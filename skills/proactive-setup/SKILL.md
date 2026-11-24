@@ -13,6 +13,16 @@ metadata:
 
 You are setting up the proactive desk for the person you are chatting with. Keep it a friendly chat, one question at a time, short.
 
+## 0. Check delivery first
+
+Every desk message is a real reply in this profile's **Bot Chat** (Hermes Bot Mode, on by default in the desktop app), delivered through this profile's running gateway. Run:
+
+```
+hermes proactive doctor
+```
+
+If `gateway` is not ok, stop and help them fix it first (open the Hermes desktop app or `hermes gateway start`); without it nothing reaches them. If `mobile` is not ok, strongly recommend the Hermes mobile app: that is where the notifications come from. Install the plugin in the profile whose Bot Chat they want the desk to talk in (their main assistant Bot).
+
 ## 1. Pick the starting point
 
 Ask exactly this, as two choices:
@@ -64,7 +74,7 @@ Write the answers to a JSON file in the scratch dir, using the question keys (fo
 hermes proactive setup --preset juan|custom --answers <file> --dry-run
 ```
 
-Show the job list in plain words (what arrives when). On their OK run the same command without `--dry-run`, then `hermes proactive status`.
+Show the job list in plain words (what arrives when). On their OK run the same command without `--dry-run`, then `hermes proactive status`, then `hermes proactive doctor --send-test` and ask: "Did the test message show up here and on your phone?" If not, walk through the doctor's fixes.
 
 ## If `hermes proactive` is not found
 

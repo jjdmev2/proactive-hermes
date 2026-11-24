@@ -18,7 +18,7 @@
 
 ---
 
-> **Quick start:** `hermes plugins install jjdmev2/proactive-hermes --enable`, then open any Hermes chat and type **`/proactive setup`**. Add an OpenAI API key for the [decision model](#the-decision-model-highly-recommended).
+> **Quick start:** turn on Bot Mode in the Hermes desktop app (on by default), run `hermes plugins install jjdmev2/proactive-hermes --enable`, then open your Bot Chat and type **`/proactive setup`**. Add an OpenAI API key for the [decision model](#the-decision-model-highly-recommended).
 
 ## Why Proactive Hermes?
 
@@ -50,11 +50,24 @@ Things you can set up the same way: a new card set or sneaker drop ("alarm me wh
 
 ## Install
 
-You need Hermes Agent **0.23.4 or newer**, with the desktop app or the gateway running so messages can reach your chat.
+### Before you install
+
+| Requirement | Why | How |
+| :--- | :--- | :--- |
+| **Hermes Agent 0.23.4 or newer** | The plugin uses Bot Mode delivery and the cron scheduler. | `hermes update` |
+| **Bot Mode** | Every desk message is a real reply in your Bot's **Bot Chat**, the one permanent conversation each Bot has. That is what makes it feel like a person texting you, with the normal notification and nothing else. | Built into the Hermes desktop app and on by default: open the **Bots** tab and click your Bot once. |
+| **The gateway running** | Messages are delivered through your profile's running gateway. If it is off, nothing reaches you. | Keep the Hermes desktop app open, or run `hermes gateway start`. |
+| **The right profile** | The desk talks in the Bot Chat of the profile you install it into. | Install it into your main assistant Bot: `hermes -p <bot> plugins install ...` |
+| **Hermes mobile app** (highly recommended) | Desk messages buzz your phone like a text; reminders, alarms and leave times need it. | See [Give Hermes access](#give-hermes-access). |
+
+### Install
 
 ```bash
 hermes plugins install jjdmev2/proactive-hermes --enable
+hermes proactive doctor
 ```
+
+`hermes proactive doctor` checks the gateway, the Bot Chat, the phone, the OpenAI key and your mail, and tells you how to fix anything missing. `hermes proactive doctor --send-test` posts one test message into your Bot Chat, so you can see it land on your phone.
 
 Recommended extras:
 
@@ -79,7 +92,7 @@ The desk can only notice and act on what it can reach. The more you connect, the
 
 ## Set it up
 
-Setup is a short chat. Two ways to start it:
+Setup is a short chat in your Bot Chat. Two ways to start it:
 
 | Where | How |
 | :--- | :--- |
@@ -97,7 +110,7 @@ Hermes does not ask what it already knows. It starts with one message listing wh
 
 Setup also asks what Hermes may do without asking you (see [approval levels](#approval-levels)), whether you use the Hermes mobile app, and offers two or three first watches from your life.
 
-You see every job and its times before anything is created. Run setup again any time; it updates the same jobs.
+You see every job and its times before anything is created. At the end Hermes posts a test message and asks if it reached your phone. Run setup again any time; it updates the same jobs.
 
 ### Approval levels
 
@@ -123,6 +136,7 @@ hermes proactive watch add --name "Card drop" --schedule "*/15 * * * *" \
 | `hermes proactive setup` | Set up or change your answers |
 | `hermes proactive setup --dry-run` | Show the jobs, change nothing |
 | `hermes proactive status` | Your settings and the jobs the plugin owns |
+| `hermes proactive doctor [--send-test]` | Check delivery to your Bot Chat and phone |
 | `hermes proactive watch add ...` | Add a watch (see above) |
 | `hermes proactive remove` | Remove every job the plugin created (settings and history stay) |
 
@@ -141,7 +155,7 @@ hermes proactive watch add --name "Card drop" --schedule "*/15 * * * *" \
                     │
      5. gate: dedupe, rank, cap, quiet hours
                     │  one short numbered message
-          your Hermes chat  ──►  you reply "1"
+   your Bot Chat (and phone)  ──►  you reply "1"
                     │
      6. small things done, the rest after your yes
 ```
@@ -200,7 +214,7 @@ The 0.10 cut-off is low on purpose: the filter only removes mail it is close to 
 
 | Feature | What you get |
 | :--- | :--- |
-| **One chat, real messages** | Short numbered replies in your Hermes chat, action first. No job cards, no extra push notifications. |
+| **One chat, real messages** | Short numbered replies in your Bot Chat, action first, with the normal notification on your phone. No job cards, no extra push notifications. |
 | **Quiet hours and holidays** | Nothing non-urgent at night. Public holidays in the countries you pick are skipped. Only urgent items (money due today, a security alert, travel today) come through at night. |
 | **Drafts before questions** | For anything you must send, reply to, book or decide, it searches first and brings a draft with sources. |
 | **Promise tracker** | Records each "I'll send it tomorrow" from your mail, Slack and chat with your exact words, and closes it only on proof. |

@@ -277,6 +277,8 @@ def setup_parser(parser) -> None:
     sub.add_parser("status", help="Show config and the jobs this plugin owns")
     sub.add_parser("remove", help="Remove every job this plugin created")
     sub.add_parser("questions", help="Print the setup questions as JSON (for the setup skill)")
+    d = sub.add_parser("doctor", help="Check gateway, Bot Chat, phone and keys; --send-test posts a test message")
+    d.add_argument("--send-test", action="store_true", help="post one test message into this profile's Bot Chat")
     watch = sub.add_parser("watch", help="Manage user-defined scheduled watches")
     watch_sub = watch.add_subparsers(dest="watch_command", required=True)
     add = watch_sub.add_parser("add", help="Add a scheduled watch")
@@ -344,8 +346,17 @@ def handle(args) -> int:
     cmd = getattr(args, "proactive_command", None)
     if cmd == "watch":
         return handle_watch(args, jobs)
+    if cmd == "doctor":
+        import ph_doctor
+        print(json.dumps(ph_doctor.report(getattr(args, "send_test", False)), indent=1, ensure_ascii=False))
+        return 0
     if cmd == "questions":
-        print(json.dumps({"known": detect(),
+        try:
+            import ph_doctor
+            delivery = ph_doctor.report()["checks"]
+        except Exception:
+            delivery = {}
+        print(json.dumps({"known": detect(), "delivery": delivery,
                           "questions": [{"key": p, "question": q, "kind": k} for p, q, _d, k in QUESTIONS]}, indent=1))
         return 0
     if cmd == "status":
@@ -399,7 +410,17 @@ def handle(args) -> int:
         if row["action"] not in ("keep", "skip"):
             print(f"  {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
     print(f"Jobs: {actions.count('create')} created, {actions.count('update')} updated, {actions.count('remove')} removed.")
-    print("Done. Desk messages arrive in your chat as normal replies.")
+    print("Done. Desk messages arrive in this profile's Bot Chat as normal replies.")
+    try:
+        import ph_doctor
+        rep = ph_doctor.report()
+        for name, row in rep["checks"].items():
+            if not row["ok"] and name in ("gateway", "bot_chat", "mobile"):
+                print(f"  To do ({name}): {row['fix']}")
+        if rep["ready"]:
+            print("Check it now: `hermes proactive doctor --send-test` posts a test message to your Bot Chat and phone.")
+    except Exception as exc:
+        print(f"  (could not run the delivery check: {type(exc).__name__})")
     return 0
 
 
