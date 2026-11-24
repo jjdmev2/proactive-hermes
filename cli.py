@@ -5,6 +5,7 @@
     hermes proactive setup --dry-run            show what would be created, change nothing
     hermes proactive status                     config summary and the jobs this plugin owns
     hermes proactive remove                     remove every job this plugin created (config and state stay)
+    hermes proactive watch {add,list,remove}     manage scheduled watches
 
 When plugin CLI registration is disabled, run the same subcommands with `python3 cli.py ...`.
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "runtime"))
@@ -32,6 +34,8 @@ QUESTIONS = [
     ("mail.gmail_api", "Read Gmail and Google Calendar through the google-workspace skill? (y/n)", "mail.gmail_api", "bool"),
     ("mail.himalaya_accounts", "Other mail accounts set up in himalaya to read (names, comma separated), or none?", None, "list"),
     ("calendar.enabled", "May I put private focus blocks on your calendar for key tasks? (y/n)", "calendar.enabled", "bool"),
+    ("authority.auto", "Which may I do without asking? calendar_blocks, reminders, alarms (urgent only), leave_time (block + 'leave now' reminder for trips). Comma separated, or none", "authority.auto", "list"),
+    ("mobile.enabled", "Do you use the Hermes mobile app with reminders, alarms and location shared? (y/n)", "mobile.enabled", "bool"),
     ("slack.enabled", "Do you use Slack through Nous Portal connectors? (y/n)", "slack.enabled", "bool"),
     ("slack.channels", "Slack channels to watch for asks to you (e.g. #team,#product), or none?", None, "list"),
     ("linear.enabled", "Do you use Linear through Nous Portal connectors? (y/n)", "linear.enabled", "bool"),
@@ -132,6 +136,22 @@ def parse(kind: str, raw: str):
     return raw
 
 
+def parse_answer(path: str, kind: str, value):
+    if isinstance(value, str) and kind != "str":
+        value = parse(kind, value)
+    if path == "authority.auto":
+        if not isinstance(value, list):
+            raise ValueError("authority.auto expects a comma-separated list or a JSON array")
+        invalid = [repr(action) for action in value if not isinstance(action, str) or action not in phconf.AUTO_ACTIONS]
+        if invalid:
+            valid = ", ".join(sorted(phconf.AUTO_ACTIONS))
+            raise ValueError(f"authority.auto: invalid action(s) {', '.join(invalid)}; choose from {valid}")
+        value = list(dict.fromkeys(value))
+    if path == "mobile.enabled" and not isinstance(value, bool):
+        raise ValueError("mobile.enabled expects yes or no")
+    return value
+
+
 def show(kind: str, value) -> str:
     if value is None:
         return ""
@@ -179,15 +199,11 @@ def interview(cfg: dict) -> dict:
         while True:
             raw = input(f"{q}{f' [{cur}]' if cur else ''} ").strip() or cur
             try:
-                _set(cfg, path, parse(kind, raw))
+                _set(cfg, path, parse_answer(path, kind, raw))
                 break
-            except Exception as exc:  # bad timezone, bad hours
+            except Exception as exc:  # bad timezone, hours or authority
                 print(f"  That did not work ({exc}). Try again.")
-    cfg["features"]["slack_sweep"] = bool(cfg["slack"].get("enabled"))
-    cfg["features"]["work_recap"] = bool(cfg["slack"].get("enabled") and cfg["daily_call"].get("enabled"))
-    if cfg["daily_call"].get("enabled"):
-        cfg["schedule"]["work_recap_after_daily"] = recap_cron(cfg)
-    return cfg
+    return finish_setup(cfg)
 
 
 def recap_cron(cfg: dict) -> str:
@@ -201,13 +217,20 @@ def apply_answers(cfg: dict, answers: dict) -> dict:
     flat = {}
     for path, _q, _d, kind in QUESTIONS:
         if path in answers:
-            v = answers[path]
-            flat[path] = parse(kind, v) if isinstance(v, str) and kind != "str" else v
+            flat[path] = parse_answer(path, kind, answers[path])
     for path, v in flat.items():
         _set(cfg, path, v)
     asked = {path for path, *_ in QUESTIONS}
     nested = {k: v for k, v in answers.items() if "." not in k and k not in asked}
-    cfg = phconf.merge(cfg, nested)
+    return finish_setup(phconf.merge(cfg, nested))
+
+
+def finish_setup(cfg: dict) -> dict:
+    auto = parse_answer("authority.auto", "list", _get(cfg, "authority.auto"))
+    mobile = parse_answer("mobile.enabled", "bool", _get(cfg, "mobile.enabled"))
+    cfg["authority"]["auto"] = auto if mobile else [action for action in auto if action not in phconf.MOBILE_ACTIONS]
+    cfg["mobile"]["enabled"] = mobile
+    cfg["reminders"]["enabled"] = mobile
     cfg["features"]["slack_sweep"] = bool(cfg["slack"].get("enabled"))
     cfg["features"]["work_recap"] = bool(cfg["slack"].get("enabled") and cfg["daily_call"].get("enabled"))
     if cfg["daily_call"].get("enabled"):
@@ -232,7 +255,14 @@ def write_config(cfg: dict) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(cfg, indent=1, ensure_ascii=False)
     if not p.is_file() or p.read_text() != text:
-        p.write_text(text)
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=p.parent, prefix=".config-", delete=False) as f:
+            tmp = Path(f.name)
+            try:
+                f.write(text)
+                f.close()
+                tmp.replace(p)
+            finally:
+                tmp.unlink(missing_ok=True)
     if p.stat().st_mode & 0o777 != 0o600:
         p.chmod(0o600)
     return p
@@ -247,6 +277,62 @@ def setup_parser(parser) -> None:
     sub.add_parser("status", help="Show config and the jobs this plugin owns")
     sub.add_parser("remove", help="Remove every job this plugin created")
     sub.add_parser("questions", help="Print the setup questions as JSON (for the setup skill)")
+    watch = sub.add_parser("watch", help="Manage user-defined scheduled watches")
+    watch_sub = watch.add_subparsers(dest="watch_command", required=True)
+    add = watch_sub.add_parser("add", help="Add a scheduled watch")
+    add.add_argument("--name", required=True)
+    add.add_argument("--schedule", required=True, help="Five-field cron expression")
+    add.add_argument("--check", required=True)
+    add.add_argument("--when", required=True)
+    add.add_argument("--then", required=True, choices=("tell", "reminder", "alarm", "draft", "act"))
+    add.add_argument("--act", help="Exact action, required with --then act")
+    add.add_argument("--urgent", action="store_true")
+    watch_sub.add_parser("list", help="List watches and their conditions")
+    watch_sub.add_parser("remove", help="Remove a watch and its managed job").add_argument("--name", required=True)
+
+
+def handle_watch(args, jobs) -> int:
+    cfg = phconf.load()
+    watches = cfg["watches"]
+    if args.watch_command == "list":
+        print(json.dumps(watches, ensure_ascii=False, indent=2))
+        return 0
+    name = args.name
+    try:
+        if not name.strip() or not name.isprintable():
+            raise ValueError("--name must be a nonblank, single-line name")
+        existing = next((watch for watch in watches if watch["name"] == name), None)
+        if args.watch_command == "add":
+            if not args.check.strip() or not args.when.strip():
+                raise ValueError("--check and --when must not be blank")
+            if args.then == "act" and not (args.act or "").strip():
+                raise ValueError("--then act requires an exact action in --act")
+            if args.then != "act" and args.act is not None:
+                raise ValueError("--act is only valid with --then act")
+            jobs.validate_watch_schedule(args.schedule)
+            watch = {"name": name, "schedule": args.schedule, "check": args.check,
+                     "when": args.when, "then": args.then, "urgent": args.urgent}
+            if args.act is not None:
+                watch["act"] = args.act
+            if existing is not None and existing != watch:
+                raise ValueError(f"watch {name!r} already exists; remove it before changing it")
+            if existing is None:
+                if any(jobs.watch_id(w["name"]) == jobs.watch_id(name) for w in watches):
+                    raise ValueError("another watch name has the same slug; choose a distinct name")
+                watches.append(watch)
+        elif existing is not None:
+            watches.remove(existing)
+    except ValueError as exc:
+        print(f"Watch: {exc}", file=sys.stderr)
+        return 2
+    write_config(cfg)
+    try:
+        jobs.apply(cfg)
+    except (OSError, RuntimeError) as exc:
+        print(f"Watch config saved, but cron reconciliation failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"Watch {name!r}: {'installed' if args.watch_command == 'add' else 'removed'}.")
+    return 0
 
 
 def handle(args) -> int:
@@ -256,6 +342,8 @@ def handle(args) -> int:
         import jobs
 
     cmd = getattr(args, "proactive_command", None)
+    if cmd == "watch":
+        return handle_watch(args, jobs)
     if cmd == "questions":
         print(json.dumps({"known": detect(),
                           "questions": [{"key": p, "question": q, "kind": k} for p, q, _d, k in QUESTIONS]}, indent=1))
@@ -280,8 +368,14 @@ def handle(args) -> int:
         print("Proactive Hermes setup.\n  1. Juan's setup (proven defaults: briefs, promise tracker, drafts first, work recap)\n  2. My own (start from scratch)")
         preset = "juan" if input("Pick 1 or 2 [1] ").strip() in ("", "1") else "custom"
     cfg = base_config(preset)
+    # Watches are user-defined, not preset defaults. Keep them across setup updates.
+    cfg["watches"] = phconf.load()["watches"]
     if args.answers:
-        cfg = apply_answers(cfg, json.loads(Path(args.answers).read_text()))
+        try:
+            cfg = apply_answers(cfg, json.loads(Path(args.answers).read_text()))
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"Setup answers: {exc}", file=sys.stderr)
+            return 2
     elif sys.stdin.isatty():
         cfg = interview(cfg)
     else:
@@ -305,7 +399,7 @@ def handle(args) -> int:
         if row["action"] not in ("keep", "skip"):
             print(f"  {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
     print(f"Jobs: {actions.count('create')} created, {actions.count('update')} updated, {actions.count('remove')} removed.")
-    print("Done. Messages arrive in your chat as normal replies; nothing is ever sent on your behalf.")
+    print("Done. Desk messages arrive in your chat as normal replies.")
     return 0
 
 

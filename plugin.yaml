@@ -5,12 +5,12 @@ version: 1.0.0
 author: HeyRito.AI
 homepage: https://heyrito.ai
 description: >
-  A quiet, proactive executive-assistant desk for Hermes. Scheduled jobs read your mail,
-  calendar, Slack and Linear, and only what you must do or decide reaches you: one short
-  numbered message in your chat, nothing at night unless it is urgent. It tracks what you
-  promised people, searches every source before asking you and brings a ready draft, and
-  recaps your team's daily call against Linear and Slack. Read-only: it never sends, posts,
-  books or pays. Set up with `hermes proactive setup` (Juan's setup or your own answers).
+  A proactive executive-assistant desk for Hermes. Scheduled jobs and your own watches read
+  mail, calendar, Slack, Linear, marketplaces, shops and event pages. Only what needs you
+  reaches your chat: one short numbered message, nothing at night unless it is urgent. It
+  tracks your promises, brings ready drafts, blocks trips and tells you when to leave, and
+  sets phone reminders and alarms. It acts only within the approval levels you choose;
+  sending, buying and registering wait for your yes. Set up with /proactive setup.
 requires_hermes: ">=0.23.4"
 provides_tools: []
 provides_hooks: [pre_llm_call]

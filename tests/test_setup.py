@@ -163,6 +163,52 @@ class SetupAnswersTests(unittest.TestCase):
         self.assertIs(cfg["features"]["weekly_review"], False)
         self.assertEqual(cfg["schedule"]["work_recap_after_daily"], "*/5 10-12 * * 1,2,3,4,5")
 
+    def test_authority_answers_and_mobile_enabled(self):
+        cfg = cli.apply_answers(cli.base_config("custom"), {
+            "authority.auto": "calendar_blocks, reminders, alarms, leave_time, watch_actions",
+            "mobile.enabled": "yes",
+        })
+        self.assertEqual(cfg["authority"]["auto"], [
+            "calendar_blocks", "reminders", "alarms", "leave_time", "watch_actions",
+        ])
+        self.assertIs(cfg["reminders"]["enabled"], True)
+        self.assertEqual(cli.apply_answers(cfg, {"authority.auto": "none"})["authority"]["auto"], [])
+
+    def test_invalid_authority_answers_explain_bad_value(self):
+        for answers in ({"authority.auto": "calendar_blocks, payments"},
+                        {"authority.auto": ["payments"]},
+                        {"authority": {"auto": ["payments"]}}):
+            with self.subTest(answers=answers), self.assertRaisesRegex(ValueError, r"authority\.auto.*payments"):
+                cli.apply_answers(cli.base_config("custom"), answers)
+
+    def test_interview_retries_an_invalid_authority_answer(self):
+        from io import StringIO
+        from contextlib import redirect_stdout
+
+        cfg = cli.base_config("custom")
+        questions = [q for q in cli.QUESTIONS if q[0] in {"authority.auto", "mobile.enabled"}]
+        output = StringIO()
+        with patch.object(cli, "detect", return_value={}), patch.object(cli, "QUESTIONS", questions), \
+                patch("builtins.input", side_effect=["payments", "reminders", "yes"]), redirect_stdout(output):
+            cli.interview(cfg)
+        self.assertIn("That did not work", output.getvalue())
+        self.assertIn("payments", output.getvalue())
+        self.assertEqual(cfg["authority"]["auto"], ["reminders"])
+        self.assertIs(cfg["reminders"]["enabled"], True)
+
+    def test_mobile_disabled_strips_phone_authority(self):
+        cfg = cli.apply_answers(cli.base_config("juan"), {
+            "mobile": {"enabled": False}, "reminders": {"enabled": True},
+        })
+        self.assertEqual(cfg["authority"]["auto"], ["calendar_blocks"])
+        self.assertIs(cfg["reminders"]["enabled"], False)
+
+    def test_juan_preset_authority(self):
+        cfg = cli.base_config("juan")
+        self.assertEqual(cfg["authority"]["auto"], ["calendar_blocks", "reminders", "alarms", "leave_time"])
+        cfg = cli.apply_answers(cfg, {"mobile.enabled": True})
+        self.assertEqual(cfg["authority"]["auto"], ["calendar_blocks", "reminders", "alarms", "leave_time"])
+
     def test_invalid_timezone_raises(self):
         for key in ("timezone", "daily_call.timezone"):
             with self.subTest(key=key), self.assertRaises(ZoneInfoNotFoundError):

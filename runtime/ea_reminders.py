@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
-"""Reminder outbox for devices that may be offline when a reminder is queued.
+"""Phone reminder and urgent-alarm outbox for devices that may be offline.
 
-The device bridge expires a pending request after ~15 minutes. When the phone is idle,
-a request can expire without reaching it. The outbox keeps each pending reminder and
-re-queues it on the bridge until the phone confirms
-it (status succeeded with a reminder id), then records the id in the action ledger.
-
-No LLM, no push, no message: re-queued requests reuse the bridge's own background wake.
-Idempotency: each attempt has a fresh bridge key derived from the stable outbox key plus
-attempt number, but a new attempt is only made after the previous request EXPIRED
-(never while one is pending or running), so a reminder can never be created twice.
+The bridge expires pending requests after ~15 minutes. Each retry uses a new
+bridge key only after the previous request is explicitly expired. Pending,
+running, or unreadable requests are not replaced. Confirmations go in the desk
+ledger; queueing alone does not mean the phone created the reminder or alarm.
 
   ea_reminders.py add --key KEY --title T [--due ISO | --due-date D] [--notes N] [--priority P]
-  ea_reminders.py adopt --key KEY --request-id RID     # track a request made via the tool
-  ea_reminders.py tick                                 # cron: check / re-queue (silent)
+  ea_reminders.py alarm --key KEY --at ISO --label TEXT  # urgent only, requires automatic alarm authority
+  ea_reminders.py adopt --key KEY --request-id RID       # track a reminder made via the tool
+  ea_reminders.py tick                                  # check / re-queue (silent)
   ea_reminders.py status
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import importlib.util
 import json
 import sys
-import time
+from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import phconf
 
@@ -43,20 +43,41 @@ def now_iso() -> str:
 def load(name: str, default):
     try:
         return json.loads((phconf.state_dir() / name).read_text())
-    except Exception:
+    except FileNotFoundError:
         return default
 
 
 def save(name: str, data) -> None:
     path = phconf.state_dir() / name
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False, sort_keys=True))
-    tmp.replace(path)
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as fh:
+        tmp = Path(fh.name)
+        try:
+            json.dump(data, fh, indent=1, ensure_ascii=False, sort_keys=True)
+            fh.close()
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+@contextmanager
+def state_lock(name: str):
+    with (phconf.state_dir() / (name + ".lock")).open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 def log(row: dict) -> None:
     with (phconf.state_dir() / RUN_LOG).open("a") as fh:
         fh.write(json.dumps({"at": now_iso(), "job": "reminders", **row}, ensure_ascii=False) + "\n")
+
+
+def auto_allowed(action: str) -> bool:
+    """Same rule as everywhere else: 'never' wins, then the automatic list."""
+    return phconf.allowed(action) == "auto"
+
+
+def enabled() -> bool:
+    return phconf.CFG["reminders"]["enabled"] and (PLUGIN / "bridge.py").is_file()
 
 
 def bridge():
@@ -71,9 +92,7 @@ def bridge():
 
 
 def wake(device_id: str) -> None:
-    """Ask the push relay to wake the phone so it fetches the request; best effort, never fatal.
-    Same call the plugin makes (plugins/hermes-mobile-device-access/__init__.py wake), but reads
-    the relay settings from the profile .env so it works outside a scoped Hermes process."""
+    """Ask the push relay to wake the phone; best effort, never fatal."""
     try:
         import urllib.request
         from urllib.parse import quote
@@ -104,86 +123,149 @@ def ledger_set(key: str, patch: dict) -> None:
     save(LEDGER, led)
 
 
-def submit(store, item: dict) -> dict:
-    args = {"title": item["title"]}
-    for f in ("due", "due_date", "notes", "priority"):
-        if item.get(f):
-            args[f] = item[f]
+def item_kind(item: dict) -> str:
+    return "alarm" if item.get("operation") == "alarms.create" else "reminder"
+
+
+def submit(store, box: dict, item: dict) -> None:
     attempt = int(item.get("attempts", 0)) + 1
-    req = store.request("reminders.create", args, idempotency_key=f"proactive-hermes:{item['key']}:rem:{attempt}"[:128],
-                        ttl=TTL)
+    if item_kind(item) == "alarm":
+        operation = "alarms.create"
+        args = {f: item[f] for f in ("at", "label")}
+        # The bridge limits keys to 128 characters; preserve both key identity and attempt.
+        digest = hashlib.sha256(item["key"].encode()).hexdigest()
+        idem = f"proactive-hermes:alarm:{digest}:{attempt}"
+    else:
+        operation = "reminders.create"
+        args = {"title": item["title"]}
+        args.update({f: item[f] for f in ("due", "due_date", "notes", "priority") if item.get(f)})
+        # Keep the existing bridge idempotency format for reminder attempts already on disk.
+        idem = f"proactive-hermes:{item['key']}:rem:{attempt}"[:128]
+    req = store.request(operation, args, idempotency_key=idem, ttl=TTL)
     item.update(attempts=attempt, request_id=req["id"], last_try=now_iso(), status="queued")
+    box[item["key"]] = item
+    save(OUTBOX, box)
     wake(req["device_id"])
-    return item
+
+
+def enqueue(item: dict, *, force: bool = False) -> dict:
+    key, kind = item["key"], item_kind(item)
+    with state_lock(OUTBOX):
+        box = load(OUTBOX, {})
+        if key in box:
+            existing = box[key]
+            if item_kind(existing) != kind:
+                return {"status": "refused", "reason": "key already belongs to a different action"}
+            return {**existing, "status": "exists", "outbox_status": existing["status"]}
+        created = now_iso()
+        today = created[:10]
+        made_today = sum(1 for i in box.values() if item_kind(i) == kind and str(i.get("created", "")).startswith(today))
+        config = phconf.CFG["reminders"]
+        cap = config.get("alarms_per_day", 3) if kind == "alarm" else config["per_day"]
+        if made_today >= cap and not force:
+            return {"status": "refused", "reason": f"daily cap {cap} {kind}s reached"}
+        item.update(attempts=0, created=created)
+        _, store = bridge()
+        submit(store, box, item)
+        ledger_set(key, {f"{kind}_status": "queued"})
+        return {"status": "queued", "key": key, "request_id": item["request_id"]}
+
+
+def add(key: str, title: str, *, due=None, due_date=None, notes="", priority="medium", force=False,
+        required_authority=()) -> dict:
+    """Queue a reminder and return its receipt without a CLI round trip."""
+    if not enabled():
+        return {"status": "disabled"}
+    if not all(map(auto_allowed, required_authority)):
+        return {"status": "not_allowed"}
+    item = {"key": key, "title": title, "due": due, "due_date": due_date, "notes": notes, "priority": priority}
+    if required_authority:
+        item["required_authority"] = list(required_authority)
+    return enqueue(item, force=force)
 
 
 def cmd_add(a) -> int:
-    box = load(OUTBOX, {})
-    if a.key in box and box[a.key].get("status") in {"queued", "landed"}:
-        print(json.dumps({"status": "exists", **box[a.key]}, ensure_ascii=False))
-        return 0
-    today = datetime.now(phconf.tz()).date().isoformat()
-    made_today = sum(1 for i in box.values() if str(i.get("created", "")).startswith(today))
-    daily_cap = phconf.CFG["reminders"]["per_day"]
-    if made_today >= daily_cap and not a.force:
-        print(json.dumps({"status": "refused", "reason": f"daily cap {daily_cap} reminders reached"}))
-        return 0
-    item = {"key": a.key, "title": a.title, "due": a.due, "due_date": a.due_date, "notes": a.notes,
-            "priority": a.priority, "attempts": 0, "created": now_iso()}
-    _, store = bridge()
-    item = submit(store, item)
-    box[a.key] = item
-    save(OUTBOX, box)
-    ledger_set(a.key, {"reminder_status": "queued"})
-    print(json.dumps({"status": "queued", "key": a.key, "request_id": item["request_id"]}))
+    result = add(a.key, a.title, due=a.due, due_date=a.due_date, notes=a.notes, priority=a.priority, force=a.force)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_alarm(a) -> int:
+    if not auto_allowed("alarms"):
+        result = {"status": "not_allowed"}
+    else:
+        try:
+            at = datetime.fromisoformat(a.at.replace("Z", "+00:00"))
+        except ValueError:
+            at = None
+        if at is None or at.utcoffset() is None:
+            result = {"status": "error", "error": "--at must be an ISO date and time with timezone"}
+        elif len(a.label) > 100:
+            result = {"status": "error", "error": "--label must be at most 100 characters"}
+        else:
+            result = enqueue({"operation": "alarms.create", "key": a.key, "at": a.at, "label": a.label})
+    print(json.dumps(result, ensure_ascii=False))
     return 0
 
 
 def cmd_adopt(a) -> int:
-    _, store = bridge()
-    req = store.result(a.request_id)
-    args = req["arguments"]
-    box = load(OUTBOX, {})
-    box[a.key] = {"key": a.key, "title": args.get("title"), "due": args.get("due"), "due_date": args.get("due_date"),
-                  "notes": args.get("notes"), "priority": args.get("priority"), "attempts": 1,
-                  "request_id": a.request_id, "created": now_iso(), "status": "queued"}
-    save(OUTBOX, box)
-    print(json.dumps({"adopted": a.key, "request_status": req["status"]}))
+    with state_lock(OUTBOX):
+        box = load(OUTBOX, {})
+        if a.key in box:
+            print(json.dumps({"status": "exists", "key": a.key}))
+            return 0
+        _, store = bridge()
+        req = store.result(a.request_id)
+        if req.get("operation") != "reminders.create":
+            print(json.dumps({"status": "refused", "reason": "can only adopt a reminder creation request"}))
+            return 0
+        args = req["arguments"]
+        box[a.key] = {"key": a.key, "title": args.get("title"), "due": args.get("due"), "due_date": args.get("due_date"),
+                      "notes": args.get("notes"), "priority": args.get("priority"), "attempts": 1,
+                      "request_id": a.request_id, "created": now_iso(), "status": "queued"}
+        save(OUTBOX, box)
+        print(json.dumps({"adopted": a.key, "request_status": req["status"]}))
     return 0
 
 
 def cmd_tick(_a) -> int:
-    box = load(OUTBOX, {})
-    if not any(i.get("status") == "queued" for i in box.values()):
-        return 0
-    _, store = bridge()
-    changed = False
-    for key, item in box.items():
-        if item.get("status") != "queued":
-            continue
-        try:
-            res = store.result(item["request_id"])
-        except Exception as exc:
-            res = {"status": "expired", "error": str(exc)}
-        status = res.get("status")
-        if status == "succeeded":
-            data = ((res.get("result") or {}).get("data") or {})
-            item.update(status="landed", reminder_id=data.get("id"), landed=now_iso())
-            ledger_set(key, {"reminder_id": data.get("id"), "reminder_status": "landed"})
-            log({"landed": key, "reminder_id": data.get("id"), "attempts": item.get("attempts")})
-            changed = True
-        elif status in {"pending", "running"}:
-            continue
-        elif status == "expired" and int(item.get("attempts", 0)) < MAX_ATTEMPTS:
-            submit(store, item)
-            changed = True
-        else:
-            item.update(status="failed", error=str(res.get("error") or status)[:200])
-            ledger_set(key, {"reminder_status": "failed"})
-            log({"failed": key, "why": item["error"], "attempts": item.get("attempts")})
-            changed = True
-    if changed:
-        save(OUTBOX, box)
+    with state_lock(OUTBOX):
+        box = load(OUTBOX, {})
+        if not any(i.get("status") == "queued" for i in box.values()):
+            return 0
+        _, store = bridge()
+        for key, item in box.items():
+            if item.get("status") != "queued":
+                continue
+            try:
+                res = store.result(item["request_id"])
+            except Exception:
+                # A failed lookup is not evidence the phone didn't act.
+                continue
+            kind = item_kind(item)
+            status = res.get("status")
+            if status == "succeeded":
+                data = ((res.get("result") or {}).get("data") or {})
+                item_id = data.get("id")
+                item.update(status="landed", landed=now_iso(), **{f"{kind}_id": item_id})
+                ledger_set(key, {f"{kind}_id": item_id, f"{kind}_status": "landed"})
+                log({"landed": key, f"{kind}_id": item_id, "attempts": item.get("attempts")})
+            elif status in {"pending", "running"}:
+                continue
+            elif status == "expired" and int(item.get("attempts", 0)) < MAX_ATTEMPTS:
+                required = ("alarms",) if kind == "alarm" else item.get("required_authority", ())
+                if not all(map(auto_allowed, required)):
+                    continue
+                try:
+                    submit(store, box, item)
+                except Exception as exc:
+                    log({"retry_error": key, "error": f"{type(exc).__name__}: {exc}"[:200]})
+                continue
+            else:
+                item.update(status="failed", error=str(res.get("error") or status)[:200])
+                ledger_set(key, {f"{kind}_status": "failed"})
+                log({"failed": key, "why": item["error"], "attempts": item.get("attempts")})
+            save(OUTBOX, box)
     return 0
 
 
@@ -202,17 +284,21 @@ def main() -> int:
     ad.add_argument("--due-date", dest="due_date")
     ad.add_argument("--notes", default="")
     ad.add_argument("--priority", choices=["none", "low", "medium", "high"], default="medium")
-    ad.add_argument("--force", action="store_true", help="ignore the daily cap")
+    ad.add_argument("--force", action="store_true", help="ignore the reminder daily cap")
+    alarm = sub.add_parser("alarm", help="queue an urgent, one-time alarm")
+    alarm.add_argument("--key", required=True)
+    alarm.add_argument("--at", required=True)
+    alarm.add_argument("--label", required=True)
     ap = sub.add_parser("adopt")
     ap.add_argument("--key", required=True)
     ap.add_argument("--request-id", required=True)
     sub.add_parser("tick")
     sub.add_parser("status")
     a = p.parse_args()
-    if not phconf.CFG["reminders"]["enabled"] or not (PLUGIN / "bridge.py").is_file():
+    if not enabled():
         print(json.dumps({"status": "disabled"}))
         return 0
-    return {"add": cmd_add, "adopt": cmd_adopt, "tick": cmd_tick, "status": cmd_status}[a.cmd](a)
+    return {"add": cmd_add, "alarm": cmd_alarm, "adopt": cmd_adopt, "tick": cmd_tick, "status": cmd_status}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -43,7 +43,20 @@ For "My own", also ask:
 
 If no OpenAI key was found, say once: "Juan's setup is built for OpenAI's decision model. With a key and a few dollars of credit it filters noise and spots promises for about 3 cents per 1,000 emails. Want to add one now, or go without?"
 
-## 3. Apply
+## 3. What it may do, the phone, and first watches
+
+Ask these three in plain words, after the details:
+
+1. **Approval levels.** "Which of these may I do without asking: private calendar blocks, reminders, alarms for urgent things, leave-time planning for trips? Everything else I prepare and ask first. Payments and passwords always stay with you." Juan's setup allows all four.
+2. **The Hermes mobile app.** Recommend it strongly: reminders, alarms, location (for leave times) and calendar make the desk useful on the go. Ask them to install it, sign in to the same Hermes, and share Reminders, Alarms, Location and Calendar in its settings. Check with the mobile device tools if they are available.
+3. **First watches.** Offer two or three from their life, for example:
+   - selling apps (Vinted, eBay, Marketplace): "tell me when a buyer makes an offer, with a suggested reply"
+   - a store or drop (a local hardware store, Amazon, a card or sneaker release): "alarm me when it is in stock or preorders open"
+   - events (Luma, Eventbrite, a conference, a concert): "tell me when registration opens, draft the form"
+   - work tools: "remind me when a PR waits on me for more than a day"
+   For accounts the watch needs (a shop login, Luma, a marketplace), tell them to sign in once in the browser Hermes uses, never to share passwords in chat.
+
+## 4. Apply
 
 Write the answers to a JSON file in the scratch dir, using the question keys (for example `"owner.name"`, `"timezone"`, `"quiet_hours": "22-7"`, `"slack.channels": "#team,#product"`). Extra choices from "My own" go in as nested keys, for example `{"schedule": {"morning_brief": "30 7 * * 1-5"}, "features": {"weekly_review": false}}`. Then run:
 
@@ -60,5 +73,5 @@ Under `plugins.isolation: host` the CLI command is not registered. Use the same 
 ## Rules
 
 - Never ask for passwords, tokens or card numbers. Accounts are connected through Hermes itself (google-workspace skill, Nous Portal connectors, himalaya).
-- The desk is read-only: it never sends, posts, books or pays. Say this once.
+- Say once how approval works: what they allowed happens on its own, everything else waits for their yes, payments and passwords always stay with them.
 - Nothing personal goes into the plugin folder. Config lives in `plugin-data/proactive-hermes/config.json` on their machine only.

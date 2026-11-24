@@ -14,6 +14,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PLUGIN = "proactive-hermes"
+MOBILE_ACTIONS = frozenset({"reminders", "alarms", "leave_time"})
+AUTO_ACTIONS = MOBILE_ACTIONS | {"calendar_blocks", "watch_actions"}
 
 DEFAULTS: dict = {
     "version": 1,
@@ -26,7 +28,14 @@ DEFAULTS: dict = {
     "chat": {"label": "Bot Chat"},
     "p0": {"deliver": ""},
     "calendar": {"enabled": False, "id": "primary", "blocks_per_day": 3},
+    "authority": {
+        "auto": [],
+        "ask_first": ["send_email", "send_slack", "reply_offers", "register_events", "purchases", "bookings"],
+        "never": ["payments", "share_credentials", "delete_data"],
+    },
+    "mobile": {"enabled": False},
     "reminders": {"enabled": False, "per_day": 6},
+    "watches": [],
     "mail": {"gmail_api": False, "himalaya_accounts": [], "noise_senders": [], "noise_subjects": []},
     "slack": {"enabled": False, "channels": [], "dm_watch": True},
     "linear": {"enabled": False, "user": ""},
@@ -103,6 +112,20 @@ def load(path: Path | None = None) -> dict:
 
 
 CFG = load()
+
+
+def allowed(action: str, *, cfg: dict | None = None) -> str:
+    """Resolve standing authority. A deny overrides any automatic grant."""
+    authority = (CFG if cfg is None else cfg).get("authority", {})
+    if not isinstance(authority, dict):
+        return "ask"
+    never = authority.get("never")
+    if isinstance(never, list) and action in never:
+        return "never"
+    auto = authority.get("auto")
+    if action in AUTO_ACTIONS and isinstance(auto, list) and action in auto:
+        return "auto"
+    return "ask"
 
 
 def tz() -> ZoneInfo:

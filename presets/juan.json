@@ -6,6 +6,7 @@
   "workdays": [0, 1, 2, 3, 4],
   "holidays": ["FI", "CL"],
   "calendar": {"enabled": true, "id": "primary", "blocks_per_day": 3},
+  "authority": {"auto": ["calendar_blocks", "reminders", "alarms", "leave_time"]},
   "reminders": {"enabled": false, "per_day": 6},
   "mail": {"gmail_api": true},
   "slack": {"enabled": true, "dm_watch": true},
