@@ -1,0 +1,31 @@
+{
+  "_about": "Juan's setup: the choices behind the original install, with no personal data. Setup still asks for your name, timezone, chat, accounts and channels.",
+  "preset": "juan",
+  "timezone": "Europe/Helsinki",
+  "quiet_hours": {"start": 23, "end": 7},
+  "workdays": [0, 1, 2, 3, 4],
+  "holidays": ["FI", "CL"],
+  "calendar": {"enabled": true, "id": "primary", "blocks_per_day": 3},
+  "reminders": {"enabled": false, "per_day": 6},
+  "mail": {"gmail_api": true},
+  "slack": {"enabled": true, "dm_watch": true},
+  "linear": {"enabled": true},
+  "daily_call": {"enabled": true, "timezone": "America/Santiago", "start": "09:00", "poll_start": "09:30", "poll_end": "11:00"},
+  "caps": {"max_items": 3, "max_brief_items": 5, "line_chars": 140, "message_chars": 700},
+  "features": {
+    "morning_brief": true, "evening_brief": true, "weekly_review": true, "mail_radar": true,
+    "slack_sweep": true, "promises": true, "resolve_first": true, "work_recap": true, "health": true
+  },
+  "schedule": {
+    "morning_brief": "0 8 * * 1-5",
+    "evening_brief": "30 21 * * 0-4",
+    "weekly_review": "0 15 * * 5",
+    "mail_radar": "*/15 7-22 * * *",
+    "slack_sweep": "0 9-19 * * 1-5",
+    "promises": "30 11,15,19 * * 1-5",
+    "work_recap_after_daily": "*/5 9-11 * * 1-5",
+    "work_recap_evening": "0 21 * * 1-5",
+    "health": "7 * * * *",
+    "tick": "*/10 7-23 * * *"
+  }
+}
