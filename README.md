@@ -61,7 +61,7 @@ First you pick a starting point:
 | **1. Juan's setup** | The defaults from the original install: morning brief 08:00, mail radar every 15 minutes, Slack sweep hourly on workdays, promise tracker 3 times a day, work recap after the daily call, evening close-out 21:30, weekly review Friday 15:00, quiet hours 23:00 to 07:00, drafts first. Built for the decision model. You only fill in your own details. |
 | **2. My own** | Start blank. Hermes asks about your day and builds the desk around it. |
 
-Then Hermes asks, one question at a time: your name, timezone, quiet hours, holiday countries, work emails, whether to use the decision model, which mail and calendar to read, Slack and Linear, which channels to watch, and when your team's daily call happens. It checks what it can on its own (your timezone, which accounts are connected) and asks you to confirm.
+Hermes does not ask what it already knows. It starts with one message listing what it found (your name from its memory, your timezone, connected mail, calendar, Slack, Linear and the OpenAI key) and asks if that is right. Then it asks only what is missing, one question at a time, each with a short reason: quiet hours, holiday countries, which channels to watch, when your team's daily call happens.
 
 You see every job and its times before anything is created. Run setup again any time; it updates the same jobs.
 
@@ -109,7 +109,7 @@ Juan's setup is built around OpenAI's **Decisions API** with `gpt-6-luna`. It do
 
 | Check | Statement the model scores | Action |
 | :--- | :--- | :--- |
-| Mail filter | "This message needs the owner to act or decide soon." | Below **0.20**: dropped and logged. Everything else goes to the agent. |
+| Mail filter | "This message needs the owner to act or decide soon." It reads the sender, the subject and the first 600 characters of the body. | Below **0.10**: dropped and logged. Everything else goes to the agent. Your own mail, replies in a thread and calendar responses are never dropped. |
 | Promise spotting | "The writer commits to a specific action for a specific person." | **0.6** or more: recorded as a promise. |
 | Done check | "The later message does what was promised." | **0.8** or more **and** the message as evidence: promise closed. |
 | Same matter | "Both texts are about the same matter." | **0.7** or more: merged, so you are not told twice. |
@@ -128,7 +128,7 @@ Real scores from testing:
 
 On one real inbox, 24 of 38 recent emails were promotions (sportswear, supermarket, food delivery, news digests). The filter dropped all 24 and kept all 14 that mattered.
 
-The low 0.20 cut-off for mail is deliberate: the filter only removes mail it is close to certain about. Anything in between still reaches the agent.
+The 0.10 cut-off is low on purpose: the filter only removes mail it is close to certain about. Reading the start of the body catches asks hidden behind a vague subject ("Re: hi"). The mail stays unread in your inbox.
 
 **After the filter, the gate ranks items in this order:** urgent first, then priority (p0, p1, p2), then items where someone is waiting on you, then the nearest deadline, then decisions before actions, then the oldest.
 
@@ -152,7 +152,7 @@ The low 0.20 cut-off for mail is deliberate: the filter only removes mail it is 
 
 - **Read-only.** The desk never sends mail or Slack messages, posts, books, buys or pays. A draft goes out only after you say yes to that exact text, in chat.
 - **Local.** Settings, drafts, promises and logs stay in your Hermes home. We run no server and collect no telemetry.
-- **The decision model sees headers only** for mail filtering: sender and subject, never the body. Promise checks send the one message being checked.
+- **The decision model sees little:** for mail, the sender, subject and first 600 characters of the body; for promise checks, the one message being checked. OpenAI offers zero data retention for eligible accounts.
 - **Work and personal stay apart.** A work draft never uses facts from personal sources, and every fact carries a source.
 - **Bounded.** Searches have call and time limits. Reminders and calendar blocks have daily caps.
 - **Text from mail, Slack or the web is treated as data.** Instructions inside it are never followed.

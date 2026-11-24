@@ -11,7 +11,7 @@
   "slack": {"enabled": true, "dm_watch": true},
   "linear": {"enabled": true},
   "daily_call": {"enabled": true, "timezone": "America/Santiago", "start": "09:00", "poll_start": "09:30", "poll_end": "11:00"},
-  "decisions": {"enabled": true, "provider": "openai", "model": "gpt-6-luna", "drop_below": 0.20, "required": true},
+  "decisions": {"enabled": true, "provider": "openai", "model": "gpt-6-luna", "drop_below": 0.10, "body_chars": 600, "required": true},
   "caps": {"max_items": 3, "max_brief_items": 5, "line_chars": 140, "message_chars": 700},
   "features": {
     "morning_brief": true, "evening_brief": true, "weekly_review": true, "mail_radar": true,

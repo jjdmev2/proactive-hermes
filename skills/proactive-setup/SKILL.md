@@ -22,20 +22,26 @@ Ask exactly this, as two choices:
 
 Both paths use the same questions below; with Juan's setup, offer the preset value as the default and accept "ok" to keep it.
 
-## 2. The interview
+## 2. Say what you already know, then ask only what is missing
 
-Get the exact questions and their keys:
+Never ask what Hermes already knows. Before any question:
 
 ```
 hermes proactive questions
 ```
 
-Ask them in that order, skipping ones that no longer apply (no Slack means no channels and no daily call). Check what you can instead of asking: the timezone from the system clock, whether the google-workspace skill is authenticated, whether Slack or Linear connector tools exist (tool_search "slack search messages", "linear issues"). Say what you found and ask them to confirm.
+Its `known` block has what the system found (name, timezone, mail accounts, Google Workspace, OpenAI key). Add what you know yourself: the user's name and preferences from your memory and user profile, connected Slack or Linear (tool_search "slack search messages", "linear issues"), work emails from their mail accounts. Send it as ONE message, for example:
+
+> "Here is what I have: Alex, Europe/Berlin, Gmail and Calendar connected, Slack connected, OpenAI key found. All correct?"
+
+Then ask only the questions in `questions` that are still open, one at a time, skipping ones that no longer apply (no Slack means no channels and no daily call). Give each a short reason, for example "Quiet hours? (so nothing buzzes you at night)".
 
 For "My own", also ask:
 - When should the morning brief arrive, and the evening close-out?
 - How often to check mail (every 15, 30 or 60 minutes)?
 - Track promises you make in mail and Slack? Weekly review on which day?
+
+If no OpenAI key was found, say once: "Juan's setup is built for OpenAI's decision model. With a key and a few dollars of credit it filters noise and spots promises for about 3 cents per 1,000 emails. Want to add one now, or go without?"
 
 ## 3. Apply
 

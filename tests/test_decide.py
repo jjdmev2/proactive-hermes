@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "runtime"))
 os.environ["EA_STATE_DIR"] = tempfile.mkdtemp()
 import ea_decide  # noqa: E402
-ea_decide.STATE = __import__("pathlib").Path(os.environ["EA_STATE_DIR"])
+ea_decide.STATE = Path(os.environ["EA_STATE_DIR"])
 
 MSGS = [{"from": "news@shop.example", "subject": "40% off"},
         {"from": "alex@client.example", "subject": "A or B by tomorrow?"},
@@ -59,3 +59,16 @@ class DecideTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExemptTests(unittest.TestCase):
+    def test_own_mail_and_replies_never_dropped(self):
+        msgs = [{"from": "me@own.example", "subject": "deck"},
+                {"from": "alex@client.example", "subject": "Re: proposal"},
+                {"from": "news@shop.example", "subject": "sale", "snippet": "40% off"}]
+        t = fake([0.01])
+        keep, drop, info = ea_decide.triage_mail(msgs, transport=t, key="k", own={"me@own.example"})
+        self.assertEqual([m["subject"] for m in drop], ["sale"])
+        self.assertEqual(len(t.body["questions"]), 1)  # exempt mail is not even sent
+        self.assertIn("40% off", t.body["input"])     # the body start is sent for the rest
+        self.assertTrue(all("snippet" not in m for m in keep))

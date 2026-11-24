@@ -41,6 +41,59 @@ QUESTIONS = [
 ]
 
 
+def detect() -> dict:
+    """What we can know without asking: owner name, timezone, mail accounts, connected services."""
+    import os
+    import pwd
+    import shutil
+    import subprocess
+    found: dict = {}
+    home = phconf.hermes_home()
+    for f in (home / "memories" / "USER.md", home / "USER.md"):
+        try:
+            for line in f.read_text().splitlines():
+                low = line.lower()
+                for tag in ("name:", "user's name is", "name is"):
+                    if tag in low:
+                        name = line[low.index(tag) + len(tag):].strip(" .*").split(",")[0].split(" (")[0]
+                        if 0 < len(name) < 40:
+                            found.setdefault("owner.name", name)
+        except OSError:
+            pass
+    if "owner.name" not in found:
+        try:
+            gecos = pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0].strip()
+            if gecos:
+                found["owner.name"] = gecos.split()[0]
+        except Exception:
+            pass
+    try:
+        link = os.path.realpath("/etc/localtime")
+        if "zoneinfo/" in link:
+            found["timezone"] = link.split("zoneinfo/", 1)[1]
+    except OSError:
+        pass
+    if os.environ.get("TZ") and "/" in os.environ["TZ"]:
+        found["timezone"] = os.environ["TZ"]
+    if shutil.which("himalaya"):
+        try:
+            out = subprocess.run(["himalaya", "account", "list", "-o", "json"], capture_output=True, text=True, timeout=15)
+            names = [a.get("name") for a in json.loads(out.stdout or "[]") if a.get("name")]
+            if names:
+                found["mail.himalaya_accounts"] = names
+        except Exception:
+            pass
+    if phconf.google_api().exists():
+        found["mail.gmail_api"] = True
+    sys.path.insert(0, str(HERE / "runtime"))
+    try:
+        import ea_decide
+        found["decisions.enabled"] = bool(ea_decide.api_key())
+    except Exception:
+        pass
+    return found
+
+
 def _get(d: dict, path: str):
     for part in path.split("."):
         if not isinstance(d, dict):
@@ -111,6 +164,12 @@ def base_config(preset: str) -> dict:
 
 
 def interview(cfg: dict) -> dict:
+    known = detect()
+    if known:
+        print("Here is what I already know (press Enter to keep each one):")
+        for k, v in known.items():
+            print(f"  {k}: {', '.join(v) if isinstance(v, list) else v}")
+            _set(cfg, k, v)
     for path, q, default_path, kind in QUESTIONS:
         if skip(path, cfg):
             continue
@@ -190,7 +249,8 @@ def handle(args) -> int:
 
     cmd = getattr(args, "proactive_command", None)
     if cmd == "questions":
-        print(json.dumps([{"key": p, "question": q, "kind": k} for p, q, _d, k in QUESTIONS], indent=1))
+        print(json.dumps({"known": detect(),
+                          "questions": [{"key": p, "question": q, "kind": k} for p, q, _d, k in QUESTIONS]}, indent=1))
         return 0
     if cmd == "status":
         cfg = phconf.load()

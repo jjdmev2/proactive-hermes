@@ -65,6 +65,21 @@ def save_state(state: dict) -> None:
     os.replace(tmp, STATE)
 
 
+SNIPPET_MAX_MESSAGES = 25
+
+
+def body_snippet(account: str, folder: str, msg_id: str, chars: int = 600) -> str:
+    """First part of the body, read with --preview so the mail stays unread. Empty on any error."""
+    try:
+        raw = himalaya(["message", "read", "--preview", "-a", account, "-f", folder, msg_id], timeout=20)
+    except Exception:
+        return ""
+    lines = raw.splitlines()
+    if "" in lines[:15]:
+        lines = lines[lines.index(""):]
+    return " ".join(" ".join(lines).split())[:chars]
+
+
 def is_noise(sender: str, subject: str) -> bool:
     sender = (sender or "").lower()
     subject = (subject or "").lower()
@@ -216,6 +231,9 @@ def main() -> int:
     triage = {"used": False}
     try:
         import ea_decide
+        if ea_decide.api_key():
+            for m in fresh[:SNIPPET_MAX_MESSAGES]:
+                m["snippet"] = body_snippet(m["account"], m["folder"], m["id"], ea_decide.SNIPPET_CHARS)
         fresh, _dropped, triage = ea_decide.triage_mail(fresh)
     except Exception as exc:  # never let the filter hide mail
         triage = {"used": False, "reason": type(exc).__name__}

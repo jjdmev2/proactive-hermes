@@ -34,7 +34,7 @@ DEFAULTS: dict = {
         "enabled": False, "timezone": "UTC", "start": "09:00",
         "poll_start": "09:30", "poll_end": "11:00", "channels": [],
     },
-    "decisions": {"enabled": True, "provider": "openai", "model": "gpt-6-luna", "drop_below": 0.20},
+    "decisions": {"enabled": True, "provider": "openai", "model": "gpt-6-luna", "drop_below": 0.10, "body_chars": 600},
     "caps": {"max_items": 3, "max_brief_items": 5, "line_chars": 140, "message_chars": 700},
     "features": {
         "morning_brief": True, "evening_brief": True, "weekly_review": True, "mail_radar": True,
