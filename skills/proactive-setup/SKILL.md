@@ -53,6 +53,10 @@ hermes proactive setup --preset juan|custom --answers <file> --dry-run
 
 Show the job list in plain words (what arrives when). On their OK run the same command without `--dry-run`, then `hermes proactive status`.
 
+## If `hermes proactive` is not found
+
+Under `plugins.isolation: host` the CLI command is not registered. Use the same commands through the plugin file: `python3 <HERMES_HOME>/plugins/proactive-hermes/cli.py questions|setup|status|remove ...` with the same flags.
+
 ## Rules
 
 - Never ask for passwords, tokens or card numbers. Accounts are connected through Hermes itself (google-workspace skill, Nous Portal connectors, himalaya).
