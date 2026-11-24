@@ -5,6 +5,8 @@
     hermes proactive setup --dry-run            show what would be created, change nothing
     hermes proactive status                     config summary and the jobs this plugin owns
     hermes proactive remove                     remove every job this plugin created (config and state stay)
+
+When plugin CLI registration is disabled, run the same subcommands with `python3 cli.py ...`.
 """
 from __future__ import annotations
 
@@ -228,8 +230,11 @@ def decisions_note(cfg: dict) -> str:
 def write_config(cfg: dict) -> Path:
     p = phconf.config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(cfg, indent=1, ensure_ascii=False))
-    p.chmod(0o600)
+    text = json.dumps(cfg, indent=1, ensure_ascii=False)
+    if not p.is_file() or p.read_text() != text:
+        p.write_text(text)
+    if p.stat().st_mode & 0o777 != 0o600:
+        p.chmod(0o600)
     return p
 
 
@@ -245,7 +250,10 @@ def setup_parser(parser) -> None:
 
 
 def handle(args) -> int:
-    import jobs
+    if __package__:
+        from . import jobs
+    else:
+        import jobs
 
     cmd = getattr(args, "proactive_command", None)
     if cmd == "questions":
@@ -257,7 +265,8 @@ def handle(args) -> int:
         print(f"Config: {phconf.config_path()} ({'found' if phconf.config_path().exists() else 'not set up yet'})")
         print(f"Preset: {cfg.get('preset')}  Owner: {cfg['owner'].get('name')}  Timezone: {cfg.get('timezone')}")
         for row in jobs.apply(cfg, dry_run=True):
-            print(f"  {row['job']}: {row['action'] if row['action'] != 'update' else 'installed'}  {row['schedule']}")
+            action = "installed" if row["action"] == "keep" else row["action"]
+            print(f"  {row['job']}: {action}  {row['schedule']}")
         return 0
     if cmd == "remove":
         gone = jobs.remove_all()
@@ -281,7 +290,8 @@ def handle(args) -> int:
     if args.dry_run:
         print(json.dumps(cfg, indent=1))
         for row in jobs.apply(cfg, dry_run=True):
-            print(f"  would {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
+            if row["action"] not in ("keep", "skip"):
+                print(f"  would {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
         return 0
     key_note = decisions_note(cfg)
     if key_note:
@@ -289,9 +299,19 @@ def handle(args) -> int:
     path = write_config(cfg)
     phconf.CFG = cfg
     rows = jobs.apply(cfg)
-    print(f"Saved {path}")
+    print(f"Config: {path}")
+    actions = [row["action"] for row in rows]
     for row in rows:
-        if row["action"] != "skip":
+        if row["action"] not in ("keep", "skip"):
             print(f"  {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
+    print(f"Jobs: {actions.count('create')} created, {actions.count('update')} updated, {actions.count('remove')} removed.")
     print("Done. Messages arrive in your chat as normal replies; nothing is ever sent on your behalf.")
     return 0
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Set up, inspect or remove Proactive Hermes.")
+    setup_parser(parser)
+    sys.exit(handle(parser.parse_args()))

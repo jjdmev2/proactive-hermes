@@ -9,9 +9,14 @@ changes nothing.
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
+import subprocess
 import sys
+from hashlib import sha256
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 HERE = Path(__file__).resolve().parent
 RUNTIME = HERE / "runtime"
@@ -107,10 +112,11 @@ def tools(cfg: dict) -> dict:
 
 def variables(cfg: dict) -> dict:
     q = cfg["quiet_hours"]
+    state = os.environ.get("EA_STATE_DIR", str(phconf.data_dir() / "state"))
     v = {
         "OWNER": cfg["owner"].get("name") or "there",
         "SCRIPTS": str(phconf.scripts_dir()),
-        "STATE": str(phconf.state_dir()),
+        "STATE": state,
         "TIMEZONE": cfg.get("timezone", "UTC"),
         "QUIET": f'{int(q["start"]):02d}:00 to {int(q["end"]):02d}:00',
         "CHAT": cfg["chat"].get("label") or "the chat",
@@ -137,10 +143,16 @@ def prompt_for(job: dict, cfg: dict) -> str:
 def install_runtime(cfg: dict) -> Path:
     dest = phconf.scripts_dir()
     dest.mkdir(parents=True, exist_ok=True)
+    phconf.state_dir()
     for f in RUNTIME.glob("*.py"):
-        shutil.copy2(f, dest / f.name)
+        target = dest / f.name
+        if not target.is_file() or target.read_bytes() != f.read_bytes():
+            shutil.copy2(f, target)
     contract = (HERE / "skills" / "proactive-desk" / "references" / "desk-contract.md").read_text()
-    (dest / "desk-contract.md").write_text(render(contract, variables(cfg)))
+    text = render(contract, variables(cfg))
+    target = dest / "desk-contract.md"
+    if not target.is_file() or target.read_text() != text:
+        target.write_text(text)
     return dest
 
 
@@ -151,25 +163,90 @@ def _registry() -> Path:
 def _load_registry() -> dict:
     try:
         return json.loads(_registry().read_text())
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError:
         return {}
 
 
-def apply(cfg: dict, dry_run: bool = False) -> list[dict]:
-    from cron import jobs as J  # Hermes core
+def _save_registry(reg: dict) -> None:
+    path = _registry()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(mode="w", dir=path.parent, prefix=".jobs-", delete=False) as f:
+        tmp = Path(f.name)
+        try:
+            json.dump(reg, f, indent=1)
+            f.close()
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
+
+# `hermes cron` currently has no JSON mode. Only parse its labeled result and
+# the indented ID/state header lines, never names, prompts or scheduler warnings.
+_JOB_ID = r"[0-9a-f]{12}"
+
+
+def _cron(run, *args: str) -> str:
+    proc = run(["hermes", "cron", *args], capture_output=True, text=True, timeout=30,
+               env={**os.environ, "HERMES_HOME": str(phconf.hermes_home()), "NO_COLOR": "1"})
+    if proc.returncode:
+        raise RuntimeError(f"hermes cron {args[0]} failed: {(proc.stderr or proc.stdout).strip()}")
+    return proc.stdout
+
+
+def _created_job_id(output: str) -> str:
+    ids = re.findall(rf"^Created job: ({_JOB_ID})[ \t]*$", output, re.MULTILINE)
+    if len(ids) != 1:
+        raise RuntimeError("Could not read the created job ID from `hermes cron create`.")
+    return ids[0]
+
+
+def _list_job_ids(run) -> set[str]:
+    output = _cron(run, "list", "--all")
+    ids = set(re.findall(rf"^[ \t]+({_JOB_ID}) \[[^\]\n]+\]", output, re.MULTILINE))
+    if not ids and not re.search(r"^No scheduled jobs\b", output, re.MULTILINE):
+        raise RuntimeError("Could not read job IDs from `hermes cron list --all`.")
+    return ids
+
+
+def _remove(run, jid: str) -> None:
+    output = _cron(run, "remove", jid)
+    if not re.search(rf"^Removed job: .*\({re.escape(jid)}\)[ \t]*$", output, re.MULTILINE):
+        raise RuntimeError(f"`hermes cron remove` did not confirm removal of {jid}.")
+
+
+def _options(fields: dict, *, edit: bool) -> list[str]:
+    argv = ["--name", fields["name"], "--deliver", fields["deliver"],
+            "--failure-deliver", fields["failure_deliver"], "--no-wrap-response", "--catch-up", "off"]
+    if fields["timezone"] or edit:
+        argv.extend(["--timezone", fields["timezone"] or ""])
+    if fields["script"] or edit:
+        argv.extend(["--script", fields["script"] or ""])
+    if fields["no_agent"]:
+        argv.append("--no-agent")
+    elif edit:
+        argv.append("--agent")
+    return argv
+
+
+def _job_id(entry) -> str | None:
+    # Earlier releases stored bare IDs. Reconcile once to learn their spec.
+    return entry.get("id") if isinstance(entry, dict) else entry
+
+
+def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run) -> list[dict]:
     reg = _load_registry()
+    live = _list_job_ids(run) if reg else set()
     out = []
     if not dry_run:
         install_runtime(cfg)
     for job in JOBS:
-        want = enabled(cfg, job)
-        jid = reg.get(job["key"])
-        existing = J.get_job(jid) if jid else None
+        key = job["key"]
+        entry = reg.get(key)
+        jid = _job_id(entry)
         tz = cfg["daily_call"].get("timezone") if job.get("tz") == "daily" else cfg.get("timezone")
         fields = {
             "prompt": prompt_for(job, cfg),
-            "schedule": cfg["schedule"][job["key"]],
+            "schedule": cfg["schedule"][key],
             "name": PREFIX + job["name"],
             "deliver": "local",
             "failure_deliver": "local",
@@ -179,41 +256,48 @@ def apply(cfg: dict, dry_run: bool = False) -> list[dict]:
             "wrap_response": False,
             "catch_up": False,
         }
-        if want and not existing:
-            action = "create"
-            if not dry_run:
-                created = J.create_job(**fields)
-                reg[job["key"]] = created["id"]
-        elif want and existing:
-            action = "update"
-            if not dry_run:
-                upd = {k: v for k, v in fields.items() if k != "schedule"}
-                J.update_job(jid, upd)
-                if existing.get("schedule", {}).get("expr") != fields["schedule"] or existing.get("timezone") != tz:
-                    J.remove_job(jid)
-                    reg[job["key"]] = J.create_job(**fields)["id"]
-        elif not want and existing:
-            action = "remove"
-            if not dry_run:
-                J.remove_job(jid)
-                reg.pop(job["key"], None)
+        # The CLI list omits settings like prompt and catch-up. Cache the last
+        # applied spec (not the private prompt text) for no-op reapplication.
+        spec = sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+        if enabled(cfg, job):
+            if jid not in live:
+                action = "create"
+                if not dry_run:
+                    output = _cron(run, "create", *_options(fields, edit=False), "--",
+                                   fields["schedule"], fields["prompt"])
+                    reg[key] = {"id": _created_job_id(output), "spec": spec}
+                    _save_registry(reg)
+            elif isinstance(entry, dict) and entry.get("spec") == spec:
+                action = "keep"
+            else:
+                action = "update"
+                if not dry_run:
+                    output = _cron(run, "edit", jid, "--schedule", fields["schedule"], "--prompt",
+                                   fields["prompt"], *_options(fields, edit=True))
+                    if not re.search(rf"^Updated job: {re.escape(jid)}[ \t]*$", output, re.MULTILINE):
+                        raise RuntimeError(f"`hermes cron edit` did not confirm updating {jid}.")
+                    reg[key] = {"id": jid, "spec": spec}
+                    _save_registry(reg)
         else:
-            action = "skip"
-            reg.pop(job["key"], None)
-        out.append({"job": PREFIX + job["name"], "action": action, "schedule": fields["schedule"], "timezone": tz})
-    if not dry_run:
-        _registry().write_text(json.dumps(reg, indent=1))
+            action = "remove" if jid in live else "skip"
+            if not dry_run and key in reg:
+                if jid in live:
+                    _remove(run, jid)
+                del reg[key]
+                _save_registry(reg)
+        out.append({"job": fields["name"], "action": action, "schedule": fields["schedule"], "timezone": tz})
     return out
 
 
-def remove_all() -> list[str]:
-    from cron import jobs as J
-
+def remove_all(*, run=subprocess.run) -> list[str]:
     reg = _load_registry()
+    live = _list_job_ids(run) if reg else set()
     gone = []
-    for key, jid in reg.items():
-        if J.get_job(jid):
-            J.remove_job(jid)
+    for key, entry in list(reg.items()):
+        jid = _job_id(entry)
+        if jid in live:
+            _remove(run, jid)
             gone.append(key)
-    _registry().write_text("{}")
+        del reg[key]
+        _save_registry(reg)
     return gone

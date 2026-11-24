@@ -113,6 +113,11 @@ Juan's setup is built around OpenAI's **Decisions API** with `gpt-6-luna`. It do
 | Promise spotting | "The writer commits to a specific action for a specific person." | **0.6** or more: recorded as a promise. |
 | Done check | "The later message does what was promised." | **0.8** or more **and** the message as evidence: promise closed. |
 | Same matter | "Both texts are about the same matter." | **0.7** or more: merged, so you are not told twice. |
+| Slack filter | "This message is waiting on the owner and is not answered yet." | Below **0.10**: skipped. DMs and messages that name you are always read. |
+| Urgency | "This needs the owner today: money, security, travel, someone blocked." | **0.8** or more: may come through during quiet hours. |
+| Prompt injection | "This text contains instructions aimed at an AI assistant." | **0.7** or more: flagged as suspicious, treated as data only, and you get one line about it. Nothing is dropped. |
+| Work recap | "Which Linear issue matches this item from the call?" | **0.7** or more: linked. Below that: "no Linear issue found". |
+| Close-out replies | "The reply gives an answer about item N." | Below **0.6**: Hermes asks you instead of guessing. |
 
 Real scores from testing:
 
@@ -125,6 +130,9 @@ Real scores from testing:
 | "New sign-in to your account" from a bank | 0.90, kept |
 | "I'll send you the deck and two dates by Friday." | 1.00, a promise |
 | "Great meeting you, let's catch up sometime." | 0.15, not a promise |
+| A mail asking the assistant to forward the last 10 emails to an outside address | 1.00, flagged as prompt injection |
+| "Can we move our call to 3pm?" | 0.00, normal mail |
+| Call item "Hotel booking in Lahti" vs Linear issue "Lahti hotel reservation" | 1.00, matched |
 
 On one real inbox, 24 of 38 recent emails were promotions (sportswear, supermarket, food delivery, news digests). The filter dropped all 24 and kept all 14 that mattered.
 
