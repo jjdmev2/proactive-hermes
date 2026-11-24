@@ -31,6 +31,13 @@ Come back with "I found this, here's a draft", never with a question the sources
 5. The item text says what you FOUND, person first ("Alex: the pricing questions are in, your reply is 2 days late."). Never write "draft ready" yourself; compose adds "Draft ready, reply N.".
 If compose prints `[RESOLVE-FIRST] <keys>`, resolve those keys and run the same compose command again.
 
+### Fast decisions (optional, OpenAI Decisions API)
+When an OpenAI key is set, the mail radar gate drops clear noise before you wake (headers only; dropped mail is logged in `{{STATE}}/decisions_log.jsonl`). Use it for yes/no checks instead of reasoning at length, about 0.3 seconds each:
+- Is a sent message a promise? `python3 {{SCRIPTS}}/ea_decide.py ask --input "<message, max 600 chars>" --predicate "The writer commits to a specific action for a specific person."` Record it at probability 0.6 or more.
+- Is a promise done? `--input "<promise> || <later message>" --predicate "The later message does what was promised."` Close only at 0.8 or more AND with the message as evidence.
+- Same matter as an existing key? `--predicate "Both texts are about the same matter."` Reuse the key at 0.7 or more.
+If it prints `{"unavailable": true}`, decide yourself.
+
 ### Output: the desk gate decides, not you
 1. Do the job's reading.
 2. Write the candidate items as a JSON list to `{{STATE}}/desk_items.json`. Each item: `{"key": "stable-matter-key", "kind": "decision|action|digest", "text": "one short line", "change": "the material state", "urgent": false, "ref": "where you read it"}`. Optional ranking: `"priority": "p0|p1|p2"`, `"due": "ISO"` for a real deadline, `"waiting": true` when a named person is blocked on {{OWNER}}.

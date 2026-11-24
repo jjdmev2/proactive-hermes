@@ -26,6 +26,7 @@ QUESTIONS = [
     ("quiet_hours", "Quiet hours, when only urgent things may reach you (e.g. 23-7)?", "quiet_hours", "hours"),
     ("holidays", "Public holidays to skip, as country codes (e.g. DE,US), or none?", "holidays", "list"),
     ("owner.work_emails", "Your work email addresses (comma separated), so drafts never mix work and personal?", None, "list"),
+    ("decisions.enabled", "Use OpenAI's fast decision model to filter noise and spot promises? Needs OPENAI_API_KEY, about 3 cents per 1,000 emails. (y/n)", "decisions.enabled", "bool"),
     ("mail.gmail_api", "Read Gmail and Google Calendar through the google-workspace skill? (y/n)", "mail.gmail_api", "bool"),
     ("mail.himalaya_accounts", "Other mail accounts set up in himalaya to read (names, comma separated), or none?", None, "list"),
     ("calendar.enabled", "May I put private focus blocks on your calendar for key tasks? (y/n)", "calendar.enabled", "bool"),
@@ -153,6 +154,18 @@ def apply_answers(cfg: dict, answers: dict) -> dict:
     return cfg
 
 
+def decisions_note(cfg: dict) -> str:
+    d = cfg.get("decisions", {})
+    if not d.get("enabled"):
+        return ""
+    import ea_decide
+    if ea_decide.api_key():
+        return "Fast decisions: OpenAI key found, noise filter and promise checks are on."
+    msg = (f"No OPENAI_API_KEY found. Add one to {phconf.hermes_home() / '.env'} (a few dollars of credit at "
+           "platform.openai.com lasts months). Until then the desk works without the fast filter.")
+    return ("Juan's setup is tuned for OpenAI's Decisions API. " + msg) if d.get("required") else msg
+
+
 def write_config(cfg: dict) -> Path:
     p = phconf.config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +223,9 @@ def handle(args) -> int:
         for row in jobs.apply(cfg, dry_run=True):
             print(f"  would {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
         return 0
+    key_note = decisions_note(cfg)
+    if key_note:
+        print(key_note)
     path = write_config(cfg)
     phconf.CFG = cfg
     rows = jobs.apply(cfg)

@@ -13,4 +13,9 @@ description: >
   books or pays. Set up with `hermes proactive setup` (Juan's setup or your own answers).
 requires_hermes: ">=0.23.4"
 provides_tools: []
-provides_hooks: []
+provides_hooks: [pre_llm_call]
+optional_env:
+  - name: OPENAI_API_KEY
+    description: "Optional. Enables the fast decision filter (OpenAI Decisions API, gpt-6-luna): noise filtering and promise checks for about 3 cents per 1,000 emails. Recommended for Juan's setup."
+    url: https://platform.openai.com/api-keys
+    secret: true

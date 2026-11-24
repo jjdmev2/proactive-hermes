@@ -211,6 +211,17 @@ def main() -> int:
         return 0
 
     fresh.sort(key=lambda m: m["date"], reverse=True)
+    # Fast first filter (OpenAI Decisions API): drop mail the owner almost surely does not need.
+    # Headers only. Fail open: no key or any error keeps every message.
+    triage = {"used": False}
+    try:
+        import ea_decide
+        fresh, _dropped, triage = ea_decide.triage_mail(fresh)
+    except Exception as exc:  # never let the filter hide mail
+        triage = {"used": False, "reason": type(exc).__name__}
+    if not fresh and not gaps:
+        print(json.dumps({"wakeAgent": False, "triage": triage}), flush=True)
+        return 0
     context = {
         "new_mail": len(fresh),
         "oldest": fresh[-1]["date"],
@@ -219,6 +230,8 @@ def main() -> int:
     }
     if gaps:
         context["gate_gaps"] = gaps[:12]
+    if triage.get("used"):
+        context["triage"] = triage
     print(
         json.dumps({"wakeAgent": True, "context": context}, ensure_ascii=False),
         flush=True,
