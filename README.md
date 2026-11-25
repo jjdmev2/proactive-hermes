@@ -1,20 +1,14 @@
-<div align="center">
-  <a href="https://heyrito.ai"><img src="docs/assets/rito-logo.png" alt="Rito" width="112" height="112" /></a>
-  <h1>Proactive Hermes</h1>
-  <p><strong>It watches your mail, calendar, work tools and the things you care about, and acts before you have to ask.</strong></p>
-  <p>A proactive executive-assistant desk for <a href="https://hermes-agent.nousresearch.com">Hermes Agent</a>.<br />Built by <a href="https://heyrito.ai">HeyRito.AI</a>.</p>
-  <p>
-    <img src="https://img.shields.io/badge/hermes-%3E%3D0.23.4-0f766e" alt="Hermes 0.23.4 or newer" />
-    <img src="https://img.shields.io/badge/type-plugin-334155" alt="Hermes plugin" />
-    <img src="https://img.shields.io/badge/actions-approval--first-0f766e" alt="Approval-first actions" />
-    <img src="https://img.shields.io/badge/decisions-OpenAI%20gpt--6--luna-0f766e" alt="OpenAI Decisions API" />
-    <img src="https://img.shields.io/badge/status-beta-d97706" alt="Beta" />
-    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-8b5cf6" alt="MIT license" /></a>
-  </p>
-  <p>
-    <a href="#install"><strong>Install</strong></a> · <a href="#set-it-up"><strong>Set it up</strong></a> · <a href="#instant-mail-push-optional">Mail push</a> · <a href="#how-it-works"><strong>How it works</strong></a> · <a href="#what-it-looks-like">Screenshots</a> · <a href="#real-examples">Real examples</a> · <a href="#the-decision-model-highly-recommended">Decision model</a> · <a href="#what-it-does">Features</a> · <a href="#make-it-your-own">Make it your own</a> · <a href="#privacy-and-safety">Privacy</a> · <a href="#built-by-heyritoai">About</a>
-  </p>
-</div>
+[![Rito](docs/assets/rito-logo-112.png)](https://heyrito.ai)
+
+# Proactive Hermes
+
+**It watches your mail, calendar, work tools and the things you care about, and acts before you have to ask.**
+
+A proactive executive-assistant desk for [Hermes Agent](https://hermes-agent.nousresearch.com). Built by [HeyRito.AI](https://heyrito.ai).
+
+![Hermes 0.23.4 or newer](https://img.shields.io/badge/hermes-%3E%3D0.23.4-0f766e) ![Hermes plugin](https://img.shields.io/badge/type-plugin-334155) ![Approval-first actions](https://img.shields.io/badge/actions-approval--first-0f766e) ![OpenAI Decisions API](https://img.shields.io/badge/decisions-OpenAI%20gpt--6--luna-0f766e) ![Beta](https://img.shields.io/badge/status-beta-d97706) [![MIT license](https://img.shields.io/badge/license-MIT-8b5cf6)](LICENSE)
+
+**[Install](#install)** · **[Set it up](#set-it-up)** · [Mail push](#instant-mail-push-optional) · **[How it works](#how-it-works)** · [Screenshots](#what-it-looks-like) · [Real examples](#real-examples) · [Decision model](#the-decision-model-highly-recommended) · [Features](#what-it-does) · [Make it your own](#make-it-your-own) · [Privacy](#privacy-and-safety) · [About](#built-by-heyritoai)
 
 ---
 
@@ -38,30 +32,25 @@ Real messages from the Hermes app. Private details blurred.
 
 #### Mail and work
 
-<table>
-<tr>
-<td width="50%" valign="top"><img src="docs/assets/screens/01-email-draft.png" alt="A teammate asks how to install. The reply is drafted before you open the mail." width="100%" /><br /><sub>A teammate asks how to install. The reply is drafted before you open the mail.</sub></td>
-<td width="50%" valign="top"><img src="docs/assets/screens/02-shipped-update.png" alt="Last week's releases, checked against Linear, turned into a client update." width="100%" /><br /><sub>Last week's releases, checked against Linear, turned into a client update.</sub></td>
-</tr>
-</table>
+| ![A teammate asks how to install. The reply is drafted before you open the mail.](docs/assets/screens/01-email-draft.png) | ![Last week's releases, checked against Linear, turned into a client update.](docs/assets/screens/02-shipped-update.png) |
+| :--- | :--- |
+| A teammate asks how to install. The reply is drafted before you open the mail. | Last week's releases, checked against Linear, turned into a client update. |
 
 #### Looking ahead
 
-<table>
-<tr>
-<td width="50%" valign="top"><img src="docs/assets/screens/03-train-uber-leave.png" alt="Train blocked on the calendar, walk time from your phone, an Uber quote, then the reminder to leave." width="100%" /><br /><sub>Train blocked on the calendar, walk time from your phone, an Uber quote, then the reminder to leave.</sub></td>
-<td width="50%" valign="top"><img src="docs/assets/screens/04-quote-in-app.png" alt="Tapping it opens the quote with Uber's own screen. Nothing is booked until you say yes." width="100%" /><br /><sub>Tapping it opens the quote with Uber's own screen. Nothing is booked until you say yes.</sub></td>
-</tr>
-</table>
+| ![Train blocked on the calendar, walk time from your phone, an Uber quote, then the reminder to leave.](docs/assets/screens/03-train-uber-leave.png) | ![Tapping it opens the quote with Uber's own screen. Nothing is booked until you say yes.](docs/assets/screens/04-quote-in-app.png) |
+| :--- | :--- |
+| Train blocked on the calendar, walk time from your phone, an Uber quote, then the reminder to leave. | Tapping it opens the quote with Uber's own screen. Nothing is booked until you say yes. |
 
 #### Watches
 
-<table>
-<tr>
-<td width="50%" valign="top"><img src="docs/assets/screens/05-seat-alarm.png" alt="A seat opened at a sold out event. The alarm is set to ring through Focus." width="100%" /><br /><sub>A seat opened at a sold out event. The alarm is set to ring through Focus.</sub></td>
-<td width="50%" valign="top"><img src="docs/assets/screens/06-vinted-offer.png" alt="A buyer offer on Vinted, ready to answer." width="100%" /><br /><sub>A buyer offer on Vinted, ready to answer.</sub><br /><br /><img src="docs/assets/screens/07-stock-and-prep.png" alt="Shop stock found, and prep before a client call." width="100%" /><br /><sub>Shop stock found, and prep before a client call.</sub></td>
-</tr>
-</table>
+| ![A seat opened at a sold out event. The alarm is set to ring through Focus.](docs/assets/screens/05-seat-alarm.png) | ![A buyer offer on Vinted, ready to answer.](docs/assets/screens/06-vinted-offer.png) |
+| :--- | :--- |
+| A seat opened at a sold out event. The alarm is set to ring through Focus. | A buyer offer on Vinted, ready to answer. |
+
+![Shop stock found, and prep before a client call.](docs/assets/screens/07-stock-and-prep.png)
+
+Shop stock found, and prep before a client call.
 
 ## Real examples
 
@@ -359,7 +348,4 @@ Proactive Hermes is the desk we use every day at **[HeyRito.AI](https://heyrito.
 
 ---
 
-<div align="center">
-  <strong>Proactive Hermes</strong><br />
-  Built by <a href="https://heyrito.ai">HeyRito.AI</a> · Rito, the security and governance layer for AI at work.
-</div>
+**Proactive Hermes**, built by [HeyRito.AI](https://heyrito.ai). Rito, the security and governance layer for AI at work.
