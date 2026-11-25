@@ -28,7 +28,7 @@ Proactive Hermes runs a small desk inside your own Hermes. Scheduled jobs read y
 
 When it does write, it brings the work with it. Small things are already done (the calendar block is in, the reminder is set), and the rest is prepared so a "yes" finishes it:
 
-> "Train to Tampere Fri 07:12: blocked, leave at 06:35 (10 min buffer)."
+> "Train to Lahti Fri 07:12: blocked, leave at 06:35 (10 min buffer)."
 > "Alex: the pricing questions are in, your reply is 2 days late. Draft ready, reply 1."
 > "Buyer offers 356 for the graphics card (listed 400). Counter at 380? Reply 1."
 
