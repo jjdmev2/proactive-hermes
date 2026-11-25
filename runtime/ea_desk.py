@@ -289,8 +289,12 @@ def render_message(header: str | None, items: list[str], worth: list[str], more:
     return render_parts(header, items, worth, more)[0]
 
 
+# Jobs whose items carry a whole briefing in one line (meeting prep: who, last thread, owe, goal, ask).
+LONG_LINE_JOBS = {"meeting-prep": 400}
+
+
 def render_parts(header: str | None, items: list[str], worth: list[str], more: int = 0,
-                 suffixes: list[str] | None = None) -> tuple[str, int]:
+                 suffixes: list[str] | None = None, line_limit: int | None = None) -> tuple[str, int]:
     """Return (message, how many of `items` made it in). Items cut for length are the caller's
     to roll over, so nothing is marked said that the owner never saw."""
     heading = ""
@@ -303,7 +307,7 @@ def render_parts(header: str | None, items: list[str], worth: list[str], more: i
     if count > 1:
         heading = heading or f"Hey {phconf.owner()}, {count} things:"
     caps = phconf.CFG["caps"]
-    line_chars = caps["line_chars"]
+    line_chars = line_limit or caps["line_chars"]
     lines = []
     for i, text in enumerate(items, 1):
         base = _clean_message_text(text) or "Note"
@@ -621,7 +625,8 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
         draft_rows = [drafts_by_item.get((i["key"], fp(i))) if is_resolvable(i) else None for i in speak]
         suffixes = [ea_resolve.suffix(rec, n) for n, rec in enumerate(draft_rows, 1)]
         texts = [i["text"].replace("\u2013", "-") if is_resolvable(i) else i["text"] for i in speak]
-        message, kept = render_parts(a.header if a.brief else None, texts, worth, more=len(overflow), suffixes=suffixes)
+        message, kept = render_parts(a.header if a.brief else None, texts, worth, more=len(overflow), suffixes=suffixes,
+                                     line_limit=LONG_LINE_JOBS.get(getattr(a, "job", "")))
         overflow = speak[kept:] + overflow  # cut for length: rolls over, never marked said
         speak, draft_rows = speak[:kept], draft_rows[:kept]
     for it in overflow:

@@ -44,6 +44,11 @@ DEFAULTS: dict = {
     "lookahead": {"calendar_account": "", "mail_account": "", "home_places": [], "watch_words": [],
                   "airport_codes": [], "senders": {}, "keywords": {}, "mail_query": "",
                   "skip_accounts": [], "folders": {}, "generic_words": []},
+    # Meeting prep (meeting_prep_gate.py): meetings starting window_min..window_max minutes from now are offered once.
+    # own_domains = mail domains that count as internal (empty: the domains of owner.work_emails); daily_regex marks
+    # the team daily that is always prepped (matched case-insensitively against the title).
+    "meeting_prep": {"window_min": 15, "window_max": 75, "own_domains": [],
+                     "daily_regex": "\\b(daily|stand-?up|scrum)\\b", "max_meetings": 3},
     "reminders": {"enabled": False, "per_day": 6},
     "watches": [],
     "mail": {"gmail_api": False, "himalaya_accounts": [], "noise_senders": [], "noise_subjects": []},
@@ -59,6 +64,7 @@ DEFAULTS: dict = {
         "morning_brief": True, "evening_brief": True, "weekly_review": True, "mail_radar": True,
         "slack_sweep": False, "promises": True, "resolve_first": True, "work_recap": False,
         "health": True, "lookahead": False,  # look-ahead is opt-in through setup
+        "meeting_prep": True,  # standard; the job only exists when a calendar is connected
     },
     "schedule": {
         "morning_brief": "0 8 * * 1-5",
@@ -71,6 +77,7 @@ DEFAULTS: dict = {
         "work_recap_evening": "0 21 * * 1-5",
         "health": "7 * * * *",
         "lookahead": "*/30 7-22 * * *",
+        "meeting_prep": "*/15 7-21 * * *",
         "tick": "*/10 7-23 * * *",
     },
 }

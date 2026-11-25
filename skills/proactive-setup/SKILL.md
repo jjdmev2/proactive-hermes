@@ -30,6 +30,8 @@ Ask exactly this, as two choices:
 1. **Juan's setup**: the proven defaults. Morning brief 08:00, mail radar every 15 min, Slack sweep hourly on workdays, promise tracker 3 times a day, work recap after the daily call, evening close-out 21:30, weekly review Friday 15:00, quiet hours 23 to 7, drafts first. You only fill in your own details.
 2. **My own**: start blank and choose everything.
 
+Both paths include meeting prep: one short prep line about 15 to 75 minutes before a meeting with other people, and "prep tonight" items in the evening brief for tomorrow's meetings; it is on whenever a calendar is connected (off with `{"features": {"meeting_prep": false}}`).
+
 Both paths use the same questions below; with Juan's setup, offer the preset value as the default and accept "ok" to keep it.
 
 ## 2. Say what you already know, then ask only what is missing
