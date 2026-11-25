@@ -95,7 +95,7 @@ First you pick a starting point:
 
 | Option | What you get |
 | :--- | :--- |
-| **1. Juan's setup** | The defaults Juan Oliva (who built this at HeyRito.AI) runs every day: morning brief 08:00, mail radar every 15 minutes, Slack sweep hourly on workdays, promise tracker 3 times a day, work recap after the daily call, evening close-out 21:30, weekly review Friday 15:00, quiet hours 23:00 to 07:00, drafts before questions. Built for the decision model. You only fill in your own details. |
+| **1. Juan's setup** | An example default: the setup Juan (who built this while building HeyRito.AI) runs every day: morning brief 08:00, mail radar every 15 minutes, Slack sweep hourly on workdays, promise tracker 3 times a day, work recap after the daily call, evening close-out 21:30, weekly review Friday 15:00, quiet hours 23:00 to 07:00, drafts before questions. Built for the decision model. You only fill in your own details. |
 | **2. My own** | Start blank. Hermes asks about your day and builds the desk around it. |
 
 Hermes does not ask what it already knows. It starts with one message listing what it found (your name from its memory, your timezone, connected mail, calendar, Slack, Linear and the OpenAI key) and asks if that is right. Then it asks only what is missing, one question at a time, each with a short reason: quiet hours, holiday countries, which channels to watch, when your team's daily call happens.
