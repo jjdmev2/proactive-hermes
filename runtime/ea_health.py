@@ -231,6 +231,43 @@ def check_device() -> None:
         fault("owner", f"{phconf.owner()}, open Hermes on your phone to sync pending reminders.")
 
 
+PHONE_STALE = timedelta(minutes=60)
+PHONE_HOURS = (8, 22)  # owner's timezone; a phone asleep at night is normal
+
+
+def phone_last_seen():
+    """When the phone last talked to the bridge: devices.seen, else the newest landed/done outbox row."""
+    try:
+        db = sqlite3.connect(f"file:{BRIDGE_DB}?mode=ro", uri=True, timeout=5)
+        row = db.execute("SELECT max(seen) FROM devices").fetchone()
+        db.close()
+        if row and row[0] is not None:
+            return datetime.fromtimestamp(float(row[0]), timezone.utc)
+    except Exception:
+        pass
+    try:
+        box = json.loads((STATE_DIR / "reminder_outbox.json").read_text())
+    except Exception:
+        return None
+    stamps = [parse_ts(v.get(f)) for v in box.values() if isinstance(v, dict) for f in ("landed", "done")]
+    return max((s for s in stamps if s), default=None)
+
+
+def check_phone_sync() -> None:
+    """Phone reminders and alarms only land when the phone wakes the Hermes app. If it has not synced for an
+    hour during the day, tell the owner once (the 2-day case is check_device's line, not this one)."""
+    local = now().astimezone(phconf.tz())
+    if not PHONE_HOURS[0] <= local.hour < PHONE_HOURS[1]:
+        return
+    seen = phone_last_seen()
+    if seen is None:
+        return  # unpaired is check_device's fault
+    age = now() - seen
+    if PHONE_STALE < age <= timedelta(hours=48):
+        fault("owner", f"Phone has not synced for {int(age.total_seconds() // 60)} min: open Hermes once; "
+                       "check Background App Refresh")
+
+
 def last_response(job_id: str):
     try:
         latest = max((OUTPUT / job_id).glob("*.md"), key=lambda p: p.stat().st_mtime)
@@ -339,6 +376,7 @@ def main() -> int:
         steps.append(check_google)
     if phconf.CFG["reminders"]["enabled"]:
         steps.append(check_device)
+        steps.append(check_phone_sync)
     if phconf.CFG["features"]["resolve_first"]:
         steps.append(check_resolve)
     for step in steps:

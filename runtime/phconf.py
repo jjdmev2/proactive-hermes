@@ -65,6 +65,10 @@ DEFAULTS: dict = {
         "slack_sweep": False, "promises": True, "resolve_first": True, "work_recap": False,
         "health": True, "lookahead": False,  # look-ahead is opt-in through setup
         "meeting_prep": True,  # standard; the job only exists when a calendar is connected
+        # IMAP IDLE on the mail radar's himalaya accounts pokes the radar on new mail (runtime/mail_idle.py,
+        # gateway only). Gmail API only accounts stay on polling; polling always stays on as the safety net.
+        "mail_push": True,
+        "calendar_alerts": True,  # standard; time-critical reminders and alarms also become calendar alerts
     },
     "schedule": {
         "morning_brief": "0 8 * * 1-5",
@@ -150,6 +154,15 @@ def allowed(action: str, *, cfg: dict | None = None) -> str:
     if action in AUTO_ACTIONS and isinstance(auto, list) and action in auto:
         return "auto"
     return "ask"
+
+
+def calendar_alerts_on(*, cfg: dict | None = None) -> bool:
+    """Time-critical reminders and alarms also become calendar alerts the phone fires by itself.
+    On by default whenever a Google calendar is connected; off with features.calendar_alerts or a
+    'never' on calendar_blocks."""
+    c = CFG if cfg is None else cfg
+    return bool(c.get("calendar", {}).get("enabled") and c.get("features", {}).get("calendar_alerts", True)
+                and allowed("calendar_blocks", cfg=c) != "never")
 
 
 def tz() -> ZoneInfo:

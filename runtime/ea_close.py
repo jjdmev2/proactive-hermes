@@ -18,6 +18,9 @@ A key that exists in no desk record (ledger, promises, goals, phone outbox, said
 the answer is {"status": "unknown_key"} and nothing is written. Closing a key that recurs (a monthly bill)
 records when it was closed and what it said; ea_desk lets it speak again once its text changes after 7 days.
 
+Also deletes the item's calendar alert ('ea:alert:<key>', see ea_reminders.py) when the desk's records show
+one exists, through `ea_calendar_block.py delete`, which only touches events Proactive Hermes created.
+
 Never deletes anything on the phone or calendar the desk did not create. Prints JSON.
 """
 from __future__ import annotations
@@ -164,8 +167,16 @@ def close(key: str, why: str = "", status: str = "done", evidence: str | None = 
         rem_out = {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:200]}
     if rem_out.get("status") in {"closing", "done"}:
         touched.append("phone reminder")
+    try:
+        alert_out = reminders.delete_alert(key)
+    except Exception as exc:
+        alert_out = {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:200]}
+    if alert_out and alert_out.get("status") == "deleted":
+        touched.append("calendar alert")
     # ea_desk.compose skips a closed key while its text is unchanged (and for 7 days), so it is not raised again.
     out = {"key": key, "status": status, "closed_in": touched, "reminder": rem_out}
+    if alert_out is not None:
+        out["calendar_alert"] = alert_out
     if errors:
         out["errors"] = errors
     return out

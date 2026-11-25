@@ -53,6 +53,8 @@ For "My own", also ask:
 - How often to check mail (every 15, 30 or 60 minutes)?
 - Track promises you make in mail and Slack? Weekly review on which day?
 
+Mail push needs no extra step: new mail wakes the radar through IMAP IDLE on the mail logins already set up in himalaya; accounts read only through the Gmail API stay on polling (`hermes proactive doctor` shows which).
+
 If no OpenAI key was found, say once: "Juan's setup is built for OpenAI's decision model. With a key and a few dollars of credit it filters noise and spots promises for about 3 cents per 1,000 emails. Want to add one now, or go without?"
 
 ## 3. What it may do, the phone, and first watches
@@ -67,6 +69,11 @@ Ask these three in plain words, after the details:
    - events (Luma, Eventbrite, a conference, a concert): "tell me when registration opens, draft the form"
    - work tools: "remind me when a PR waits on me for more than a day"
    For accounts the watch needs (a shop login, Luma, a marketplace), tell them to sign in once in the browser Hermes uses, never to share passwords in chat.
+
+**Phone checklist** (say it once, plainly). Phone reminders and alarms land only when the phone wakes the Hermes app, so urgent items also become calendar alerts the phone fires by itself. For that to work on an iPhone:
+- Add the work Google account (the connected calendar) to the iPhone Calendar app (Settings > Calendar > Accounts) and turn on its notifications (Settings > Notifications > Calendar).
+- Turn on Background App Refresh for Hermes (Settings > General > Background App Refresh).
+- Low Power Mode pauses background refresh, so reminders and alarms from Hermes arrive late while it is on. Calendar alerts still fire.
 
 ## 4. Apply
 

@@ -31,7 +31,7 @@ class AlarmTests(OfflineTestCase):
         self.assertTrue(key)
         self.wake.assert_called_once_with("fake-phone")
 
-    def test_retry_requires_confirmed_expiry_and_stops_when_landed(self):
+    def test_pending_waits_and_landed_is_recorded(self):
         rid = self.alarm()["request_id"]
         for status in ("pending", "running"):
             self.store.results[rid] = {"status": status}
@@ -39,18 +39,27 @@ class AlarmTests(OfflineTestCase):
         with patch.object(self.store, "result", side_effect=OSError("read failed")):
             self.assertEqual(self.cli(reminders, "tick"), "")
         self.assertEqual(len(self.store.requests), 1)
-        self.store.results[rid] = {"status": "expired"}
-        self.cli(reminders, "tick")
-        self.assertEqual(len(self.store.requests), 2)
-        self.assertNotEqual(self.store.requests[0][2], self.store.requests[1][2])
-        self.assertEqual(self.store.requests[1][:2], self.store.requests[0][:2])
-        self.store.results["request-2"] = {"status": "succeeded", "result": {"data": {"id": "alarm-1"}}}
+        self.store.results[rid] = {"status": "succeeded", "result": {"data": {"id": "alarm-1"}}}
         self.cli(reminders, "tick")
         self.cli(reminders, "tick")
         ledger = self.read_json(self.tmp / reminders.LEDGER)["urgent"]
         self.assertEqual((ledger["alarm_status"], ledger["alarm_id"]), ("landed", "alarm-1"))
         self.assertNotIn("reminder_id", ledger)
+        self.assertEqual(len(self.store.requests), 1)
+
+    def test_expired_or_late_alarm_is_logged_and_never_retried(self):
+        # A retried alarm reaches the phone after its time and is refused, so the calendar alert is the net.
+        for key, result in (("a", {"status": "expired"}),
+                            ("b", {"status": "failed", "error": "The alarm time has already passed"})):
+            rid = self.alarm(key)["request_id"]
+            self.store.results[rid] = result
+            self.cli(reminders, "tick")
+            self.cli(reminders, "tick")
         self.assertEqual(len(self.store.requests), 2)
+        box = self.read_json(self.tmp / reminders.OUTBOX)
+        self.assertEqual((box["a"]["status"], box["b"]["status"]), ("expired", "failed"))
+        rows = self.rows(self.tmp / reminders.RUN_LOG)
+        self.assertEqual([r["alarm_failed"] for r in rows if "alarm_failed" in r], ["a", "b"])
 
     def test_no_authority_or_revoked_authority(self):
         rid = self.alarm()["request_id"]

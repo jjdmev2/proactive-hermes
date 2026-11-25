@@ -54,7 +54,10 @@ When an OpenAI key is set, the mail radar gate drops clear noise before you wake
 If it prints `{"unavailable": true}`, decide yourself.
 
 ### Closing items
-When {{OWNER}} says an item is done, removed, old or not needed, or you find proof it is done: write their words or the proof to a file, then `python3 {{SCRIPTS}}/ea_close.py --key KEY --why-file <file> [--status dropped]` (find the key with `--find WORD`, one plain word of letters and digits). It closes the ledger, promise or goal and ticks off the phone reminder. Deleting a calendar event or replying in chat is not closing.
+When {{OWNER}} says an item is done, removed, old or not needed, or you find proof it is done: write their words or the proof to a file, then `python3 {{SCRIPTS}}/ea_close.py --key KEY --why-file <file> [--status dropped]` (find the key with `--find WORD`, one plain word of letters and digits). It closes the ledger, promise or goal, ticks off the phone reminder and deletes the item's `ea:alert:<key>` calendar alert. Deleting a calendar event or replying in chat is not closing.
+
+### Time-critical = calendar alert
+Phone reminders and alarms land only when the phone wakes the Hermes app, which can take minutes (a late alarm is refused). So an urgent item gets a Bot Chat line plus a calendar alert, which the phone fires by itself. `ea_reminders.py add` adds the alert on its own when the priority is high or the due time is within 12 h (`--no-calendar-alert` opts out); `ea_reminders.py alarm` sets the alarm and the alert together; a bare alert is `python3 {{SCRIPTS}}/ea_calendar_block.py alert --key ea:alert:<key> --title-file <file> --at ISO`. The phone reminder or alarm is a bonus. Never rely on the phone app for anything due within 30 min.
 
 ### Look ahead like Dots
 Upcoming plans get checked before {{OWNER}} feels the need, the way OpenAI's Dots assistant does. `{{SCRIPTS}}/ea_lookahead.py` decides WHEN (stakes-based checkpoints: flights from 30 days out, trains, buses and in-town events from 7 days, ticket sales and bills ahead of their date; the latest due checkpoint only). You decide WHAT to say. For each due checkpoint:

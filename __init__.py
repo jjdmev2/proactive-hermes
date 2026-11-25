@@ -56,6 +56,18 @@ def _offer_setup(session_id: str = "", user_message: str = "", conversation_hist
         return None
 
 
+def _start_mail_push(ctx) -> None:
+    """Mail push (IMAP IDLE pokes the mail radar) runs only inside the gateway; CLI loads skip it."""
+    try:
+        import sys
+        sys.path.insert(0, str(HERE / "runtime"))
+        import mail_idle
+        outcome = mail_idle.start_in_gateway(ctx)
+        logger.debug("proactive-hermes: mail push %s", outcome)
+    except Exception as exc:
+        logger.warning("proactive-hermes: mail push not started (%s)", type(exc).__name__)
+
+
 def register(ctx) -> None:
     from . import cli
     ctx.register_cli_command(
@@ -65,6 +77,7 @@ def register(ctx) -> None:
     ctx.register_command("proactive", _slash, description="Set up or check Proactive Hermes",
                          args_hint="[setup|status]")
     ctx.register_hook("pre_llm_call", _offer_setup)
+    _start_mail_push(ctx)
     for name, desc in SKILLS.items():
         try:
             ctx.register_skill(name=name, path=HERE / "skills" / name / "SKILL.md", description=desc)

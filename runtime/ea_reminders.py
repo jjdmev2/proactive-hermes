@@ -9,11 +9,20 @@ A reminder the desk created (it has the id) is ticked off on the phone once its 
 finished in the promise, goal or action records; the same expiry rules apply to that request.
 
   ea_reminders.py add --key KEY --title T [--due ISO | --due-date D] [--notes N] [--priority P]
+                      [--no-calendar-alert]
   ea_reminders.py alarm --key KEY --at ISO --label TEXT  # urgent only, requires automatic alarm authority
   ea_reminders.py adopt --key KEY --request-id RID       # track a reminder made via the tool
   ea_reminders.py close --key KEY [--evidence E]        # item is done: tick the phone reminder off
   ea_reminders.py tick                                  # check / re-queue / close finished items (silent)
   ea_reminders.py status
+
+Time-critical = calendar alert. The bridge delivers only when the phone wakes the Hermes app, which can
+take minutes (an alarm that arrives after its time is refused). With a calendar connected and
+features.calendar_alerts on (the default), a reminder that is priority high or due within 12 h ALSO gets
+a calendar alert (key 'ea:alert:<key>', popup at 0 min, ea_calendar_block.py alert) that the phone fires
+by itself; the phone reminder is a bonus. When a queued request expires or fails and the due time is still
+more than 2 min away, the alert is made sure of (idempotent). Alarms always get the alert; an alarm that
+expires or comes back 'already passed' is logged, never retried.
 """
 from __future__ import annotations
 
@@ -22,9 +31,12 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import os
+import subprocess
 import sys
+import tempfile
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -42,6 +54,9 @@ TTL = 900
 DONE = {"done", "closed", "dropped", "resolved", "cancelled", "complete", "completed"}
 # Outbox keys that track the same thing as a promise or goal under another name: {outbox_key: record_key}.
 ALIASES: dict[str, str] = {}
+CAL_BLOCK = Path(__file__).resolve().parent / "ea_calendar_block.py"
+CRITICAL_WITHIN = timedelta(hours=12)   # due this soon = time-critical, gets a calendar alert
+RESCUE_LEAD = timedelta(minutes=2)      # bridge gave up: still worth an alert if due is further than this
 
 
 def now_iso() -> str:
@@ -155,6 +170,107 @@ def submit(store, box: dict, item: dict) -> None:
     box[item["key"]] = item
     save(OUTBOX, box)
     wake(req["device_id"])
+
+
+def alert_key(key: str) -> str:
+    return "ea:alert:" + key
+
+
+def parse_due(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=phconf.tz())
+
+
+def time_critical(priority, due) -> bool:
+    """Priority high, or a due time within the next 12 h (past due counts too; it just gets no alert)."""
+    if str(priority or "").lower() == "high":
+        return True
+    when = parse_due(due)
+    return bool(when and when - datetime.now(phconf.tz()) <= CRITICAL_WITHIN)
+
+
+def calendar_cli(args: list[str], texts: dict[str, str] | None = None) -> dict:
+    """Run ea_calendar_block.py. Text goes through --NAME-file in a private temp dir, never argv."""
+    tmpdir = tempfile.mkdtemp(prefix="ph_alert_")
+    try:
+        argv = [sys.executable, str(CAL_BLOCK), *args]
+        for name, text in (texts or {}).items():
+            path = Path(tmpdir) / f"{name}.txt"
+            path.write_text(text or "", encoding="utf-8")
+            argv += [f"--{name}-file", str(path)]
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        try:
+            return json.loads(proc.stdout.strip().splitlines()[-1])
+        except Exception:
+            return {"status": "error", "error": (proc.stderr or proc.stdout)[-200:]}
+    finally:
+        for f in Path(tmpdir).glob("*"):
+            f.unlink(missing_ok=True)
+        os.rmdir(tmpdir)
+
+
+def calendar_alert(key: str, title: str, at: str, notes: str = "") -> dict:
+    return calendar_cli(["alert", "--key", key, "--at", at], {"title": title, "notes": notes})
+
+
+def ensure_alert(item: dict, lead: timedelta = timedelta(0), why: str = "time-critical") -> dict | None:
+    """Make sure the item's calendar alert exists when its time is still more than `lead` away.
+    Returns the alert result, or None when nothing was needed (off, opted out, no time, already made, too late)."""
+    if item.get("no_calendar_alert") or not phconf.calendar_alerts_on():
+        return None
+    when = parse_due(item.get("at") if item_kind(item) == "alarm" else item.get("due"))
+    if not when or when - datetime.now(phconf.tz()) <= lead:
+        return None
+    if (item.get("calendar_alert") or {}).get("status") in {"created", "updated"}:
+        return None
+    res = calendar_alert(alert_key(item["key"]), item.get("label") or item.get("title") or item["key"],
+                         when.isoformat(), item.get("notes") or "")
+    item["calendar_alert"] = {"key": alert_key(item["key"]), "id": res.get("id"), "status": res.get("status"),
+                              "at": now_iso(), "why": why}
+    if res.get("id"):
+        ledger_set(item["key"], {"calendar_alert_id": res["id"], "calendar_alert_status": res.get("status")})
+    log({"calendar_alert": alert_key(item["key"]), "status": res.get("status"), "why": why,
+         **({"error": str(res.get("error"))[:200]} if res.get("error") else {})})
+    return res
+
+
+def alert_recorded(key: str) -> bool:
+    """Do the desk's records say an 'ea:alert:<key>' event exists? (no calendar call when they say no)"""
+    led = read_records(LEDGER, {})
+    row = led.get(key) if isinstance(led, dict) else None
+    if isinstance(row, dict) and row.get("calendar_alert_id"):
+        return True
+    akey, live = alert_key(key), False
+    try:
+        with (phconf.state_dir() / "actions_log.jsonl").open(encoding="utf-8") as fh:
+            for line in fh:
+                if akey not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get("key") != akey:
+                    continue
+                if entry.get("kind") == "calendar_alert" and entry.get("id"):
+                    live = True
+                elif entry.get("kind") == "calendar_block_deleted":
+                    live = False
+    except FileNotFoundError:
+        return False
+    return live
+
+
+def delete_alert(key: str) -> dict | None:
+    """Delete KEY's calendar alert if the records show one (only events this plugin created)."""
+    if not phconf.CFG["calendar"]["enabled"] or not alert_recorded(key):
+        return None
+    return calendar_cli(["delete", "--key", alert_key(key)])
 
 
 def read_records(name: str, default):
@@ -314,8 +430,18 @@ def enqueue(item: dict, *, force: bool = False) -> dict:
         return {"status": "queued", "key": key, "request_id": item["request_id"]}
 
 
+def with_alert(item: dict, why: str) -> None:
+    """The calendar alert goes first: it is the part that does not depend on the phone app waking."""
+    if item["key"] in read_records(OUTBOX, {}):
+        return  # already tracked: enqueue answers 'exists' or 'refused'
+    try:
+        ensure_alert(item, why=why)
+    except Exception as exc:  # the phone path still runs
+        log({"calendar_alert_error": item["key"], "error": f"{type(exc).__name__}: {exc}"[:200]})
+
+
 def add(key: str, title: str, *, due=None, due_date=None, notes="", priority="medium", force=False,
-        required_authority=()) -> dict:
+        required_authority=(), calendar_alert: bool = True) -> dict:
     """Queue a reminder and return its receipt without a CLI round trip."""
     if not enabled():
         return {"status": "disabled"}
@@ -324,11 +450,19 @@ def add(key: str, title: str, *, due=None, due_date=None, notes="", priority="me
     item = {"key": key, "title": title, "due": due, "due_date": due_date, "notes": notes, "priority": priority}
     if required_authority:
         item["required_authority"] = list(required_authority)
-    return enqueue(item, force=force)
+    if not calendar_alert:
+        item["no_calendar_alert"] = True
+    elif time_critical(priority, due):
+        with_alert(item, "time-critical")
+    result = enqueue(item, force=force)
+    if item.get("calendar_alert"):
+        result["calendar_alert"] = item["calendar_alert"]
+    return result
 
 
 def cmd_add(a) -> int:
-    result = add(a.key, a.title, due=a.due, due_date=a.due_date, notes=a.notes, priority=a.priority, force=a.force)
+    result = add(a.key, a.title, due=a.due, due_date=a.due_date, notes=a.notes, priority=a.priority, force=a.force,
+                 calendar_alert=not a.no_calendar_alert)
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -345,8 +479,14 @@ def cmd_alarm(a) -> int:
             result = {"status": "error", "error": "--at must be an ISO date and time with timezone"}
         elif len(a.label) > 100:
             result = {"status": "error", "error": "--label must be at most 100 characters"}
+        elif at <= datetime.now(phconf.tz()):
+            result = {"status": "refused", "reason": "alarm time already passed"}
         else:
-            result = enqueue({"operation": "alarms.create", "key": a.key, "at": a.at, "label": a.label})
+            item = {"operation": "alarms.create", "key": a.key, "at": a.at, "label": a.label}
+            with_alert(item, "alarm")
+            result = enqueue(item)
+            if item.get("calendar_alert"):
+                result["calendar_alert"] = item["calendar_alert"]
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -397,21 +537,39 @@ def cmd_tick(_a) -> int:
                 log({"landed": key, f"{kind}_id": item_id, "attempts": item.get("attempts")})
             elif status in {"pending", "running"}:
                 continue
+            elif kind == "alarm":
+                # Expired or 'The alarm time has already passed': log it, never retry. The calendar alert
+                # (made when the alarm was queued) is the real safety net.
+                item.update(status="expired" if status == "expired" else "failed",
+                            error=str(res.get("error") or status)[:200])
+                ledger_set(key, {"alarm_status": item["status"]})
+                log({"alarm_failed": key, "why": item["error"], "no_retry": True})
+                safe_alert(item, f"alarm {item['status']}")
             elif status == "expired" and int(item.get("attempts", 0)) < MAX_ATTEMPTS:
-                required = ("alarms",) if kind == "alarm" else item.get("required_authority", ())
+                required = item.get("required_authority", ())
                 if not all(map(auto_allowed, required)):
                     continue
+                safe_alert(item, "bridge expired")  # the phone is not waking: make sure of the part that needs no app
                 try:
                     submit(store, box, item)
                 except Exception as exc:
                     log({"retry_error": key, "error": f"{type(exc).__name__}: {exc}"[:200]})
+                    save(OUTBOX, box)
                 continue
             else:
                 item.update(status="failed", error=str(res.get("error") or status)[:200])
                 ledger_set(key, {f"{kind}_status": "failed"})
                 log({"failed": key, "why": item["error"], "attempts": item.get("attempts")})
+                safe_alert(item, "bridge failed")
             save(OUTBOX, box)
     return 0
+
+
+def safe_alert(item: dict, why: str) -> None:
+    try:
+        ensure_alert(item, RESCUE_LEAD, why=why)
+    except Exception as exc:  # never let the calendar stall the outbox
+        log({"calendar_alert_error": item.get("key"), "error": f"{type(exc).__name__}: {exc}"[:200]})
 
 
 def cmd_close(a) -> int:
@@ -473,6 +631,8 @@ def main() -> int:
     _text_option(ad, "notes", default="")
     ad.add_argument("--priority", choices=["none", "low", "medium", "high"], default="medium")
     ad.add_argument("--force", action="store_true", help="ignore the reminder daily cap")
+    ad.add_argument("--no-calendar-alert", action="store_true",
+                    help="do not add the calendar alert even when the reminder is time-critical")
     alarm = sub.add_parser("alarm", help="queue an urgent, one-time alarm")
     alarm.add_argument("--key", required=True)
     alarm.add_argument("--at", required=True)

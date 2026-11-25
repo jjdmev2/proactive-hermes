@@ -17,7 +17,7 @@
   "features": {
     "morning_brief": true, "evening_brief": true, "weekly_review": true, "mail_radar": true,
     "slack_sweep": true, "promises": true, "resolve_first": true, "work_recap": true, "health": true,
-    "lookahead": true, "meeting_prep": true
+    "lookahead": true, "meeting_prep": true, "mail_push": true
   },
   "meeting_prep": {"daily_regex": "\\b(daily|stand-?up|scrum|product sprint)\\b"},
   "schedule": {

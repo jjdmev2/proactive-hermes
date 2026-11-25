@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Pre-flight checks: can the desk reach the owner's Bot Chat, and is the phone set up?
 
-    ph_doctor.py            JSON report: gateway, bot_chat, mobile, decisions, mail, calendar
+    ph_doctor.py            JSON report: gateway, bot_chat, mobile, decisions, mail, calendar, and
+                            mail_push (per mailbox: "push live" or "polling only (reason)")
     ph_doctor.py --send-test   also posts one test message into Bot Chat (proves live delivery)
 
 Every desk message is delivered as a real reply in this profile's Bot Chat (Hermes Bot Mode),
@@ -88,6 +89,12 @@ def report(send_test: bool = False) -> dict:
         if not ok:
             row["fix"] = FIX[name]
         out["checks"][name] = row
+    # One line per mailbox: IMAP IDLE push live, or polling only with the reason.
+    try:
+        import mail_idle
+        out["mail_push"] = mail_idle.push_report()
+    except Exception as exc:
+        out["mail_push"] = {"all": f"polling only ({type(exc).__name__})"}
     # Bot Chat may be missing until the first delivery; the gateway is the hard requirement.
     out["ready"] = gw[0]
     if send_test:

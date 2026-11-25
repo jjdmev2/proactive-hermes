@@ -8,8 +8,13 @@ Usage:
   ea_calendar_block.py free   --date YYYY-MM-DD [--minutes 30] [--from 09:00] [--to 18:00]
   ea_calendar_block.py create --key KEY --title T --start ISO --end ISO
                               [--notes TEXT] [--alert 10] [--allow-overlap]
+  ea_calendar_block.py alert  --key ea:... --title T --at ISO [--notes TEXT]
+                              (5 min private alert, popup at 0 min, may overlap, not in the daily cap)
   ea_calendar_block.py mine   [--days 14]
   ea_calendar_block.py delete --key KEY      (only Proactive Hermes blocks)
+
+`alert` is the time-critical path: a phone that syncs this calendar fires the popup on its own,
+so it never waits for the Hermes app to wake (the mobile bridge can lag by minutes).
 
 Times without an offset use the configured timezone. Output is one JSON object on stdout.
 Exit codes: 0 ok, 2 bad input, 3 conflict (overlap), 4 Google error.
@@ -29,7 +34,9 @@ CAL = phconf.CFG["calendar"]["id"]
 TAG = "proactive_hermes_key"
 CREATED_BY = "proactive-hermes"
 LOG = phconf.state_dir() / "actions_log.jsonl"
-DAILY_CAP = phconf.CFG["calendar"]["blocks_per_day"]
+DAILY_CAP = phconf.CFG["calendar"]["blocks_per_day"]  # alerts are not counted
+ALERT_MINUTES = 5
+ALERT_TITLE_CHARS = 60
 
 
 def out(obj: dict, code: int = 0) -> None:
@@ -167,6 +174,68 @@ def cmd_create(a) -> None:
     out(result, 0 if ok else 4)
 
 
+def alert_body(key: str, title: str, at: datetime, notes: str = "") -> dict:
+    """A short private event whose only job is to make the phone buzz at `at` (popup at 0 min).
+    Transparent, so it never shows as busy and never blocks a free slot; overlap is fine."""
+    title = " ".join((title or "").split())
+    if len(title) > ALERT_TITLE_CHARS:
+        title = title[:ALERT_TITLE_CHARS - 1].rstrip() + "\u2026"
+    at = at.astimezone(TZ)
+    return {
+        "summary": title,
+        "description": ((notes or "").strip() + "\n\nAlert set by Proactive Hermes.").strip(),
+        "start": {"dateTime": at.isoformat(), "timeZone": TZ.key},
+        "end": {"dateTime": (at + timedelta(minutes=ALERT_MINUTES)).isoformat(), "timeZone": TZ.key},
+        "visibility": "private",
+        "transparency": "transparent",
+        "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 0}]},
+        "extendedProperties": {"private": {TAG: key, "created_by": CREATED_BY, "kind": "alert"}},
+    }
+
+
+def alert_ok(back: dict, key: str) -> bool:
+    rem = back.get("reminders") or {}
+    return (back.get("visibility") == "private"
+            and back.get("extendedProperties", {}).get("private", {}).get(TAG) == key
+            and rem.get("useDefault") is False
+            and {"method": "popup", "minutes": 0} in (rem.get("overrides") or []))
+
+
+def make_alert(svc, key: str, title: str, at: datetime, notes: str = "") -> tuple[dict, int]:
+    """Create or update (idempotent by key) and read back. Returns (result, exit code)."""
+    if not key.startswith("ea:"):
+        return {"status": "error", "error": "key must start with 'ea:'"}, 2
+    if not (title or "").strip():
+        return {"status": "error", "error": "title is empty"}, 2
+    body = alert_body(key, title, at, notes)
+    existing = find_mine(svc, key)  # only events this plugin created
+    if existing:
+        ev = svc.events().patch(calendarId=CAL, eventId=existing["id"], body=body).execute()
+        status = "updated"
+    else:
+        ev = svc.events().insert(calendarId=CAL, body=body).execute()
+        status = "created"
+    back = svc.events().get(calendarId=CAL, eventId=ev["id"]).execute()  # read-back, not trust
+    ok = alert_ok(back, key)
+    result = {"status": status if ok else "unverified", "key": key, "id": back["id"],
+              "title": back.get("summary"), "start": back["start"].get("dateTime"),
+              "end": back["end"].get("dateTime"), "visibility": back.get("visibility"),
+              "reminders": back.get("reminders"), "calendar": back.get("organizer", {}).get("email")}
+    log({"kind": "calendar_alert", **result})
+    return result, (0 if ok else 4)
+
+
+def cmd_alert(a) -> None:
+    try:
+        at = parse_dt(a.at)
+    except ValueError:
+        out({"status": "error", "error": "--at must be an ISO date and time"}, 2)
+    if not a.key.startswith("ea:"):
+        out({"status": "error", "error": "key must start with 'ea:'"}, 2)
+    result, code = make_alert(service(), a.key, a.title, at, a.notes or "")
+    out(result, code)
+
+
 def cmd_mine(a) -> None:
     svc = service()
     now = datetime.now(TZ)
@@ -248,6 +317,11 @@ def main() -> None:
     c.add_argument("--alert", type=int, default=5)
     c.add_argument("--allow-overlap", action="store_true")
     c.add_argument("--force", action="store_true", help="ignore the daily cap")
+    al = sub.add_parser("alert")
+    al.add_argument("--key", required=True)
+    _text_option(al, "title", required=True)
+    al.add_argument("--at", required=True)
+    _text_option(al, "notes", default="")
     m = sub.add_parser("mine")
     m.add_argument("--days", type=int, default=14)
     d = sub.add_parser("delete")
@@ -257,7 +331,8 @@ def main() -> None:
     if not phconf.CFG["calendar"]["enabled"]:
         out({"status": "disabled"})
     try:
-        {"free": cmd_free, "create": cmd_create, "mine": cmd_mine, "delete": cmd_delete}[a.cmd](a)
+        {"free": cmd_free, "create": cmd_create, "alert": cmd_alert, "mine": cmd_mine,
+         "delete": cmd_delete}[a.cmd](a)
     except SystemExit:
         raise
     except Exception as exc:

@@ -187,7 +187,7 @@ To uninstall completely: `hermes proactive remove`, then `hermes plugins remove 
      6. small things done, the rest after your yes
 ```
 
-1. **Wake up.** Each job runs on its schedule. A small script runs first and checks whether anything changed since last time (new mail, call notes posted). Nothing new means no agent run.
+1. **Wake up.** Each job runs on its schedule. A small script runs first and checks whether anything changed since last time (new mail, call notes posted). Nothing new means no agent run. New mail also wakes the mail radar as soon as your mail server announces it (iCloud right away, Gmail usually within 1 to 3 minutes): the desk keeps an IMAP IDLE connection open to each mailbox you picked, so it needs no public URL. Polling on the schedule stays on as the safety net.
 2. **Filter.** With an OpenAI key, the decision model scores each new mail from its sender, subject and the start of the body. Clear noise is dropped and logged, so the agent never spends time on it.
 3. **Read and pick.** The desk agent reads what is left and writes candidate items: a decision you must make, an action you must take, or a digest line. Anything else is left out.
 4. **Resolve.** If an item needs you to send, reply, intro, book or decide, the agent searches mail, Slack, past chats and its own records first. It stores a draft with a source for every fact.
@@ -254,9 +254,13 @@ The cut-off is 0.10, so the filter only removes mail it is close to certain abou
 | **Look-ahead** | Checks your upcoming plans ahead of time. It reads your calendar and the booking, ticket and registration mails in every mailbox you connect, work and personal; a ticket mail means the trip is yours, a marketing mail is ignored. The bigger the stakes, the earlier the first look: flights and longer trips from 30 days out, trains and in-town events from 7 days, ticket sales and bills ahead of their date. More checks as the day gets closer (2 days, the evening before, that morning, leave time). Each check speaks only for a gap, a change or a decision: "If the 09:50 train is yours, it lands 16 min before the start. The 09:09 lands 10:14, €15. Walking or Uber?" Weekly routines get one quiet look; races you watch on TV are skipped. |
 | **Trips and leave times** | A ticket or booking in your mail becomes a calendar block and a "leave now" reminder based on where your phone is, with a buffer. |
 | **Watches** | Your own proactive tasks: marketplaces, shops, drops, event registrations, anything with a page. Tell, remind, alarm, draft or act. |
-| **Phone reminders and alarms** | Reminders for deadlines and promises, alarms that ring through Focus for the few things that cannot wait. Retried until the phone confirms. |
+| **Phone reminders and alarms** | Reminders for deadlines and promises, alarms that ring through Focus for the few things that cannot wait. Reminders are retried until the phone confirms; urgent ones also get a calendar alert (see [Your phone](#your-phone)). |
 | **Private calendar blocks** | Focus blocks on your own calendar for key tasks, a few per day at most, never touching events it did not create. |
 | **Health checks** | A watchdog checks every job, the message outbox and failed deliveries, and only tells you when something needs you. |
+
+## Your phone
+
+Urgent items arrive as a Bot Chat message plus a calendar alert that your phone fires by itself, as long as the connected calendar is on the phone with notifications on. Phone reminders and alarms land when iOS wakes the Hermes app, which can take minutes, so they are a bonus and never the only signal. Keep Background App Refresh on for Hermes, and expect delays in Low Power Mode.
 
 ## Bookings (optional extra)
 
