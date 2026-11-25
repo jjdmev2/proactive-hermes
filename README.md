@@ -38,7 +38,7 @@ These all happened on our own desk.
 
 | Situation | What Hermes did |
 | :--- | :--- |
-| **A train ticket home** | The booking mail arrived. Hermes blocked the trip on the calendar, checked where the phone was, and sent the time to leave with a 10 minute buffer. |
+| **A train ticket home** | The booking mail arrived. Hermes blocked the trip on the calendar and sent the time to leave, based on your phone's location, with a 10 minute buffer (Hermes mobile app with location access required). |
 | **A conference spot opened** | A watch was checking the registration page every few minutes. When a seat freed up it set a phone alarm that rings through Focus, so it could not be missed, and had the registration ready. |
 | **A buyer made an offer** | A marketplace offer came in below the asking price. Hermes reported it with a suggested counter, and on "yes" answered the buyer in the app. |
 | **A promise to a partner** | The owner had promised a list of questions "over the weekend". A teammate posted the list in Slack on Monday. Hermes connected the two, drafted the email in the right thread, and sent it after "yes". |
