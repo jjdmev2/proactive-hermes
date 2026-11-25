@@ -66,8 +66,9 @@ class TripTests(OfflineTestCase):
         self.freeze_datetime(trip)
         self.freeze_datetime(reminders)
         self.store = FakeStore()
-        self.enterContext(patch.object(reminders, "bridge", return_value=(None, self.store)))
-        self.enterContext(patch.object(reminders, "wake"))
+        real_bridge = reminders.bridge   # read-only reads hit the fake bridge.db below; writes go to the fake store
+        self.enterContext(patch.object(reminders, "bridge", side_effect=lambda read_only=False:
+                                       real_bridge(read_only=True) if read_only else (None, self.store)))
         self.enterContext(patch.object(reminders, "PLUGIN", self.tmp / "plugins" / "hermes-mobile-device-access"))
         reminders.PLUGIN.mkdir(parents=True)
         (reminders.PLUGIN / "bridge.py").touch()

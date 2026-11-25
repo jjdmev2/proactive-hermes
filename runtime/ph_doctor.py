@@ -2,7 +2,8 @@
 """Pre-flight checks: can the desk reach the owner's Bot Chat, and is the phone set up?
 
     ph_doctor.py            JSON report: gateway, bot_chat, mobile, decisions, mail, calendar, and
-                            mail_push (per mailbox: "push live" or "polling only (reason)")
+                            mail_push (per mailbox: "instant push", or "15 min checks" with the reason
+                            and the next step; never an address or a password)
     ph_doctor.py --send-test   also posts one test message into Bot Chat (proves live delivery)
 
 Every desk message is delivered as a real reply in this profile's Bot Chat (Hermes Bot Mode),
@@ -27,7 +28,9 @@ FIX = {
                 "profile's Bot once. Its Bot Chat is where every desk message lands. It is also created on the first delivery.",
     "mobile": "Install the Hermes mobile app, sign in to the same Hermes, open this Bot's chat once, and share "
               "Reminders, Alarms, Location and Calendar in the app settings. Notifications for desk messages come from the app.",
-    "decisions": "Add OPENAI_API_KEY to this profile's .env and a few dollars of credit at platform.openai.com.",
+    "decisions": "Set PROACTIVE_OPENAI_API_KEY: Settings -> Plugins -> Proactive Hermes -> OpenAI key for the decision "
+                 "filter, or `hermes plugins config proactive-hermes`. It can be the same key as OPENAI_API_KEY; "
+                 "Hermes hides OPENAI_API_KEY from scheduled scripts. Put a few dollars of credit on platform.openai.com.",
     "mail": "Set up the google-workspace skill (Gmail) or a himalaya mail account.",
 }
 
@@ -63,9 +66,15 @@ def check_bot_chat(home: Path) -> tuple[bool, str]:
 
 
 def check_mobile(home: Path) -> tuple[bool, str]:
-    db = home / "plugin-data" / "hermes-mobile-device-access" / "bridge.db"
     plugin = any((home / "plugins" / n).exists() for n in ("hermes-mobile-device-access", "hermes-mobile-push"))
-    if db.exists():
+    try:
+        from contextlib import closing
+        import ea_reminders
+        with closing(ea_reminders.bridge(read_only=True)) as db:   # the one mobile bridge access point
+            paired = bool(db.execute("SELECT count(*) FROM devices").fetchone()[0])
+    except Exception:
+        paired = False
+    if paired:
         return True, "phone paired"
     return (False, "mobile plugins found, no phone paired yet") if plugin else (False, "Hermes mobile app not connected")
 
@@ -78,7 +87,7 @@ def report(send_test: bool = False) -> dict:
     mob = check_mobile(home)
     try:
         import ea_decide
-        dec = (bool(ea_decide.api_key()), "OpenAI key found" if ea_decide.api_key() else "no OPENAI_API_KEY")
+        dec = ea_decide.key_status()   # what the scheduled jobs will see, not just this command
     except Exception:
         dec = (False, "unavailable")
     mail = (phconf.google_api().exists() or bool(phconf.CFG["mail"].get("himalaya_accounts")), "")
@@ -89,12 +98,13 @@ def report(send_test: bool = False) -> dict:
         if not ok:
             row["fix"] = FIX[name]
         out["checks"][name] = row
-    # One line per mailbox: IMAP IDLE push live, or polling only with the reason.
+    # One row per mailbox: instant push (IMAP IDLE), or the radar schedule with the reason and the next step.
     try:
         import mail_idle
         out["mail_push"] = mail_idle.push_report()
     except Exception as exc:
-        out["mail_push"] = {"all": f"polling only ({type(exc).__name__})"}
+        out["mail_push"] = {"all": {"mode": "15 min checks", "reason": f"push status unreadable ({type(exc).__name__})",
+                                    "next": "Run `hermes proactive doctor` again; if it stays, report it."}}
     # Bot Chat may be missing until the first delivery; the gateway is the hard requirement.
     out["ready"] = gw[0]
     if send_test:

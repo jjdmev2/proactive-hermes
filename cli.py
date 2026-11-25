@@ -30,7 +30,7 @@ QUESTIONS = [
     ("quiet_hours", "Quiet hours, when only urgent things may reach you (e.g. 23-7)?", "quiet_hours", "hours"),
     ("holidays", "Public holidays to skip, as country codes (e.g. DE,US), or none?", "holidays", "list"),
     ("owner.work_emails", "Your work email addresses (comma separated), so drafts never mix work and personal?", None, "list"),
-    ("decisions.enabled", "Use OpenAI's fast decision model to filter noise and spot promises? Needs OPENAI_API_KEY, about 3 cents per 1,000 emails. (y/n)", "decisions.enabled", "bool"),
+    ("decisions.enabled", "Use OpenAI's fast decision model to filter noise and spot promises? Needs an OpenAI key in PROACTIVE_OPENAI_API_KEY, about 3 cents per 1,000 emails. (y/n)", "decisions.enabled", "bool"),
     ("mail.gmail_api", "Read Gmail and Google Calendar through the google-workspace skill? (y/n)", "mail.gmail_api", "bool"),
     ("mail.himalaya_accounts", "Other mail accounts set up in himalaya to read (names, comma separated), or none?", None, "list"),
     ("calendar.enabled", "May I put private focus blocks on your calendar for key tasks? (y/n)", "calendar.enabled", "bool"),
@@ -94,7 +94,7 @@ def detect() -> dict:
     sys.path.insert(0, str(HERE / "runtime"))
     try:
         import ea_decide
-        found["decisions.enabled"] = bool(ea_decide.api_key())
+        found["decisions.enabled"] = ea_decide.key_status()[0]   # what the scheduled jobs will see
     except Exception:
         pass
     return found
@@ -243,10 +243,13 @@ def decisions_note(cfg: dict) -> str:
     if not d.get("enabled"):
         return ""
     import ea_decide
-    if ea_decide.api_key():
-        return "Fast decisions: OpenAI key found, noise filter and promise checks are on."
-    msg = (f"No OPENAI_API_KEY found. Add one to {phconf.hermes_home() / '.env'} (a few dollars of credit at "
-           "platform.openai.com lasts months). Until then the desk works without the fast filter.")
+    scheduled, _ = ea_decide.key_status()
+    if scheduled:
+        return "Fast decisions: PROACTIVE_OPENAI_API_KEY found, noise filter and promise checks are on."
+    msg = ("Scheduled runs have no OpenAI key. Set PROACTIVE_OPENAI_API_KEY in Settings -> Plugins -> Proactive "
+           "Hermes (OpenAI key for the decision filter), or with `hermes plugins config proactive-hermes`. It can be "
+           "the same key as OPENAI_API_KEY: Hermes hides OPENAI_API_KEY from scheduled scripts. A few dollars of "
+           "credit on platform.openai.com lasts months. Until then the desk works without the fast filter.")
     return ("Juan's setup is tuned for OpenAI's Decisions API. " + msg) if d.get("required") else msg
 
 

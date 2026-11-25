@@ -46,6 +46,20 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(rep["test_message"]["status"], "delivered")
         self.assertTrue(fake.call_args.kwargs["urgent"])
 
+    def test_decisions_reports_what_scheduled_runs_see(self):
+        import ea_decide
+        with mock.patch.object(ph_doctor, "check_gateway", return_value=(True, "running")), \
+             mock.patch.object(ph_doctor, "check_bot_chat", return_value=(True, "found")), \
+             mock.patch.object(ph_doctor, "check_mobile", return_value=(True, "")), \
+             mock.patch.dict(ea_decide.phconf.CFG, decisions={"enabled": True}), \
+             mock.patch.object(ea_decide.phconf, "secret", side_effect=lambda n: {"OPENAI_API_KEY": "sk-x"}.get(n, "")):
+            rep = ph_doctor.report()
+        dec = rep["checks"]["decisions"]
+        self.assertFalse(dec["ok"])                       # OPENAI_API_KEY alone never reaches scheduled scripts
+        self.assertIn("Set PROACTIVE_OPENAI_API_KEY for scheduled runs", dec["note"])
+        self.assertIn("hermes plugins config proactive-hermes", dec["fix"])
+        self.assertNotIn("sk-x", str(rep))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -97,9 +97,9 @@ class ResolveHealthTests(unittest.TestCase):
         })
 
     def test_reminders_disabled_skips_bridge_database(self):
-        with patch.object(health.sqlite3, "connect") as connect:
+        with patch.object(health.reminders, "bridge") as bridge:
             health.check_device()
-        connect.assert_not_called()
+        bridge.assert_not_called()
 
     def test_google_auth_message_uses_configured_owner(self):
         with patch.object(health.subprocess, "run") as run:

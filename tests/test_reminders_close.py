@@ -23,7 +23,6 @@ class CloseTestCase(OfflineTestCase):
         self.freeze_datetime(reminders)
         self.store = FakeStore()
         self.bridge = self.enterContext(patch.object(reminders, "bridge", return_value=(None, self.store)))
-        self.wake = self.enterContext(patch.object(reminders, "wake"))
         self.write(reminders.OUTBOX, {
             "promise-x": {"key": "promise-x", "status": "landed", "reminder_id": "R1"},
             "alias-x": {"key": "alias-x", "status": "landed", "reminder_id": "R2"},
@@ -95,7 +94,7 @@ class CloseFinishedTests(CloseTestCase):
             self.assertNotEqual(box[key]["status"], "closing")
         self.assertEqual(box["promise-x"]["close_evidence"], "sent")
         self.assertEqual(self.box()["goal-x"]["close_request_id"], box["goal-x"]["close_request_id"])  # saved
-        self.assertEqual(self.wake.call_count, 4)
+        self.assertFalse(hasattr(reminders, "wake"))
 
     def test_close_succeeded_is_recorded_in_outbox_and_ledger(self):
         box = self.box()
@@ -264,7 +263,7 @@ class CloseCommandTests(CloseTestCase):
         self.assertEqual(self.store.requests[0][:2], ("reminders.complete", {"id": "R5"}))
         row = self.box()["still-open"]
         self.assertEqual((row["status"], row["close_evidence"], row["close_attempts"]), ("closing", "owner: done", 1))
-        self.wake.assert_called_once_with("fake-phone")
+        self.assertFalse(hasattr(reminders, "wake"))  # the desk never wakes the phone itself
         self.assertEqual(self.close("--key", "still-open"), {"status": "closing", "key": "still-open"})
         self.assertEqual(len(self.store.requests), 1)
 

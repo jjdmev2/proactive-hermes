@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -65,8 +66,9 @@ DEFAULTS: dict = {
         "slack_sweep": False, "promises": True, "resolve_first": True, "work_recap": False,
         "health": True, "lookahead": False,  # look-ahead is opt-in through setup
         "meeting_prep": True,  # standard; the job only exists when a calendar is connected
-        # IMAP IDLE on the mail radar's himalaya accounts pokes the radar on new mail (runtime/mail_idle.py,
-        # gateway only). Gmail API only accounts stay on polling; polling always stays on as the safety net.
+        # IMAP IDLE pokes the mail radar on new mail (runtime/mail_idle.py, gateway only), for the mailboxes the
+        # owner gave Hermes in Settings -> Plugins -> Proactive Hermes (mail_N_address + app password). Every other
+        # mailbox stays on the radar schedule; polling always stays on as the safety net.
         "mail_push": True,
         "calendar_alerts": True,  # standard; time-critical reminders and alarms also become calendar alerts
     },
@@ -190,6 +192,46 @@ def quiet_hours() -> tuple[int, int]:
 def scripts_dir() -> Path:
     """Where `setup apply` installs the runtime (cron gate scripts must live under HERMES_HOME/scripts)."""
     return hermes_home() / "scripts" / PLUGIN
+
+
+def agent_root() -> Path:
+    """The Hermes install directory (so a runtime script started by a bare python3 can import Hermes)."""
+    env = os.environ.get("HERMES_AGENT_ROOT")
+    if env:
+        return Path(env).expanduser()
+    home = hermes_home()
+    base = home.parent.parent if home.parent.name == "profiles" else home
+    return base / "hermes-agent"
+
+
+def _get_secret():
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        root = agent_root()
+        if not root.is_dir():
+            return None
+        if str(root) not in sys.path:
+            sys.path.append(str(root))
+        try:
+            from agent.secret_scope import get_secret
+        except ImportError:
+            return None
+    return get_secret
+
+
+def secret(name: str) -> str:
+    """A credential the plugin declares (plugin.yaml), read only through Hermes: agent.secret_scope.get_secret,
+    which honours the active profile. Never from a file (catalog rule 11). "" when it is unset, when Hermes cannot
+    be imported, or when Hermes refuses the read (a multiplexed gateway thread with no profile scope): callers
+    fail open."""
+    get_secret = _get_secret()
+    if get_secret is None:
+        return ""
+    try:
+        return str(get_secret(name) or "").strip()
+    except Exception:  # UnscopedSecretError and friends: never crash a job over an optional key
+        return ""
 
 
 def google_api() -> Path:

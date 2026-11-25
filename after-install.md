@@ -11,7 +11,9 @@ Desk messages are real replies in this profile's **Bot Chat** (Bot Mode, on by d
 
 You choose **Juan's setup** (proven defaults, you only fill in your details) or **My own** (Hermes builds it with you). You see every job and time before anything is created.
 
-**Recommended for Juan's setup:** an OpenAI API key with a few dollars of credit (`OPENAI_API_KEY` in your Hermes `.env`). It powers the fast decision filter: noise out, promises spotted, about 3 cents per 1,000 emails. Without it everything still works.
+**Recommended for Juan's setup:** an OpenAI API key with a few dollars of credit. Put it in Settings → Plugins → Proactive Hermes → **OpenAI key for the decision filter** (or `hermes plugins config proactive-hermes`). It can be the same key as `OPENAI_API_KEY`; Hermes hides that one from scheduled jobs, so the plugin needs its own copy. It powers the fast decision filter: noise out, promises spotted, about 3 cents per 1,000 emails. Without it everything still works.
+
+**Optional, instant mail push:** by default mail is checked every 15 minutes. To get new mail within 1 to 3 minutes, make an app password for a mailbox (Gmail: open myaccount.google.com/apppasswords, with 2-Step Verification on; iCloud: account.apple.com > Sign-In and Security > App-Specific Passwords), then fill **Mailbox 1 address** and **Mailbox 1 app password** in Settings → Plugins → Proactive Hermes, or with `hermes plugins config proactive-hermes`. Never paste it into a chat. Restart Hermes, then `hermes proactive doctor` shows which mailboxes have instant push.
 
 Optional: `pip install holidays` to skip public holidays.
 

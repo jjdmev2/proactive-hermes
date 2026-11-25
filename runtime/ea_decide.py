@@ -4,7 +4,7 @@
 Used as a cheap first filter before any agent wakes up: "does this mail need the owner?",
 "is this sent message a promise?", "is this the same matter?". About 0.35 s and $0.00003 per call.
 
-Optional and fail-open: no OPENAI_API_KEY, a network error or a bad reply leaves items unscored
+Optional and fail-open: no key (PROACTIVE_OPENAI_API_KEY, else OPENAI_API_KEY where Hermes shows it), a network error or a bad reply leaves items unscored
 and keeps mail and Slack messages. Mail triage uses sender, subject and up to 600 body characters.
 
   ea_decide.py ask --input TEXT --predicate "statement"          -> {"probability": 0.87}
@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 import urllib.error
@@ -32,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import phconf  # noqa: E402
 
 URL = "https://api.openai.com/v1/decisions"
+PLUGIN_KEY = "PROACTIVE_OPENAI_API_KEY"   # Settings -> Plugins -> Proactive Hermes -> OpenAI key for the decision filter
 MODEL = phconf.CFG.get("decisions", {}).get("model") or "gpt-6-luna"
 TIMEOUT = 12
 MAX_QUESTIONS = 400
@@ -54,18 +54,23 @@ MAIL_CONTEXT = (
 def api_key() -> str:
     if not phconf.CFG.get("decisions", {}).get("enabled", True):
         return ""
-    key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if key:
-        return key
-    # Only this profile's own .env: never fall back to another profile's (or the default profile's) secrets.
-    env = phconf.hermes_home() / ".env"
-    try:
-        for line in env.read_text().splitlines():
-            if line.startswith("OPENAI_API_KEY="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return ""
+    # Through Hermes's secret scope only (the active profile's value); never parsed from a .env file. The plugin's
+    # own key first: Hermes hides provider keys such as OPENAI_API_KEY from scheduled scripts and terminal
+    # commands, but not PROACTIVE_OPENAI_API_KEY. OPENAI_API_KEY is only a fallback where Hermes lets it through.
+    return phconf.secret(PLUGIN_KEY) or phconf.secret("OPENAI_API_KEY")
+
+
+def key_status() -> tuple[bool, str]:
+    """(will the scheduled jobs have a key, plain note). Scheduled scripts see PROACTIVE_OPENAI_API_KEY only:
+    Hermes strips OPENAI_API_KEY from them, so finding it here (in a Hermes command) proves nothing for cron."""
+    if not phconf.CFG.get("decisions", {}).get("enabled", True):
+        return True, "decision filter turned off in settings"
+    if phconf.secret(PLUGIN_KEY):
+        return True, f"{PLUGIN_KEY} found: scheduled runs use it"
+    if phconf.secret("OPENAI_API_KEY"):
+        return False, (f"only OPENAI_API_KEY found. Hermes hides it from scheduled scripts, so scheduled runs go "
+                       f"without the filter. Set {PLUGIN_KEY} for scheduled runs (it can be the same key)")
+    return False, f"no {PLUGIN_KEY}"
 
 
 def _post(body: dict, key: str, timeout: float = TIMEOUT) -> dict:

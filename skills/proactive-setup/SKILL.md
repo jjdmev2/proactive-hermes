@@ -53,9 +53,19 @@ For "My own", also ask:
 - How often to check mail (every 15, 30 or 60 minutes)?
 - Track promises you make in mail and Slack? Weekly review on which day?
 
-Mail push needs no extra step: new mail wakes the radar through IMAP IDLE on the mail logins already set up in himalaya; accounts read only through the Gmail API stay on polling (`hermes proactive doctor` shows which).
+**Instant mail push (optional, after the mailboxes are chosen).** Say it plainly, once: "By default I check your mail every 15 minutes. If you want, a mailbox can wake me within 1 to 3 minutes of new mail. That needs an app password for that mailbox, which you paste into Hermes's settings, never into this chat. Want it for any mailbox?" If yes, per mailbox:
 
-If no OpenAI key was found, say once: "Juan's setup is built for OpenAI's decision model. With a key and a few dollars of credit it filters noise and spots promises for about 3 cents per 1,000 emails. Want to add one now, or go without?"
+1. Make an app password (a separate password just for Hermes, which they can revoke any time):
+   - Gmail: open myaccount.google.com/apppasswords. 2-Step Verification must be on. Work or school accounts, Advanced Protection and security key only accounts may not offer app passwords.
+   - iCloud: account.apple.com > Sign-In and Security > App-Specific Passwords. Two-factor authentication must be on.
+   - Outlook, Hotmail, Live and Microsoft 365: not possible. Microsoft allows only its own sign-in for mail, so an app password is refused. These mailboxes stay on the 15 minute checks.
+   - Fastmail, Yahoo and others: the provider's own app password page. If the provider has none, that mailbox stays on the 15 minute checks.
+2. Open **Settings → Plugins → Proactive Hermes** in the Hermes desktop app (or run `hermes plugins config proactive-hermes` in a terminal) and fill **Mailbox N address** and **Mailbox N app password** (N is 1 to 6). If the address does not end in gmail.com, icloud.com, me.com, mac.com, fastmail.com or a yahoo domain, also fill **Mailbox N IMAP server**. For a work Gmail on the company's domain that is imap.gmail.com. For anything else, take it from the provider's help page.
+3. After setup is applied, restart Hermes (`hermes gateway restart`, or quit and reopen the desktop app), then run `hermes proactive doctor`. Under `mail_push` each mailbox shows `instant push`, or `15 min checks` with the reason and the next step.
+
+Never ask for, accept or repeat a password in chat. If they paste one anyway, do not use it or repeat it: tell them to revoke that app password now, make a new one, and put the new one only in the settings field. A mailbox they skip simply stays on the 15 minute checks.
+
+If `hermes proactive doctor` does not show the `decisions` check as ok, say once: "Juan's setup is built for OpenAI's decision model. With a key and a few dollars of credit it filters noise and spots promises for about 3 cents per 1,000 emails. Want to add one now, or go without?" If yes: open **Settings → Plugins → Proactive Hermes** and fill **OpenAI key for the decision filter** (or run `hermes plugins config proactive-hermes`). It can be the same key as `OPENAI_API_KEY`, but it must be set there: Hermes hides `OPENAI_API_KEY` from scheduled jobs, so a key that is only in `OPENAI_API_KEY` never reaches the mail radar. Never take the key in chat. Run `hermes proactive doctor` again to confirm.
 
 ## 3. What it may do, the phone, and first watches
 
@@ -71,7 +81,7 @@ Ask these three in plain words, after the details:
    For accounts the watch needs (a shop login, Luma, a marketplace), tell them to sign in once in the browser Hermes uses, never to share passwords in chat.
 
 **Phone checklist** (say it once, plainly). Phone reminders and alarms land only when the phone wakes the Hermes app, so urgent items also become calendar alerts the phone fires by itself. For that to work on an iPhone:
-- Add the work Google account (the connected calendar) to the iPhone Calendar app (Settings > Calendar > Accounts) and turn on its notifications (Settings > Notifications > Calendar).
+- Add the work Google account (the connected calendar) to the iPhone Calendar app (Settings > Apps > Calendar > Calendar Accounts on iOS 18 and later; older iOS: Settings > Calendar > Accounts) and turn on its notifications (Settings > Notifications > Calendar).
 - Turn on Background App Refresh for Hermes (Settings > General > Background App Refresh).
 - Low Power Mode pauses background refresh, so reminders and alarms from Hermes arrive late while it is on. Calendar alerts still fire.
 
@@ -91,6 +101,6 @@ Under `plugins.isolation: host` the CLI command is not registered. Use the same 
 
 ## Rules
 
-- Never ask for passwords, tokens or card numbers. Accounts are connected through Hermes itself (google-workspace skill, Nous Portal connectors, himalaya).
+- Never ask for passwords, tokens or card numbers, and never accept one in chat. Accounts are connected through Hermes itself (google-workspace skill, Nous Portal connectors, himalaya), and mail push app passwords go only into Settings → Plugins → Proactive Hermes or `hermes plugins config proactive-hermes`.
 - Say once how approval works: what they allowed happens on its own, everything else waits for their yes, payments and passwords always stay with them.
 - Nothing personal goes into the plugin folder. Config lives in `plugin-data/proactive-hermes/config.json` on their machine only.

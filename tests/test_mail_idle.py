@@ -18,32 +18,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "runtime"))
 import mail_idle as mi  # noqa: E402
 import phconf  # noqa: E402
 
-TOML = """
-[accounts.rawacct]
-email = "raw@example.org"
-backend.type = "imap"
-backend.host = "imap.example.org"
-backend.port = 993
-backend.encryption.type = "tls"
-backend.login = "rawlogin@example.org"
-backend.auth.type = "password"
-backend.auth.raw = "s3cret-raw"
+REAL_PLUGIN_SETTINGS = mi.plugin_settings
 
-[accounts.cmdacct]
-email = "cmd@example.org"
-backend.type = "imap"
-backend.host = "imap.example.org"
-backend.auth.type = "password"
-backend.auth.cmd = "pass show mail"
+SETTINGS = {
+    "mail_1_address": "me@gmail.com",                 # auto host
+    "mail_2_address": "work@example.org", "mail_2_host": "imap.example.org", "mail_2_port": 143,
+    "mail_3_address": "nohost@example.net",           # unknown domain, no server: skipped
+    "mail_4_address": "nopass@icloud.com",            # no app password: skipped
+}
+SECRETS = {"PROACTIVE_MAIL_1_PASSWORD": "s3cret-one", "PROACTIVE_MAIL_2_PASSWORD": "s3cret-two",
+           "PROACTIVE_MAIL_3_PASSWORD": "s3cret-three"}
 
-[accounts.oauth]
-backend.type = "imap"
-backend.host = "imap.example.org"
-backend.auth.type = "oauth2"
 
-[accounts.maildir]
-backend.type = "maildir"
-"""
+def fake_secret(name):
+    return SECRETS.get(name, "")
+
 
 TZ = ZoneInfo("Europe/Berlin")      # UTC+1 in November
 DAY = datetime(2026, 11, 25, 11, 0, tzinfo=timezone.utc)    # 12:00 local
@@ -61,37 +50,98 @@ class Clock:
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(self.enterContext(TemporaryDirectory()))
-        self.toml = self.tmp / "config.toml"
-        self.toml.write_text(TOML)
         home = self.tmp / "profiles" / "example"
         self.config = self.tmp / "config.json"
         self.config.write_text(json.dumps({"timezone": "Europe/Berlin",
-                                           "mail": {"himalaya_accounts": ["rawacct", {"account": "cmdacct"}, "oauth"]}}))
+                                           "mail": {"himalaya_accounts": ["icloud", {"account": "work"}]}}))
         self.enterContext(patch.dict(os.environ, EA_STATE_DIR=str(self.tmp / "state"), HERMES_HOME=str(home),
-                                     PROACTIVE_HERMES_CONFIG=str(self.config), HIMALAYA_CONFIG=str(self.toml)))
+                                     PROACTIVE_HERMES_CONFIG=str(self.config)))
         self.enterContext(patch.object(phconf, "CFG", phconf.load()))
         self.enterContext(patch.object(phconf, "hermes_home", return_value=home))
+        self.enterContext(patch.object(phconf, "secret", side_effect=fake_secret))
+        self.enterContext(patch.object(mi, "plugin_settings", side_effect=lambda ctx=None: dict(SETTINGS)))
 
 
 class ConfigTests(Base):
-    def test_raw_cmd_and_unsupported(self):
+    def test_slots_auto_host_and_skips(self):
         accounts, skipped = mi.load_accounts()
         by = {a.name: a for a in accounts}
-        self.assertEqual(set(by), {"rawacct", "cmdacct"})
-        self.assertEqual(by["rawacct"].login, "rawlogin@example.org")
-        self.assertEqual(by["rawacct"].password(), "s3cret-raw")
-        fake = lambda *a, **k: SimpleNamespace(returncode=0, stdout="pw-from-cmd\nmore\n")
-        self.assertEqual(by["cmdacct"].password(run=fake), "pw-from-cmd")
-        self.assertIn("oauth2", skipped["oauth"])
-        self.assertIn("not imap", skipped["maildir"])
-        self.assertNotIn("s3cret", json.dumps(skipped) + repr(by["rawacct"]))
+        self.assertEqual(set(by), {"acct#1", "acct#2"})
+        self.assertEqual((by["acct#1"].host, by["acct#1"].port, by["acct#1"].tls), ("imap.gmail.com", 993, "tls"))
+        self.assertEqual(by["acct#1"].login, "me@gmail.com")
+        self.assertEqual(by["acct#1"].password(), "s3cret-one")
+        self.assertEqual((by["acct#2"].host, by["acct#2"].port, by["acct#2"].tls), ("imap.example.org", 143, "start-tls"))
+        self.assertEqual(skipped, {"acct#3": "unknown_host", "acct#4": "no_password"})
+        # Nothing secret or personal in the reasons or in repr().
+        text = json.dumps(skipped) + repr(accounts)
+        for leak in ("s3cret", "me@gmail.com", "work@example.org"):
+            self.assertNotIn(leak, text)
 
-    def test_selection_follows_mail_radar_accounts(self):
-        self.assertEqual(mi.selected_accounts(), ["rawacct", "cmdacct", "oauth"])
-        accounts, skipped = mi.load_accounts(only=mi.selected_accounts())
-        self.assertEqual({a.name for a in accounts}, {"rawacct", "cmdacct"})
-        self.assertNotIn("maildir", skipped)        # not selected: never touched
-        self.assertEqual(mi.selected_accounts({"mail": {"himalaya_accounts": []}}), [])  # empty = none
+    def test_password_read_through_hermes_secret_with_slot_names(self):
+        asked = []
+        mi.load_accounts(dict(SETTINGS), secret=lambda n: asked.append(n) or "pw")
+        self.assertEqual(asked, ["PROACTIVE_MAIL_1_PASSWORD", "PROACTIVE_MAIL_2_PASSWORD", "PROACTIVE_MAIL_4_PASSWORD"])
+        mi.load_accounts()
+        self.assertEqual([c.args[0] for c in phconf.secret.call_args_list],
+                         ["PROACTIVE_MAIL_1_PASSWORD", "PROACTIVE_MAIL_2_PASSWORD", "PROACTIVE_MAIL_4_PASSWORD"])
+
+    def test_auto_host_table(self):
+        cases = {"a@gmail.com": "imap.gmail.com", "a@googlemail.com": "imap.gmail.com",
+                 "a@icloud.com": "imap.mail.me.com", "a@me.com": "imap.mail.me.com", "a@mac.com": "imap.mail.me.com",
+                 "a@outlook.com": None, "a@hotmail.co.uk": None,      # Microsoft: no app passwords, never autofilled
+                 "a@live.com": None, "a@fastmail.com": "imap.fastmail.com",
+                 "a@yahoo.com": "imap.mail.yahoo.com", "a@Yahoo.co.uk": "imap.mail.yahoo.com",
+                 "a@yahoo.co.jp": None, "a@example.org": None, "a@deliver.example": None, "nobody": None}
+        for address, host in cases.items():
+            self.assertEqual(mi.auto_host(address), host, address)
+
+    def test_unknown_host_needs_server_and_ports(self):
+        acc, skipped = mi.load_accounts({"mail_1_address": "x@corp.example"}, secret=lambda n: "pw")
+        self.assertEqual((acc, skipped), ([], {"acct#1": "unknown_host"}))
+        (acc,), _ = mi.load_accounts({"mail_1_address": "x@corp.example", "mail_1_host": "mail.corp.example"},
+                                     secret=lambda n: "pw")
+        self.assertEqual((acc.host, acc.port, acc.slot), ("mail.corp.example", 993, 1))
+        _, skipped = mi.load_accounts({"mail_1_address": "x@gmail.com", "mail_1_port": "abc"}, secret=lambda n: "pw")
+        self.assertEqual(skipped, {"acct#1": "bad_port"})
+        _, skipped = mi.load_accounts({"mail_1_address": "not an address"}, secret=lambda n: "pw")
+        self.assertEqual(skipped, {"acct#1": "bad_address"})
+
+    def test_microsoft_mailboxes_are_skipped_without_asking_for_a_password(self):
+        asked = []
+        settings = {"mail_1_address": "a@outlook.com", "mail_2_address": "b@Hotmail.co.uk",
+                    "mail_3_address": "c@live.com", "mail_4_address": "d@live.nl",
+                    # Microsoft 365 on a company domain: the owner fills in Microsoft's server
+                    "mail_5_address": "e@corp.example", "mail_5_host": "outlook.office365.com",
+                    "mail_6_address": "f@corp.example", "mail_6_host": "imap-mail.outlook.com"}
+        accounts, skipped = mi.load_accounts(settings, secret=lambda n: asked.append(n) or "pw")
+        self.assertEqual(accounts, [])
+        self.assertEqual(skipped, {f"acct#{n}": "microsoft" for n in range(1, 7)})
+        self.assertEqual(asked, [])                                     # a password would not help
+        self.assertEqual(mi.REASONS["microsoft"], "Microsoft allows only its own sign-in, no app passwords")
+        self.assertIsNone(mi.auto_host("a@outlook.com"))
+        # Another mail server on an odd domain, or a company domain that merely starts with "live.", is not blocked
+        # once the owner names the server.
+        (acc,), skipped = mi.load_accounts({"mail_1_address": "me@live.corp.example", "mail_1_host": "mail.corp.example"},
+                                           secret=lambda n: "pw")
+        self.assertEqual((acc.host, skipped), ("mail.corp.example", {}))
+        self.assertFalse(mi.microsoft_only("me@gmail.com"))
+        self.assertFalse(mi.microsoft_only("me@yahoo.com"))
+        self.assertFalse(mi.microsoft_only("nobody"))
+        self.assertFalse(mi.microsoft_only("x@corp.example", "notoutlook.com"))
+
+    def test_empty_slots_are_ignored_and_secret_errors_skip(self):
+        self.assertEqual(mi.load_accounts({}, secret=lambda n: "pw"), ([], {}))
+        def refuse(name):
+            raise RuntimeError("no scope")
+        self.assertEqual(mi.load_accounts({"mail_6_address": "a@gmail.com"}, secret=refuse),
+                         ([], {"acct#6": "secret_unavailable"}))
+
+    def test_settings_read_through_ctx_get_config(self):
+        ctx = SimpleNamespace(get_config=lambda key, default=None: {"mail_2_address": "b@me.com"}.get(key, default))
+        out = REAL_PLUGIN_SETTINGS(ctx)       # Base patches mi.plugin_settings; this is the real one
+        self.assertEqual(out["mail_2_address"], "b@me.com")
+        self.assertEqual(set(out), set(mi.settings_keys()))
+        self.assertNotIn("mail_2_password", out)       # the password never comes from settings
 
     def test_window_from_quiet_hours(self):
         self.assertEqual(mi.poke_window({"quiet_hours": {"start": 23, "end": 7}}), (7, 23))
@@ -311,14 +361,27 @@ class GatewayStartTests(Base):
         self.config.unlink()
         self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "not set up")
         self.config.write_text("{}")
-        with patch.object(phconf, "CFG", phconf.load()):
-            self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "disabled")      # no accounts selected
+        with patch.object(mi, "plugin_settings", return_value={}):
+            self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "no mailboxes")   # no slot filled
         cfg = phconf.load()
         cfg["features"]["mail_push"] = False
-        cfg["mail"]["himalaya_accounts"] = ["rawacct"]
         with patch.object(phconf, "CFG", cfg):
             self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "disabled")
         self.assertEqual(ctx.spawned, [])
+
+    def test_passwords_are_read_at_start_not_in_the_imap_threads(self):
+        ctx = FakeCtx()
+
+        async def go():
+            return mi.start_in_gateway(ctx, gateway=True)
+
+        self.assertEqual(asyncio.run(go()), "started")
+        reads = phconf.secret.call_count
+        self.assertEqual(reads, 3)                     # slots 1, 2 and 4 (3 has no server)
+        svc = mi._SERVICE
+        self.assertEqual([w.acct.name for w in svc.workers], ["acct#1", "acct#2"])
+        self.assertEqual([w.label for w in svc.workers], ["acct#1", "acct#2"])
+        self.assertEqual(svc.status.accounts["acct#3"]["last_error_class"], "unknown_host")
 
     def test_gateway_with_loop_spawns_once(self):
         ctx = FakeCtx()
@@ -367,20 +430,75 @@ class GatewayStartTests(Base):
 
 
 class DoctorTests(Base):
-    def test_push_live_and_polling_reasons(self):
+    def test_instant_push_and_15_min_reasons_with_next_steps(self):
         now = datetime(2026, 11, 25, 12, tzinfo=timezone.utc)
         hb = self.tmp / "hb.json"
         hb.write_text(json.dumps({"updated": now.isoformat(), "accounts": {
-            "rawacct": {"state": "idle"}, "cmdacct": {"state": "error", "last_error_class": "TimeoutError"}}}))
+            "acct#1": {"state": "idle"}, "acct#2": {"state": "error", "last_error_class": "AuthError"}}}))
         cfg = phconf.load()
         cfg["mail"]["gmail_api"] = True
         rep = mi.push_report(cfg, now=now, path=hb)
-        self.assertEqual(rep["rawacct"], "push live")
-        self.assertIn("TimeoutError", rep["cmdacct"])
-        self.assertTrue(rep["oauth"].startswith("polling only (auth type oauth2"))
-        self.assertTrue(rep["Gmail API"].startswith("polling only"))
+        self.assertEqual(rep["Mailbox 1 (gmail.com)"], {"mode": "instant push"})
+        two = rep["Mailbox 2 (example.org)"]
+        self.assertEqual((two["mode"], two["reason"]), ("15 min checks", "login refused"))
+        self.assertIn("app password", two["next"])
+        three = rep["Mailbox 3 (example.net)"]
+        self.assertEqual(three["reason"], "unknown mail server for this address")
+        self.assertIn("Mailbox 3 IMAP server", three["next"])
+        four = rep["Mailbox 4 (icloud.com)"]
+        self.assertEqual(four["reason"], "no app password")
+        self.assertIn("hermes plugins config proactive-hermes", four["next"])
+        for other in ("Gmail API", "himalaya account icloud", "himalaya account work"):
+            self.assertEqual(rep[other]["mode"], "15 min checks")
+            self.assertIn("Mailbox 5", rep[other]["next"])          # the first free slot
         stale = mi.push_report(cfg, now=now + timedelta(minutes=11), path=hb)
-        self.assertIn("stale", stale["rawacct"])
+        self.assertEqual(stale["Mailbox 1 (gmail.com)"]["reason"], "push heartbeat is stale")
+        missing = mi.push_report(cfg, now=now, path=self.tmp / "none.json")
+        self.assertEqual(missing["Mailbox 1 (gmail.com)"]["reason"], "push is not running")
+        # Never an address or a password in the report.
+        text = json.dumps(rep) + json.dumps(stale)
+        for leak in ("s3cret", "me@", "work@", "nohost@", "nopass@"):
+            self.assertNotIn(leak, text)
+
+    def test_microsoft_mailbox_says_why_and_stays_on_15_min_checks(self):
+        now = datetime(2026, 11, 25, 12, tzinfo=timezone.utc)
+        hb = self.tmp / "hb.json"
+        hb.write_text(json.dumps({"updated": now.isoformat(), "accounts": {"acct#1": {"state": "idle"}}}))
+        settings = {"mail_1_address": "me@gmail.com", "mail_5_address": "me@outlook.com",
+                    "mail_6_address": "me@hotmail.co.uk", "mail_6_host": ""}
+        rep = mi.push_report(phconf.load(), now=now, path=hb, settings=settings, secret=fake_secret)
+        for key in ("Mailbox 5 (outlook.com)", "Mailbox 6 (hotmail.co.uk)"):
+            row = rep[key]
+            self.assertEqual(row["mode"], "15 min checks")
+            self.assertEqual(row["reason"], "Microsoft allows only its own sign-in, no app passwords")
+            self.assertEqual(row["next"], "Nothing to do: this mailbox stays on 15 min checks.")
+            # No "make a new password" loop, no restart or settings errand.
+            for loop in ("refused", "new one", "app password in", "restart", "Restart", "Mailbox 5 IMAP", "Mailbox 6 IMAP"):
+                self.assertNotIn(loop, row["next"] + row["reason"])
+        self.assertEqual(rep["Mailbox 1 (gmail.com)"], {"mode": "instant push"})
+        # The same row when the radar runs every 10 minutes, and when the heartbeat is missing or stale.
+        cfg = phconf.load()
+        cfg["schedule"]["mail_radar"] = "*/10 7-22 * * *"
+        rep10 = mi.push_report(cfg, path=self.tmp / "none.json", settings=settings, secret=fake_secret)
+        self.assertEqual(rep10["Mailbox 5 (outlook.com)"]["next"], "Nothing to do: this mailbox stays on 10 min checks.")
+        self.assertEqual(rep10["Mailbox 5 (outlook.com)"]["reason"], mi.REASONS["microsoft"])
+        self.assertNotIn("me@", json.dumps(rep) + json.dumps(rep10))
+
+    def test_slot_filled_after_start_says_restart(self):
+        now = datetime(2026, 11, 25, 12, tzinfo=timezone.utc)
+        hb = self.tmp / "hb.json"
+        hb.write_text(json.dumps({"updated": now.isoformat(), "accounts": {"acct#1": {"state": "idle"}}}))
+        rep = mi.push_report(phconf.load(), now=now, path=hb)
+        self.assertEqual(rep["Mailbox 2 (example.org)"]["reason"], "settings changed after Hermes started")
+        self.assertIn("gateway restart", rep["Mailbox 2 (example.org)"]["next"])
+
+    def test_feature_off_and_radar_interval(self):
+        cfg = phconf.load()
+        cfg["features"]["mail_push"] = False
+        cfg["schedule"]["mail_radar"] = "*/10 7-22 * * *"
+        rep = mi.push_report(cfg, path=self.tmp / "none.json")
+        self.assertEqual(rep["Mailbox 1 (gmail.com)"]["mode"], "10 min checks")
+        self.assertEqual(rep["Mailbox 1 (gmail.com)"]["reason"], "mail push is off in features")
 
     def test_doctor_report_has_mail_push(self):
         import ph_doctor
@@ -388,8 +506,11 @@ class DoctorTests(Base):
              patch.object(ph_doctor, "check_bot_chat", return_value=(True, "found")), \
              patch.object(ph_doctor, "check_mobile", return_value=(True, "")):
             rep = ph_doctor.report()
-        self.assertEqual(set(rep["mail_push"]), {"rawacct", "cmdacct", "oauth"})
-        self.assertTrue(all(v.startswith(("push live", "polling only")) for v in rep["mail_push"].values()))
+        self.assertIn("Mailbox 1 (gmail.com)", rep["mail_push"])
+        self.assertIn("himalaya account icloud", rep["mail_push"])
+        self.assertTrue(all(v["mode"] in ("instant push", "15 min checks") for v in rep["mail_push"].values()))
+        self.assertTrue(all("next" in v for v in rep["mail_push"].values() if v["mode"] != "instant push"))
+        self.assertNotIn("s3cret", json.dumps(rep))
 
 
 class PausedRadarTests(Base):
@@ -578,27 +699,6 @@ class DrainTests(unittest.TestCase):
         self.assertEqual(mi.drain_untagged(SimpleNamespace()), 0)
 
 
-class AuthCmdTests(unittest.TestCase):
-    def test_list_runs_without_shell_and_string_keeps_sh(self):
-        seen = []
-        run = lambda argv, **k: seen.append(argv) or SimpleNamespace(returncode=0, stdout="pw\n")
-        mi.Account(name="a", host="h", auth_kind="cmd", _secret=["pass", "show", "mail box"]).password(run=run)
-        mi.Account(name="a", host="h", auth_kind="cmd", _secret="pass show mail").password(run=run)
-        self.assertEqual(seen, [["pass", "show", "mail box"], ["sh", "-c", "pass show mail"]])
-
-    def test_toml_list_form_is_kept_as_argv(self):
-        tmp = Path(self.enterContext(TemporaryDirectory()))
-        (tmp / "c.toml").write_text('[accounts.l]\nbackend.type = "imap"\nbackend.host = "h"\n'
-                                    'backend.auth.type = "password"\nbackend.auth.cmd = ["pass", "show", "a b"]\n')
-        (acct,), _ = mi.load_accounts(tmp / "c.toml")
-        self.assertEqual(acct._secret, ["pass", "show", "a b"])
-
-    def test_failed_command_is_an_auth_error(self):
-        with self.assertRaises(PermissionError):
-            mi.Account(name="a", host="h", auth_kind="cmd", _secret=["false"]).password(
-                run=lambda *a, **k: SimpleNamespace(returncode=1, stdout=""))
-
-
 class LogFileTests(unittest.TestCase):
     def setUp(self):
         self.tearDown()     # a gateway-start test may have attached the real file handler
@@ -634,9 +734,9 @@ class LogFileTests(unittest.TestCase):
         self.assertNotIn("private-name", text)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)   # the new file after rotation too
 
-    def test_labels_follow_selected_order(self):
-        self.assertEqual(mi.acct_label("b", ["a", "b"]), "acct#2")
-        self.assertEqual(mi.acct_label("zz", ["a"]), "acct#?")
+    def test_labels_are_slot_numbers(self):
+        self.assertEqual(mi.slot_label(2), "acct#2")
+        self.assertEqual(mi.password_env(6), "PROACTIVE_MAIL_6_PASSWORD")
 
 
 if __name__ == "__main__":

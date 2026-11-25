@@ -9,14 +9,15 @@ from __future__ import annotations
 
 import json
 import re
-import sqlite3
 import subprocess
 import sys
 from collections.abc import Iterator
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import ea_reminders as reminders
 import phconf
 
 PROFILE = phconf.hermes_home()
@@ -28,7 +29,6 @@ HEALTH_STATE = STATE_DIR / "health_state.json"
 PENDING = STATE_DIR / "pending_queue.jsonl"
 RUN_LOG = STATE_DIR / "run_log.jsonl"
 PING_LOG = STATE_DIR / "ping_log.jsonl"
-BRIDGE_DB = PROFILE / "plugin-data" / "hermes-mobile-device-access" / "bridge.db"
 
 DESK_PREFIXES = ("Proactive ·",)
 REALERT = timedelta(hours=24)
@@ -219,9 +219,8 @@ def check_device() -> None:
     if not phconf.CFG["reminders"]["enabled"]:
         return
     try:
-        db = sqlite3.connect(f"file:{BRIDGE_DB}?mode=ro", uri=True, timeout=5)
-        row = db.execute("SELECT max(seen) FROM devices").fetchone()
-        db.close()
+        with closing(reminders.bridge(read_only=True)) as db:   # the one mobile bridge access point
+            row = db.execute("SELECT max(seen) FROM devices").fetchone()
     except Exception:
         return
     if not row or row[0] is None:
@@ -238,9 +237,8 @@ PHONE_HOURS = (8, 22)  # owner's timezone; a phone asleep at night is normal
 def phone_last_seen():
     """When the phone last talked to the bridge: devices.seen, else the newest landed/done outbox row."""
     try:
-        db = sqlite3.connect(f"file:{BRIDGE_DB}?mode=ro", uri=True, timeout=5)
-        row = db.execute("SELECT max(seen) FROM devices").fetchone()
-        db.close()
+        with closing(reminders.bridge(read_only=True)) as db:
+            row = db.execute("SELECT max(seen) FROM devices").fetchone()
         if row and row[0] is not None:
             return datetime.fromtimestamp(float(row[0]), timezone.utc)
     except Exception:

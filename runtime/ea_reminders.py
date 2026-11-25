@@ -16,6 +16,9 @@ finished in the promise, goal or action records; the same expiry rules apply to 
   ea_reminders.py tick                                  # check / re-queue / close finished items (silent)
   ea_reminders.py status
 
+Phone access goes through the Hermes mobile device plugin's bridge (see bridge() below: the only code here that
+touches that plugin's files). The desk never wakes the phone itself.
+
 Time-critical = calendar alert. The bridge delivers only when the phone wakes the Hermes app, which can
 take minutes (an alarm that arrives after its time is refused). With a calendar connected, calendar_blocks
 in the automatic authority and features.calendar_alerts on (the default), a reminder that is priority high or due within 12 h ALSO gets
@@ -49,7 +52,8 @@ PROFILE = phconf.hermes_home()
 OUTBOX = "reminder_outbox.json"
 LEDGER = "actions.json"
 RUN_LOG = "run_log.jsonl"
-PLUGIN = PROFILE / "plugins" / "hermes-mobile-device-access"
+BRIDGE_PLUGIN = "hermes-mobile-device-access"
+PLUGIN = PROFILE / "plugins" / BRIDGE_PLUGIN
 PROMISES = "promises.json"
 GOALS = "goals.json"
 MAX_ATTEMPTS = 40          # ~10h of 15-minute retries while the phone sleeps
@@ -106,7 +110,21 @@ def enabled() -> bool:
     return phconf.CFG["reminders"]["enabled"] and (PLUGIN / "bridge.py").is_file()
 
 
-def bridge():
+def bridge(*, read_only: bool = False):
+    """THE ONLY code in this plugin that touches the Hermes mobile device plugin's files (disclosed in the README).
+
+    Neither Hermes nor that plugin offers an API a scheduled script can call: its mobile_* tools run only inside an
+    agent turn, and it has no CLI. So the outbox uses the plugin's own bridge.py (open_store) on its own database,
+    <HERMES_HOME>/plugin-data/hermes-mobile-device-access/bridge.db, for creating and completing reminders and
+    alarms and for reading request results.
+
+    read_only=True: a read-only SQLite connection to that database (health checks and the trip planner's last known
+    location). It never creates the file; a phone that was never paired raises sqlite3.OperationalError.
+    Otherwise: (bridge module, its Store)."""
+    db = PROFILE / "plugin-data" / BRIDGE_PLUGIN / "bridge.db"
+    if read_only:
+        import sqlite3
+        return sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     base = PROFILE.parent.parent if PROFILE.parent.name == "profiles" else PROFILE
     agent = base / "hermes-agent"
     if agent.is_dir():
@@ -115,29 +133,6 @@ def bridge():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod, mod.open_store(PROFILE)
-
-
-def wake(device_id: str) -> None:
-    """Ask the push relay to wake the phone; best effort, never fatal."""
-    try:
-        import urllib.request
-        from urllib.parse import quote
-        env = {}
-        for line in (PROFILE / ".env").read_text().splitlines():
-            if "=" in line and not line.lstrip().startswith("#"):
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip().strip('"').strip("'")
-        relay = env.get("HERMES_MOBILE_PUSH_RELAY_URL", "").rstrip("/")
-        key = env.get("HERMES_MOBILE_PUSH_INSTALL_KEY", "")
-        if not relay.startswith("https://") or not key:
-            return
-        req = urllib.request.Request(f"{relay}/devices/{quote(device_id, safe='')}/wake", data=b"{}", method="POST",
-                                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                                              "User-Agent": "proactive-hermes (reminder outbox)"})
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            resp.read(256)
-    except Exception:
-        pass
 
 
 @state_lock(LEDGER)
@@ -172,7 +167,6 @@ def submit(store, box: dict, item: dict) -> None:
     item.update(attempts=attempt, request_id=req["id"], last_try=now_iso(), status="queued")
     box[item["key"]] = item
     save(OUTBOX, box)
-    wake(req["device_id"])
 
 
 def alert_key(key: str) -> str:
@@ -329,7 +323,6 @@ def request_close(store, item: dict, evidence: str) -> dict:
                         idempotency_key=f"proactive-hermes:done:{digest}:{attempt}", ttl=TTL)
     item.update(status="closing", close_attempts=attempt, close_request_id=req["id"],
                 close_evidence=evidence[:200], close_try=now_iso())
-    wake(req["device_id"])
     return item
 
 

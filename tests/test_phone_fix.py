@@ -26,7 +26,6 @@ class PhoneBase(OfflineTestCase):
         self.freeze_datetime(reminders)
         self.store = FakeStore()
         self.enterContext(patch.object(reminders, "bridge", return_value=(None, self.store)))
-        self.enterContext(patch.object(reminders, "wake"))
         self.calls = []
 
         def fake_cli(args, texts=None):
@@ -274,8 +273,11 @@ class PhoneHealthTests(OfflineTestCase):
         spec = importlib.util.spec_from_file_location("test_ea_health_phone", RUNTIME / "ea_health.py")
         self.health = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.health)
-        self.db = self.tmp / "bridge.db"
-        self.enterContext(patch.multiple(self.health, STATE_DIR=self.tmp, BRIDGE_DB=self.db, faults={}))
+        self.db = self.tmp / "plugin-data" / "hermes-mobile-device-access" / "bridge.db"
+        self.db.parent.mkdir(parents=True)
+        self.enterContext(patch.multiple(self.health, STATE_DIR=self.tmp, faults={}))
+        # Health reads the phone's last sync only through ea_reminders.bridge(read_only=True).
+        self.enterContext(patch.object(self.health.reminders, "PROFILE", self.tmp))
 
     def clock_at(self, hour):
         clock = datetime(2030, 4, 1, hour, tzinfo=phconf.tz()).astimezone(timezone.utc)

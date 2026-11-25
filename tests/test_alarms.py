@@ -16,7 +16,6 @@ class AlarmTests(OfflineTestCase):
         self.freeze_datetime(reminders)
         self.store = FakeStore()
         self.bridge = self.enterContext(patch.object(reminders, "bridge", return_value=(None, self.store)))
-        self.wake = self.enterContext(patch.object(reminders, "wake"))
         self.at = "2030-04-03T18:00:00+02:00"
 
     def alarm(self, key="urgent", at=None, label="Leave for Berlin"):
@@ -29,7 +28,7 @@ class AlarmTests(OfflineTestCase):
         (op, args, key, ttl), = self.store.requests
         self.assertEqual((op, args, ttl), ("alarms.create", {"at": self.at, "label": "Leave for Berlin"}, reminders.TTL))
         self.assertTrue(key)
-        self.wake.assert_called_once_with("fake-phone")
+        self.assertFalse(hasattr(reminders, "wake"))  # the desk never wakes the phone itself
 
     def test_pending_waits_and_landed_is_recorded(self):
         rid = self.alarm()["request_id"]

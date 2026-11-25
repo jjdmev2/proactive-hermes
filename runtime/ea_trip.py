@@ -69,9 +69,8 @@ def origin_hint() -> dict | None:
     # instead: the bridge currently has no public list/latest-result method.
     if not (outbox.PLUGIN / "bridge.py").is_file():
         return None
-    path = outbox.PROFILE / "plugin-data" / outbox.PLUGIN.name / "bridge.db"
     try:
-        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
+        with closing(outbox.bridge(read_only=True)) as db:   # the one mobile bridge access point
             rows = db.execute("""
                 SELECT requests.result, devices.grants FROM requests
                 JOIN devices ON devices.id = requests.device

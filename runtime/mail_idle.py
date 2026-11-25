@@ -1,35 +1,38 @@
 #!/usr/bin/env python3
-"""Mail push: IMAP IDLE on the selected mailboxes wakes the mail radar within about a minute.
+"""Mail push: IMAP IDLE on the mailboxes the owner gave Hermes wakes the mail radar within 1 to 3 minutes.
+
+Opt-in. A mailbox gets push only when the owner fills one of six slots in Settings -> Plugins -> Proactive
+Hermes (or `hermes plugins config proactive-hermes`): Mailbox N address, Mailbox N app password, and for an
+unknown provider Mailbox N IMAP server (port 993 unless set). The address, server and port are plugin settings;
+the app password is a Hermes secret (PROACTIVE_MAIL_N_PASSWORD) read only through agent.secret_scope.get_secret,
+when the gateway loads the plugin. Nothing is read from another tool's config, a keyring or a .env file. Every
+other mailbox stays on the radar's schedule (15 minutes by default).
 
 It only POKES the plugin's own mail radar cron job (the job `hermes proactive setup` registered under
 the key "mail_radar"): the job's next run moves to now and its gate reads mail as usual. A radar the owner
 paused or disabled is never poked (a poke would un-pause it). It never calls a model, never posts, never
-reads or stores mail content, and never logs addresses, account names or secrets: the log names an account
-by its position in mail.himalaya_accounts ("acct#2"). Polling on the radar's schedule stays on as the safety net.
+reads or stores mail content, and never logs addresses or secrets: the log names a mailbox by its slot
+("acct#2"). Polling on the radar's schedule stays on as the safety net.
 
 IDLE is renewed every 9 minutes and the socket has TCP keepalive (60 s idle, 20 s interval, 3 probes), so a
 dead NAT path is noticed within minutes. Errors reconnect with jittered backoff (5 s doubling to 5 min, reset
 only after a full IDLE round); a refused login waits 1 h. Log: logs/proactive-hermes-mail-push.log (0600,
 rotated at 1 MB, 3 kept).
 
-Accounts: mail.himalaya_accounts, the himalaya accounts setup selected for the mail radar (names or
-{"account": name}). Empty means none: the desk never opens a mailbox it was not given, the same rule
-the radar and the look-ahead follow. Logins come from the himalaya config (password `raw` or `cmd`;
-other auth, e.g. OAuth or keyring, stays on polling). Mail read through the Gmail API only (mail.gmail_api)
-has no IMAP login here and stays on polling.
-
 Inside the gateway, `start_in_gateway(ctx)` runs it as a supervised task (`ctx.spawn_task`); blocking
-IMAP lives in one thread per account. CLI loads never start it. Feature flag: features.mail_push.
+IMAP lives in one thread per mailbox. CLI loads never start it. Feature flag: features.mail_push.
 With `plugins.isolation: host` the plugin host cannot tell a gateway from a CLI parent, so push stays off
-there and `hermes proactive doctor` reports polling only.
+there and `hermes proactive doctor` reports 15 min checks only.
 
-    python3 mail_idle.py --once-test   connect each selected account, report idle-capable yes/no, exit
+    python3 mail_idle.py --once-test   connect each filled slot, report idle-capable yes/no, exit
     python3 mail_idle.py --dry-run     run in the foreground and log "would poke" instead of poking
+(run them inside Hermes, e.g. through `hermes proactive doctor`, so the app passwords are readable)
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import imaplib
 import json
 import logging
@@ -45,7 +48,6 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,17 +71,24 @@ HEARTBEAT_EVERY = 60
 STALE_AFTER_S = 10 * 60
 TASK_NAME = "proactive-hermes:mail-push"
 
+SLOTS = range(1, 7)         # Mailbox 1..6 in Settings -> Plugins -> Proactive Hermes
+DEFAULT_PORT = 993
+SETTINGS = "Settings -> Plugins -> Proactive Hermes (or `hermes plugins config proactive-hermes`)"
+RESTART = "restart Hermes (`hermes gateway restart`, or quit and reopen the desktop app)"
+# Well-known providers: the IMAP server is filled in for these domains. Any other domain needs Mailbox N IMAP server.
+HOSTS = {
+    "gmail.com": "imap.gmail.com", "googlemail.com": "imap.gmail.com",
+    "icloud.com": "imap.mail.me.com", "me.com": "imap.mail.me.com", "mac.com": "imap.mail.me.com",
+    "fastmail.com": "imap.fastmail.com", "fastmail.fm": "imap.fastmail.com",
+}
+# Outlook.com, Hotmail, Live and Microsoft 365 mail takes only Microsoft's own sign-in: password and app password
+# logins are refused. Such a mailbox is never filled in with a server and stays on the radar schedule.
+MICROSOFT = ("outlook", "hotmail", "live")   # outlook.com, hotmail.co.uk, live.com, ...
+MICROSOFT_HOSTS = ("office365.com", "outlook.com", "office.com")   # outlook.office365.com, imap-mail.outlook.com, ...
+YAHOO_HOST = "imap.mail.yahoo.com"           # yahoo.com, yahoo.co.uk, yahoo.fr, ...; not Yahoo Japan (yahoo.co.jp)
+
 log = logging.getLogger("proactive_hermes.mail_idle")
 log.addHandler(logging.NullHandler())
-
-
-def himalaya_config() -> Path:
-    env = os.environ.get("HIMALAYA_CONFIG")
-    if env:
-        return Path(env).expanduser()
-    candidates = [Path(os.environ["XDG_CONFIG_HOME"]) / "himalaya" / "config.toml"] if os.environ.get("XDG_CONFIG_HOME") else []
-    candidates += [Path.home() / ".config" / "himalaya" / "config.toml", Path.home() / ".himalayarc"]
-    return next((c for c in candidates if c.is_file()), candidates[0])
 
 
 def heartbeat_path() -> Path:
@@ -90,17 +99,13 @@ def log_path() -> Path:
     return phconf.hermes_home() / "logs" / "proactive-hermes-mail-push.log"
 
 
-def acct_label(name: str, names: list[str] | None = None) -> str:
-    """How the log names an account: its 1-based position in mail.himalaya_accounts, never the name."""
-    names = selected_accounts() if names is None else names
-    return f"acct#{names.index(name) + 1}" if name in names else "acct#?"
+def slot_label(n: int) -> str:
+    """How the log and the heartbeat name a mailbox: its slot, never the address."""
+    return f"acct#{n}"
 
 
-def selected_accounts(cfg: dict | None = None) -> list[str]:
-    """The himalaya accounts setup selected for the mail radar. Empty = none (never all)."""
-    raw = ((cfg or phconf.CFG).get("mail") or {}).get("himalaya_accounts")
-    names = [str((a.get("account") if isinstance(a, dict) else a) or "").strip() for a in (raw if isinstance(raw, list) else [])]
-    return list(dict.fromkeys(n for n in names if n))
+def password_env(n: int) -> str:
+    return f"PROACTIVE_MAIL_{n}_PASSWORD"
 
 
 def poke_window(cfg: dict | None = None) -> tuple[int, int]:
@@ -111,81 +116,146 @@ def poke_window(cfg: dict | None = None) -> tuple[int, int]:
 
 # ---------------------------------------------------------------- config
 
+def _domain(address: str) -> str:
+    return address.rsplit("@", 1)[-1].strip().lower().rstrip(".") if "@" in address else ""
+
+
+def auto_host(address: str) -> str | None:
+    """The IMAP server of a well-known provider, from the address's domain. None for any other domain
+    (and for Microsoft mail, which has no app passwords: see microsoft_only)."""
+    domain = _domain(address)
+    if not domain:
+        return None
+    if domain in HOSTS:
+        return HOSTS[domain]
+    first = domain.split(".", 1)[0]
+    if "." not in domain:
+        return None
+    if first == "yahoo" and domain != "yahoo.co.jp":
+        return YAHOO_HOST
+    return None
+
+
+def microsoft_only(address: str, host: str = "") -> bool:
+    """True for a mailbox Microsoft opens only through its own sign-in: an outlook.*, hotmail.* or live.* address
+    with no server filled in, or any address whose filled-in server is Microsoft's (Microsoft 365 on a company
+    domain)."""
+    host = host.strip().lower().rstrip(".")
+    if host:
+        return any(host == d or host.endswith("." + d) for d in MICROSOFT_HOSTS)
+    domain = _domain(address)
+    return "." in domain and domain.split(".", 1)[0] in MICROSOFT
+
+
+def settings_keys() -> list[str]:
+    return [f"mail_{n}_{part}" for n in SLOTS for part in ("address", "host", "port")]
+
+
+def plugin_settings(ctx=None) -> dict:
+    """The slot settings (address, server, port; never the password) through Hermes: ctx.get_config inside the
+    plugin, else Hermes's read-only config loader (plugins.entries.proactive-hermes.settings)."""
+    if ctx is not None and hasattr(ctx, "get_config"):
+        out = {}
+        for key in settings_keys():
+            try:
+                out[key] = ctx.get_config(key)
+            except Exception:
+                out[key] = None
+        return out
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return {}
+    entry = ((cfg.get("plugins") or {}).get("entries") or {}).get(phconf.PLUGIN) if isinstance(cfg, dict) else None
+    settings = entry.get("settings") if isinstance(entry, dict) else None
+    return {k: settings.get(k) for k in settings_keys()} if isinstance(settings, dict) else {}
+
+
 @dataclass
 class Account:
-    name: str
+    name: str                            # slot label, e.g. "acct#1"; never the address
     host: str
-    port: int = 993
-    login: str = ""
-    tls: str = "tls"                     # tls | start-tls | none
-    auth_kind: str = "raw"               # raw | cmd
-    _secret: str | list = field(default="", repr=False)   # list = argv run without a shell
+    port: int = DEFAULT_PORT
+    login: str = field(default="", repr=False)
+    tls: str = "tls"                     # tls (implicit, port 993) | start-tls (port 143); never plain text
+    _secret: str = field(default="", repr=False)
+    slot: int = 0
 
-    def password(self, run=subprocess.run) -> str:
-        if self.auth_kind == "raw":
-            return self._secret
-        argv = [str(x) for x in self._secret] if isinstance(self._secret, list) else ["sh", "-c", self._secret]
-        proc = run(argv, capture_output=True, text=True, timeout=30)
-        if proc.returncode != 0:
-            raise AuthError("auth command failed")
-        line = (proc.stdout or "").splitlines()
-        if not line or not line[0].strip():
-            raise AuthError("auth command printed nothing")
-        return line[0].strip()
+    def password(self) -> str:
+        return self._secret
 
 
 class AuthError(PermissionError):
-    """The password could not be obtained or the server refused it: retried only every AUTH_BACKOFF_S."""
+    """The server refused the app password: retried only every AUTH_BACKOFF_S."""
 
 
-def load_accounts(path: Path | None = None, only: list[str] | None = None) -> tuple[list[Account], dict[str, str]]:
-    """Accounts with a readable IMAP password login, plus {name: reason} for the ones skipped.
-    Reasons never contain a secret."""
-    with open(path or himalaya_config(), "rb") as fh:
-        cfg = tomllib.load(fh)
+# Why a filled slot is not watched. Codes go into the heartbeat; doctor turns them into words and a next step.
+REASONS = {
+    "no_password": "no app password",
+    "unknown_host": "unknown mail server for this address",
+    "microsoft": "Microsoft allows only its own sign-in, no app passwords",
+    "bad_port": "IMAP port is not a number",
+    "bad_address": "the address is not a mail address",
+    "secret_unavailable": "Hermes could not read the app password in the gateway",
+}
+
+
+def load_accounts(settings: dict | None = None, secret=None) -> tuple[list[Account], dict[str, str]]:
+    """Accounts from the filled slots, plus {label: reason code} for filled slots that cannot be watched.
+    Empty slots are ignored. Reasons never contain an address or a secret. `secret(name)` reads a declared
+    secret through Hermes (phconf.secret -> agent.secret_scope.get_secret)."""
+    settings = plugin_settings() if settings is None else settings
+    secret = secret or phconf.secret
     accounts: list[Account] = []
     skipped: dict[str, str] = {}
-    for name, acct in (cfg.get("accounts") or {}).items():
-        if only is not None and name not in only:
+    for n in SLOTS:
+        address = str(settings.get(f"mail_{n}_address") or "").strip()
+        if not address:
             continue
-        if not isinstance(acct, dict):
-            skipped[name] = "not a table"
+        label = slot_label(n)
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", address):
+            skipped[label] = "bad_address"
             continue
-        backend = acct.get("backend") or {}
-        if (backend.get("type") or "").lower() != "imap":
-            skipped[name] = f"backend {backend.get('type') or 'missing'} is not imap"
+        host = str(settings.get(f"mail_{n}_host") or "").strip()
+        if microsoft_only(address, host):
+            skipped[label] = "microsoft"
             continue
-        host = backend.get("host")
+        host = host or auto_host(address)
         if not host:
-            skipped[name] = "no imap host"
+            skipped[label] = "unknown_host"
             continue
-        auth = backend.get("auth") or {}
-        kind = (auth.get("type") or "password").lower()
-        if kind != "password":
-            skipped[name] = f"auth type {kind} not supported"
+        raw_port = settings.get(f"mail_{n}_port")
+        try:
+            port = int(raw_port) if raw_port not in (None, "") else DEFAULT_PORT
+        except (TypeError, ValueError):
+            skipped[label] = "bad_port"
             continue
-        if isinstance(auth.get("raw"), str) and auth["raw"]:
-            auth_kind, secret = "raw", auth["raw"]
-        elif isinstance(auth.get("cmd"), str) and auth["cmd"].strip():
-            auth_kind, secret = "cmd", auth["cmd"]
-        elif isinstance(auth.get("cmd"), list) and auth["cmd"]:
-            auth_kind, secret = "cmd", [str(x) for x in auth["cmd"]]
-        elif "keyring" in auth:
-            skipped[name] = "keyring auth not supported"
+        if not 0 < port < 65536:
+            skipped[label] = "bad_port"
             continue
-        else:
-            skipped[name] = "no password source"
+        try:
+            password = secret(password_env(n))
+        except Exception:
+            skipped[label] = "secret_unavailable"
             continue
-        enc = backend.get("encryption")
-        tls = str((enc.get("type") if isinstance(enc, dict) else enc) or "tls").lower()
-        accounts.append(Account(name=name, host=str(host), port=int(backend.get("port") or (993 if tls == "tls" else 143)),
-                                login=str(backend.get("login") or acct.get("email") or ""), tls=tls,
-                                auth_kind=auth_kind, _secret=secret))
-    if only is not None:
-        for name in only:
-            if name not in skipped and not any(a.name == name for a in accounts):
-                skipped[name] = "not in himalaya config"
+        if not password:
+            skipped[label] = "no_password"
+            continue
+        accounts.append(Account(name=label, host=host, port=port, login=address,
+                                tls="start-tls" if port == 143 else "tls", _secret=password, slot=n))
     return accounts, skipped
+
+
+def filled_slots(settings: dict | None = None) -> dict[int, str]:
+    """{slot: domain of the address} for every slot with an address (the domain only, for doctor)."""
+    settings = plugin_settings() if settings is None else settings
+    out = {}
+    for n in SLOTS:
+        address = str(settings.get(f"mail_{n}_address") or "").strip()
+        if address:
+            out[n] = address.rsplit("@", 1)[-1].lower() if "@" in address else "?"
+    return out
 
 
 # ---------------------------------------------------------------- heartbeat
@@ -713,9 +783,8 @@ class Service:
         self.debouncer = Debouncer(poke, status=self.status, window=window or poke_window(), tz=tz)
         for name, reason in skipped.items():
             self.status.set(name, "skipped", reason)
-        names = [a.name for a in accounts] + [n for n in skipped if n not in {a.name for a in accounts}]
-        labels = labels or {n: f"acct#{i}" for i, n in enumerate(names, 1)}
-        self.workers = [Worker(a, self.debouncer, self.status, self.stop, connect_fn, label=labels.get(a.name))
+        labels = labels or {}
+        self.workers = [Worker(a, self.debouncer, self.status, self.stop, connect_fn, label=labels.get(a.name, a.name))
                         for a in accounts]
         self._last_hb = 0.0
 
@@ -770,9 +839,10 @@ _LOCK = threading.Lock()
 
 
 def enabled(cfg: dict | None = None) -> bool:
+    """The feature flags. Which mailboxes get push is decided by the filled slots (load_accounts)."""
     cfg = cfg or phconf.CFG
     feats = cfg.get("features") or {}
-    return bool(feats.get("mail_push", True) and feats.get("mail_radar", True) and selected_accounts(cfg))
+    return bool(feats.get("mail_push", True) and feats.get("mail_radar", True))
 
 
 def is_gateway_process() -> bool:
@@ -791,13 +861,14 @@ def _gateway_loop():
     return loop if loop is not None and loop.is_running() and not loop.is_closed() else None
 
 
-def build_service(*, dry_run: bool = False) -> Service:
-    names = selected_accounts()
-    accounts, skipped = load_accounts(only=names)
-    for name, reason in skipped.items():
-        log.info("%s: polling only (%s)", acct_label(name, names), reason)
-    return Service(accounts, skipped, lambda: poke_radar(dry_run=dry_run),
-                   labels={n: acct_label(n, names) for n in names})
+def build_service(ctx=None, *, dry_run: bool = False, secret=None) -> Service:
+    """Read the slots and their app passwords NOW, in the caller's context: inside the gateway that is plugin
+    registration, where Hermes's profile secret scope applies. The IMAP threads only use what was read here,
+    so they never call get_secret without a scope (a multiplexed gateway would refuse that read)."""
+    accounts, skipped = load_accounts(plugin_settings(ctx), secret=secret)
+    for label, reason in skipped.items():
+        log.info("%s: 15 min checks only (%s)", label, REASONS.get(reason, reason))
+    return Service(accounts, skipped, lambda: poke_radar(dry_run=dry_run))
 
 
 def stop_service() -> None:
@@ -810,7 +881,7 @@ def stop_service() -> None:
             w.close()
 
 
-def start_in_gateway(ctx, *, gateway: bool | None = None, wait_s: float = 600) -> str:
+def start_in_gateway(ctx, *, gateway: bool | None = None, wait_s: float = 600, secret=None) -> str:
     """Start mail push once per process, only inside the gateway. Returns what happened (for logs/tests)."""
     global _SERVICE
     if not phconf.config_path().exists():
@@ -823,10 +894,13 @@ def start_in_gateway(ctx, *, gateway: bool | None = None, wait_s: float = 600) -
         if _SERVICE is not None:
             return "already running"
         try:
-            _SERVICE = svc = build_service()
+            svc = build_service(ctx, secret=secret)
         except Exception as exc:
             log.warning("mail push not started: %s", type(exc).__name__)
             return "config unreadable"
+        if not svc.workers and not svc.status.accounts:
+            return "no mailboxes"
+        _SERVICE = svc
     _setup_file_log()
     try:
         ctx.on_unload(stop_service)
@@ -839,7 +913,8 @@ def start_in_gateway(ctx, *, gateway: bool | None = None, wait_s: float = 600) -
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        # Plugins can load on a discovery thread before the gateway loop runs: hand off once it is up.
+        # Plugins can load on a discovery thread before the gateway loop runs: hand off once it is up. The thread
+        # runs in a copy of this context, so it keeps the profile scope plugin loading had.
         def handoff():
             deadline = time.monotonic() + wait_s
             while time.monotonic() < deadline and _SERVICE is svc:
@@ -849,7 +924,8 @@ def start_in_gateway(ctx, *, gateway: bool | None = None, wait_s: float = 600) -
                     return
                 time.sleep(1)
             log.warning("mail push not started: no gateway loop")
-        threading.Thread(target=handoff, name="mail-push-handoff", daemon=True).start()
+        threading.Thread(target=contextvars.copy_context().run, args=(handoff,), name="mail-push-handoff",
+                         daemon=True).start()
         return "waiting for the gateway loop"
     spawn()
     return "started"
@@ -883,50 +959,97 @@ def _setup_file_log(path: Path | None = None) -> None:
 
 # ---------------------------------------------------------------- doctor
 
-def push_report(cfg: dict | None = None, *, now: datetime | None = None, path: Path | None = None) -> dict[str, str]:
-    """{account: "push live" | "polling only (reason)"} for every mailbox the desk reads."""
+def radar_every(cfg: dict | None = None) -> str:
+    """'15 min checks' from the radar's cron schedule ("*/15 7-22 * * *"); 'scheduled checks' otherwise."""
+    sched = str(((cfg or phconf.CFG).get("schedule") or {}).get("mail_radar") or "")
+    m = re.match(r"\*/(\d+)\s", sched + " ")
+    return f"{int(m.group(1))} min checks" if m else "scheduled checks"
+
+
+def _next(reason: str, n: int, every: str = "15 min checks") -> str:
+    box = f"Mailbox {n}"
+    return {
+        "no_password": f"Make an app password for this mailbox, paste it in {box} app password in {SETTINGS}, then {RESTART}.",
+        "unknown_host": f"Fill {box} IMAP server (from your provider's help page, e.g. imap.example.com) in {SETTINGS}, then {RESTART}.",
+        "bad_port": f"Set {box} IMAP port to a number (usually 993) or clear it, in {SETTINGS}, then {RESTART}.",
+        "bad_address": f"Fix {box} address in {SETTINGS} (the full mail address), then {RESTART}.",
+        "secret_unavailable": f"Run `hermes gateway restart`. If this stays, report it: Hermes could not give the plugin its app password.",
+        "login_refused": f"The mail server refused the app password. Make a new one, paste it in {box} app password in {SETTINGS}, then {RESTART}. Push retries once an hour.",
+        "microsoft": f"Nothing to do: this mailbox stays on {every}.",
+        "no_idle": "Nothing to do: this mail server does not offer IMAP IDLE, so it stays on the radar schedule.",
+        "not_running": f"{RESTART[0].upper() + RESTART[1:]}. Push starts with the gateway, so it needs a restart after setup or after filling a Mailbox slot.",
+        "stale": "Check that Hermes is running for this profile (desktop app or `hermes gateway start`).",
+        "not_loaded": f"{RESTART[0].upper() + RESTART[1:]} so push picks up the new settings.",
+        "reconnecting": "Nothing to do yet: push reconnects by itself. If it stays like this, check the network or the mail server.",
+        "feature_off": "Turn mail push back on: set features.mail_push to true with `hermes proactive setup`.",
+    }.get(reason, "Run `hermes proactive doctor` again in a few minutes.")
+
+
+def push_report(cfg: dict | None = None, *, now: datetime | None = None, path: Path | None = None,
+                settings: dict | None = None, secret=None) -> dict[str, dict]:
+    """One row per mailbox: {"mode": "instant push" | "<N> min checks", "reason": ..., "next": ...}.
+    Rows are named "Mailbox N (domain)" for the slots, never by address; the radar's other mailboxes get one
+    row each ("himalaya account <name>", "Gmail API"). Passwords are only checked for presence."""
     cfg = cfg or phconf.CFG
     now = now or datetime.now(timezone.utc)
-    out: dict[str, str] = {}
-    if (cfg.get("mail") or {}).get("gmail_api"):
-        out["Gmail API"] = "polling only (Gmail API accounts have no IMAP login here)"
-    names = selected_accounts(cfg)
+    every = radar_every(cfg)
+    settings = plugin_settings() if settings is None else settings
+    slots = filled_slots(settings)
+    out: dict[str, dict] = {}
     feats = cfg.get("features") or {}
-    if not names:
-        return out
-    if not feats.get("mail_push", True) or not feats.get("mail_radar", True):
-        for n in names:
-            out[n] = "polling only (mail push is off in features)"
-        return out
+    push_on = feats.get("mail_push", True) and feats.get("mail_radar", True)
     try:
         beat = json.loads((path or heartbeat_path()).read_text())
         updated = datetime.fromisoformat(str(beat.get("updated")).replace("Z", "+00:00"))
         fresh = (now - updated).total_seconds() <= STALE_AFTER_S
         rows = beat.get("accounts") or {}
-    except (FileNotFoundError, ValueError, TypeError):
+    except (FileNotFoundError, ValueError, TypeError, AttributeError):
         beat, fresh, rows = None, False, {}
     try:
-        _, skipped = load_accounts(only=names)
+        _, skipped = load_accounts(settings, secret=secret)
     except Exception:
         skipped = {}
-    for n in names:
-        row = rows.get(n) if isinstance(rows, dict) else None
-        if n in skipped:
-            out[n] = f"polling only ({skipped[n]})"
+    for n, domain in slots.items():
+        label, key = slot_label(n), f"Mailbox {n} ({domain})"
+        row = rows.get(label) if isinstance(rows, dict) else None
+        if not push_on:
+            reason = "feature_off"
+        elif label in skipped:
+            reason = skipped[label]
         elif beat is None:
-            out[n] = "polling only (push not running: start the gateway)"
+            reason = "not_running"
         elif not fresh:
-            out[n] = "polling only (push heartbeat is stale: is the gateway running?)"
+            reason = "stale"
         elif not isinstance(row, dict):
-            out[n] = "polling only (not watched yet)"
+            reason = "not_loaded"
         elif row.get("state") == "idle":
-            out[n] = "push live"
+            out[key] = {"mode": "instant push"}
+            continue
         elif row.get("state") == "error":
-            out[n] = f"polling only (reconnecting after {row.get('last_error_class') or 'an error'})"
-        elif row.get("state") == "skipped":
-            out[n] = f"polling only ({row.get('last_error_class') or 'skipped'})"
+            reason = "login_refused" if row.get("last_error_class") in ("AuthError", "PermissionError") else "reconnecting"
+        elif row.get("state") == "skipped" and row.get("last_error_class") == "NoIdleCapability":
+            reason = "no_idle"
+        elif row.get("state") == "skipped" and row.get("last_error_class") in REASONS:
+            reason = "not_loaded"   # skipped when the gateway started; the settings changed since
         else:
-            out[n] = f"polling only ({row.get('state') or 'unknown'})"
+            reason = "reconnecting"
+        words = {"feature_off": "mail push is off in features", "not_running": "push is not running",
+                 "stale": "push heartbeat is stale", "not_loaded": "settings changed after Hermes started",
+                 "login_refused": "login refused", "reconnecting": "reconnecting",
+                 "no_idle": "server has no IMAP IDLE"}.get(reason) or REASONS.get(reason, reason)
+        out[key] = {"mode": every, "reason": words, "next": _next(reason, n, every)}
+    free = [n for n in SLOTS if n not in slots]
+    hint = (f"If this mailbox is not one of the Mailbox slots above: make an app password and fill Mailbox "
+            f"{free[0]} address and app password in {SETTINGS}, then {RESTART}. Optional." if free else
+            "All six Mailbox slots are used.")
+    mail = cfg.get("mail") or {}
+    if mail.get("gmail_api"):
+        out["Gmail API"] = {"mode": every, "reason": "no push slot (read through Google's API)", "next": hint}
+    for acc in mail.get("himalaya_accounts") or []:
+        name = str((acc.get("account") if isinstance(acc, dict) else acc) or "").strip()
+        if name:
+            out[f"himalaya account {name}"] = {"mode": every, "reason": "no push slot, unless it is one of the Mailbox slots above",
+                                               "next": hint}
     return out
 
 
@@ -952,7 +1075,7 @@ def once_test(accounts: list[Account], skipped: dict[str, str], connect_fn=conne
             row["reason"] = type(exc).__name__
         rows.append(row)
     for name, reason in skipped.items():
-        rows.append({"account": name, "idle_capable": "no", "reason": f"skipped: {reason}"})
+        rows.append({"account": name, "idle_capable": "no", "reason": f"skipped: {REASONS.get(reason, reason)}"})
     return rows
 
 
@@ -962,12 +1085,11 @@ def main(argv=None) -> int:
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args(argv)
     _setup_file_log()
-    names = selected_accounts()
-    if not names:
-        print("No mail accounts selected for the mail radar (mail.himalaya_accounts): nothing to watch.")
+    if not filled_slots():
+        print(f"No mailbox slots filled in {SETTINGS}: nothing to watch.")
         return 0
     if a.once_test:
-        accounts, skipped = load_accounts(only=names)
+        accounts, skipped = load_accounts()
         for row in once_test(accounts, skipped):
             print(f"{row['account']}: idle-capable {row['idle_capable']}"
                   + (f" ({row['reason']})" if row.get("reason") else ""))

@@ -13,8 +13,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
-from shutil import copyfile
-from tempfile import NamedTemporaryFile, TemporaryDirectory
+from tempfile import NamedTemporaryFile
 
 import phconf
 from phconf import state_dir
@@ -380,19 +379,9 @@ def search_gmail(email, who, runner=None, *, since=None, before=None, origin_ids
     kwargs = {"capture_output": True, "text": True, "timeout": 60}
     try:
         if runner is None:
-            # The wrapper can refresh its OAuth token. Isolate that write from the live profile.
-            token = phconf.hermes_home() / "google_token.json"
-            scratch = state_dir().resolve() if os.getenv("EA_STATE_DIR") else None
-            if scratch is not None:
-                scratch.mkdir(parents=True, exist_ok=True)
-            with TemporaryDirectory(prefix="resolve-mail-", dir=scratch) as home:
-                private_token = Path(home) / token.name
-                copyfile(token, private_token)
-                private_token.chmod(0o600)
-                env = {**os.environ, "HERMES_HOME": home, "HOME": home, "TMPDIR": home,
-                       "XDG_CACHE_HOME": home, "XDG_CONFIG_HOME": home, "XDG_DATA_HOME": home,
-                       "XDG_STATE_HOME": home, "PYTHONDONTWRITEBYTECODE": "1"}
-                result = subprocess.run(argv, **kwargs, env=env)
+            # The google-workspace skill's own wrapper signs in with its own token; this script never opens,
+            # copies or refreshes that token itself (catalog rule 11).
+            result = subprocess.run(argv, **kwargs)
         else:
             result = runner(argv, **kwargs)
         if result.returncode:

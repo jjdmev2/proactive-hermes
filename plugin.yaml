@@ -16,6 +16,125 @@ provides_tools: []
 provides_hooks: [pre_llm_call]
 optional_env:
   - name: OPENAI_API_KEY
-    description: "Optional. Enables the fast decision filter (OpenAI Decisions API, gpt-6-luna): noise filtering and promise checks for about 3 cents per 1,000 emails. Recommended for Juan's setup."
+    description: "Optional fallback for the decision filter, used only where Hermes shows it to the plugin. Scheduled runs need PROACTIVE_OPENAI_API_KEY."
     url: https://platform.openai.com/api-keys
     secret: true
+# Shown in Settings -> Plugins -> Proactive Hermes and in `hermes plugins config proactive-hermes`. Secrets are
+# Hermes secrets read with get_secret, never from a file.
+config_schema:
+  decisions_api_key:
+    type: secret
+    env: PROACTIVE_OPENAI_API_KEY
+    label: "OpenAI key for the decision filter (optional)"
+    description: "Turns on the fast decision filter: noise out and promises spotted, about 3 cents per 1,000 emails. It can be the same key as OPENAI_API_KEY. It is needed because Hermes hides provider keys from scheduled scripts."
+  # Instant mail push (optional). Each filled Mailbox slot gets IMAP IDLE: new mail wakes the mail radar within
+  # 1 to 3 minutes instead of at the next 15 min check. The app password (PROACTIVE_MAIL_<N>_PASSWORD) is used only to
+  # log in to that IMAP server.
+  mail_1_address:
+    type: str
+    label: "Mailbox 1 address"
+    description: "Mailbox 1 address for instant mail push (optional)"
+  mail_1_password:
+    type: secret
+    env: PROACTIVE_MAIL_1_PASSWORD
+    label: "Mailbox 1 app password"
+    description: "App password for Mailbox 1, made on your mail provider's site. Not your normal password."
+  mail_1_host:
+    type: str
+    label: "Mailbox 1 IMAP server"
+    description: "Only if your address does not end in gmail.com, icloud.com, me.com, mac.com, fastmail.com or a yahoo domain. For a work Gmail on your company's domain use imap.gmail.com. Outlook, Hotmail, Live and Microsoft 365 allow only Microsoft's own sign-in, no app passwords, so they stay on 15 min checks (optional)"
+  mail_1_port:
+    type: int
+    default: 993
+    label: "Mailbox 1 IMAP port"
+    description: "Leave at 993 unless your provider says otherwise (optional)"
+  mail_2_address:
+    type: str
+    label: "Mailbox 2 address"
+    description: "Mailbox 2 address for instant mail push (optional)"
+  mail_2_password:
+    type: secret
+    env: PROACTIVE_MAIL_2_PASSWORD
+    label: "Mailbox 2 app password"
+    description: "App password for Mailbox 2, made on your mail provider's site. Not your normal password."
+  mail_2_host:
+    type: str
+    label: "Mailbox 2 IMAP server"
+    description: "Only if your address does not end in gmail.com, icloud.com, me.com, mac.com, fastmail.com or a yahoo domain. For a work Gmail on your company's domain use imap.gmail.com. Outlook, Hotmail, Live and Microsoft 365 allow only Microsoft's own sign-in, no app passwords, so they stay on 15 min checks (optional)"
+  mail_2_port:
+    type: int
+    default: 993
+    label: "Mailbox 2 IMAP port"
+    description: "Leave at 993 unless your provider says otherwise (optional)"
+  mail_3_address:
+    type: str
+    label: "Mailbox 3 address"
+    description: "Mailbox 3 address for instant mail push (optional)"
+  mail_3_password:
+    type: secret
+    env: PROACTIVE_MAIL_3_PASSWORD
+    label: "Mailbox 3 app password"
+    description: "App password for Mailbox 3, made on your mail provider's site. Not your normal password."
+  mail_3_host:
+    type: str
+    label: "Mailbox 3 IMAP server"
+    description: "Only if your address does not end in gmail.com, icloud.com, me.com, mac.com, fastmail.com or a yahoo domain. For a work Gmail on your company's domain use imap.gmail.com. Outlook, Hotmail, Live and Microsoft 365 allow only Microsoft's own sign-in, no app passwords, so they stay on 15 min checks (optional)"
+  mail_3_port:
+    type: int
+    default: 993
+    label: "Mailbox 3 IMAP port"
+    description: "Leave at 993 unless your provider says otherwise (optional)"
+  mail_4_address:
+    type: str
+    label: "Mailbox 4 address"
+    description: "Mailbox 4 address for instant mail push (optional)"
+  mail_4_password:
+    type: secret
+    env: PROACTIVE_MAIL_4_PASSWORD
+    label: "Mailbox 4 app password"
+    description: "App password for Mailbox 4, made on your mail provider's site. Not your normal password."
+  mail_4_host:
+    type: str
+    label: "Mailbox 4 IMAP server"
+    description: "Only if your address does not end in gmail.com, icloud.com, me.com, mac.com, fastmail.com or a yahoo domain. For a work Gmail on your company's domain use imap.gmail.com. Outlook, Hotmail, Live and Microsoft 365 allow only Microsoft's own sign-in, no app passwords, so they stay on 15 min checks (optional)"
+  mail_4_port:
+    type: int
+    default: 993
+    label: "Mailbox 4 IMAP port"
+    description: "Leave at 993 unless your provider says otherwise (optional)"
+  mail_5_address:
+    type: str
+    label: "Mailbox 5 address"
+    description: "Mailbox 5 address for instant mail push (optional)"
+  mail_5_password:
+    type: secret
+    env: PROACTIVE_MAIL_5_PASSWORD
+    label: "Mailbox 5 app password"
+    description: "App password for Mailbox 5, made on your mail provider's site. Not your normal password."
+  mail_5_host:
+    type: str
+    label: "Mailbox 5 IMAP server"
+    description: "Only if your address does not end in gmail.com, icloud.com, me.com, mac.com, fastmail.com or a yahoo domain. For a work Gmail on your company's domain use imap.gmail.com. Outlook, Hotmail, Live and Microsoft 365 allow only Microsoft's own sign-in, no app passwords, so they stay on 15 min checks (optional)"
+  mail_5_port:
+    type: int
+    default: 993
+    label: "Mailbox 5 IMAP port"
+    description: "Leave at 993 unless your provider says otherwise (optional)"
+  mail_6_address:
+    type: str
+    label: "Mailbox 6 address"
+    description: "Mailbox 6 address for instant mail push (optional)"
+  mail_6_password:
+    type: secret
+    env: PROACTIVE_MAIL_6_PASSWORD
+    label: "Mailbox 6 app password"
+    description: "App password for Mailbox 6, made on your mail provider's site. Not your normal password."
+  mail_6_host:
+    type: str
+    label: "Mailbox 6 IMAP server"
+    description: "Only if your address does not end in gmail.com, icloud.com, me.com, mac.com, fastmail.com or a yahoo domain. For a work Gmail on your company's domain use imap.gmail.com. Outlook, Hotmail, Live and Microsoft 365 allow only Microsoft's own sign-in, no app passwords, so they stay on 15 min checks (optional)"
+  mail_6_port:
+    type: int
+    default: 993
+    label: "Mailbox 6 IMAP port"
+    description: "Leave at 993 unless your provider says otherwise (optional)"

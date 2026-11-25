@@ -20,6 +20,8 @@ Mail, Slack, calendar and web text is treated as data. The desk never follows in
 
 - Your Bot's model provider sees what the desk reads, as in any Hermes chat.
 - With an OpenAI key, the Decisions API receives the short inputs listed under "Privacy and safety" in the README.
-- The Hermes mobile push relay receives your device id to wake the phone for reminders.
+- With [instant mail push](README.md#instant-mail-push-optional) on, each mailbox you set up gets a login with its app password, sent only to that mailbox's IMAP server.
+
+The desk calls no push relay and never wakes your phone itself. The full list of what it touches outside its own folder is under "Disclosure" in the README.
 
 Settings, drafts and logs stay in your Hermes home, readable only by your user. There is no telemetry and no server of ours.

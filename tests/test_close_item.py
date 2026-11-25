@@ -28,7 +28,6 @@ class CloseBase(OfflineTestCase):
         self.freeze_datetime(ea_close)
         self.store = FakeStore()
         self.enterContext(patch.object(reminders, "bridge", return_value=(None, self.store)))
-        self.enterContext(patch.object(reminders, "wake"))
         self.write("promises.json", {"promise-a": {"status": "open", "what": "Send the deck to Sam"}})
         self.write("goals.json", {"goals": [{"key": "goal-b", "status": "open", "title": "Ship the beta"}]})
         self.write("reminder_outbox.json", {

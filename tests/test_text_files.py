@@ -179,19 +179,20 @@ class PromptsNeverInlineUntrustedText(unittest.TestCase):
 
 
 class ApiKeyScope(unittest.TestCase):
-    def test_never_reads_another_profiles_env(self):
+    def test_key_only_through_hermes_never_from_any_env_file(self):
         import ea_decide
         import phconf
         with tempfile.TemporaryDirectory() as tmp:
             own, other = Path(tmp) / "profiles" / "mine", Path(tmp) / "user"
             own.mkdir(parents=True)
             (other / ".hermes").mkdir(parents=True)
-            (other / ".hermes" / ".env").write_text("OPENAI_API_KEY=sk-default-profile\n")
+            (other / ".hermes" / ".env").write_text("OPENAI_API_KEY=sk-def...file\n")
+            (own / ".env").write_text("OPENAI_API_KEY=sk-own-file\n")
             with patch.dict(os.environ, {"OPENAI_API_KEY": "", "HERMES_HOME": str(own)}), \
                     patch.object(phconf, "hermes_home", return_value=own), patch.object(Path, "home", return_value=other):
-                self.assertEqual(ea_decide.api_key(), "")
-                (own / ".env").write_text("OPENAI_API_KEY=sk-own\n")
-                self.assertEqual(ea_decide.api_key(), "sk-own")
+                self.assertEqual(ea_decide.api_key(), "")      # neither .env file is parsed by the plugin
+                with patch.object(phconf, "secret", side_effect=lambda n: {"OPENAI_API_KEY": "sk-own"}.get(n, "")):
+                    self.assertEqual(ea_decide.api_key(), "sk-own")   # the profile's value, from Hermes
 
 
 if __name__ == "__main__":

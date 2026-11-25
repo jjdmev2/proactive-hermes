@@ -635,7 +635,6 @@ class ReminderTests(OfflineTestCase):
         self.freeze_datetime(reminders)
         self.store = FakeStore()
         self.enterContext(patch.object(reminders, "bridge", return_value=(None, self.store)))
-        self.wake = self.enterContext(patch.object(reminders, "wake"))
 
     def add(self, key="task"):
         return json.loads(self.cli(reminders, "add", "--key", key, "--title", "Do the task"))
@@ -665,7 +664,7 @@ class ReminderTests(OfflineTestCase):
         ])
         row = self.read_json(self.tmp / reminders.OUTBOX)["task"]
         self.assertEqual((row["attempts"], row["status"], row["request_id"]), (2, "queued", "request-2"))
-        self.assertEqual(self.wake.call_count, 2)
+        self.assertFalse(hasattr(reminders, "wake"))
 
     def test_pending_and_running_requests_are_never_resubmitted(self):
         request_id = self.add()["request_id"]
@@ -676,7 +675,7 @@ class ReminderTests(OfflineTestCase):
             self.assertEqual((self.tmp / reminders.OUTBOX).read_bytes(), before)
         self.assertEqual(self.store.lookups, [request_id] * 3)
         self.assertEqual(len(self.store.requests), 1)
-        self.wake.assert_called_once_with("fake-phone")
+        self.assertFalse(hasattr(reminders, "wake"))  # the desk never wakes the phone itself
 
     def test_expiry_at_max_attempts_fails_without_resubmitting(self):
         request_id = self.add()["request_id"]
@@ -688,7 +687,7 @@ class ReminderTests(OfflineTestCase):
         self.assertEqual(self.read_json(self.tmp / reminders.OUTBOX)["task"]["status"], "failed")
         self.assertEqual(self.read_json(self.tmp / reminders.LEDGER)["task"]["reminder_status"], "failed")
         self.assertEqual(len(self.store.requests), 1)
-        self.wake.assert_called_once_with("fake-phone")
+        self.assertFalse(hasattr(reminders, "wake"))  # the desk never wakes the phone itself
 
     def test_add_daily_cap_refuses_before_submitting(self):
         for i in range(2):
