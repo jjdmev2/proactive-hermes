@@ -24,7 +24,7 @@
 
 The messages worth getting from an assistant are about things you never set up an alert for: the client call that now overlaps your dentist, the invoice due today, the reply you promised yesterday and never sent.
 
-Proactive Hermes runs a small desk inside your own Hermes. Scheduled jobs read your mail, calendar, Slack and Linear, and watches keep an eye on the shops, marketplaces and event pages you choose. A gate decides what reaches you, and the rest goes to a private log. Most runs end with no message at all.
+Proactive Hermes runs a small desk inside your own Hermes. Scheduled jobs read your mail, calendar, Slack and Linear, and watches check the shops, marketplaces and event pages you pick. Most runs end with no message.
 
 When it does write, small things are already done (the calendar block is in, the reminder is set), and the rest is prepared so a "yes" finishes it:
 
@@ -69,13 +69,13 @@ These all happened on our own desk.
 
 | Situation | What Hermes did |
 | :--- | :--- |
-| **A train ticket home** | The booking mail arrived. Hermes blocked the trip on the calendar and sent the time to leave, based on your phone's location, with a 10 minute buffer (Hermes mobile app with location access required). |
+| **A train ticket home** | The booking mail arrived. Hermes blocked the trip on the calendar and sent the time to leave from your phone's location, with a 10 minute buffer. |
 | **A conference spot opened** | A watch was checking the registration page every few minutes. When a seat freed up it sent a message, queued a phone alarm (it rings through Focus once it reaches the phone), and had the registration ready. |
 | **A buyer made an offer** | A marketplace offer came in below the asking price. Hermes reported it with a suggested counter, and on "yes" answered the buyer in the app. |
 | **A promise to a partner** | The owner had promised a list of questions "over the weekend". A teammate posted the list in Slack on Monday. Hermes connected the two, drafted the email in the right thread, and sent it after "yes". |
 | **A meeting moved** | A client proposed a new time. Hermes checked the calendar, said it was free, and accepted on "yes". |
 | **A bill about to cut service** | An overdue notice said service stops in 3 days. Hermes set a reminder for the next morning with the amount and due date. |
-| **Looking ahead at a weekend** | Three days before, Hermes noticed two tournament registrations in different cities on the same weekend as a train already in the calendar, and that the shop's mail and the tournament site disagreed on the date of a third event. It asked which plan was real and suggested checking the date with the shop. |
+| **A double-booked weekend** | Three days before, Hermes saw two tournament registrations in different cities on the weekend of a train already in the calendar, and a third event with two different dates. It asked which plan was real. |
 | **A daily call** | After the team's daily, Hermes read the call notes in Slack, checked each point against Linear, and sent the owner what was done, what was not, and today's focus. Nothing was posted in Slack. |
 
 Things you can set up the same way: a new card set or sneaker drop ("alarm me when preorders open"), concert or Luma event registration ("tell me when it opens, with the form filled"), stock at your local hardware store or on Amazon, replies to offers on Vinted, eBay or Marketplace, and "suggest a reply to every mail from X".
@@ -87,7 +87,7 @@ Things you can set up the same way: a new card set or sneaker drop ("alarm me wh
 | Requirement | Why | How |
 | :--- | :--- | :--- |
 | **Hermes Agent 0.23.4 or newer** | The plugin uses Bot Mode delivery and the cron scheduler. | `hermes update` |
-| **Bot Mode** | Every desk message is a real reply in your Bot's **Bot Chat**, the one permanent conversation each Bot has. It arrives like a text from a person, with the app's normal notification and nothing extra. | Bot Mode is on by default in the Hermes desktop app. Open the **Bots** tab and click your Bot once so its Bot Chat exists. You read it in the desktop app or the Hermes mobile app. |
+| **Bot Mode** | Desk messages arrive as normal replies in your Bot's **Bot Chat**, with the app's normal notification. | Bot Mode is on by default in the Hermes desktop app. Open the **Bots** tab and click your Bot once so its Bot Chat exists. You read it in the desktop app or the Hermes mobile app. |
 | **The gateway running** | Messages are delivered through your profile's running gateway. If it is off, nothing reaches you. | Keep the Hermes desktop app open, or run `hermes gateway start`. |
 | **The right profile** | The desk talks in the Bot Chat of the profile (Bot) you install it into. | Use your main assistant Bot. If that is not your default profile, add `-p <profile name>` to every command below, for example `hermes -p assistant plugins install ...`. `hermes profile list` shows the names. |
 | **Hermes mobile app** (recommended) | Desk messages buzz your phone like a text; reminders, alarms and leave times need it. Tested on iPhone. | See [Give Hermes access](#give-hermes-access). The plugin works without it, and `doctor` tells you it is missing. |
@@ -103,12 +103,12 @@ hermes proactive doctor
 
 ### Give Hermes access
 
-The desk only sees what you connect. Everything here is optional except the gateway and Bot Mode above, but connect at least one mailbox or calendar: without one, only watches have anything to read.
+The desk only sees what you connect. All of it is optional, but connect at least one mailbox or calendar.
 
 | Access | What it unlocks | How |
 | :--- | :--- | :--- |
 | **Hermes mobile app** | Reminders and alarms on your phone, leave times based on where you are, your phone calendar and contacts. | Install the Hermes app, sign in to the same Hermes, and share **Reminders, Alarms, Location and Calendar** in its settings (Contacts too, if you want it to find people's numbers). |
-| **OpenAI API key** | The [decision model](#the-decision-model-highly-recommended): drops noise before any agent runs and spots your promises. About 3 cents per 1,000 emails. | Open **Settings → Plugins → Proactive Hermes** and fill **OpenAI key for the decision filter** (or run `hermes plugins config proactive-hermes`). It can be the same key as your `OPENAI_API_KEY`. The plugin needs its own copy because Hermes hides provider keys from scheduled jobs. Put a few dollars of credit on [platform.openai.com](https://platform.openai.com). |
+| **OpenAI API key** | The [decision model](#the-decision-model-highly-recommended): drops noise before any agent runs and spots your promises. About 3 cents per 1,000 emails. | Fill **OpenAI key for the decision filter** in **Settings → Plugins → Proactive Hermes**. It can be your usual key ([why it goes here](#the-decision-model-highly-recommended)). Add a few dollars of credit on [platform.openai.com](https://platform.openai.com). |
 | **Mail and calendar** | Mail radar, promise tracker, look-ahead, trips, calendar blocks and conflicts. Connect every mailbox you use, work and personal: tickets and bookings often land in a personal one. | The `google-workspace` skill for Gmail and Google Calendar; [himalaya](https://github.com/pimalaya/himalaya) for any other mailbox (IMAP). |
 | **Instant mail push** (optional) | New mail wakes the mail radar within 1 to 3 minutes instead of at the next 15 minute check. | An app password per mailbox, pasted into Hermes's settings. See [Instant mail push](#instant-mail-push-optional). |
 | **Slack and Linear** | Asks waiting on you, the work recap, promises made in Slack. | Hermes connectors (Nous Portal). |
@@ -129,18 +129,16 @@ First you pick a starting point:
 
 | Option | What you get |
 | :--- | :--- |
-| **1. Juan's setup** | The setup Juan (who built this for his own needs as a founder while building HeyRito.AI) runs every day: morning brief 08:00, mail radar every 15 minutes from 07:00 to 23:00, Slack sweep hourly on workdays, promise tracker 3 times a day, work recap after the daily call, evening close-out 21:30, weekly review Friday 15:00, quiet hours 23:00 to 07:00, drafts before questions. Built for the decision model. You only fill in your own details. |
+| **1. Juan's setup** | What Juan runs every day: morning brief 08:00, mail radar every 15 minutes from 07:00 to 23:00, Slack sweep hourly on workdays, promise tracker 3 times a day, work recap after the daily call, evening close-out 21:30, weekly review Friday 15:00, quiet hours 23:00 to 07:00, drafts before questions. Built for the decision model. You only fill in your own details. |
 | **2. My own** | Start blank. Hermes asks about your day and builds the desk around it. |
 
-Hermes does not ask what it already knows. It starts with one message listing what it found (your name from its memory, your timezone, connected mail, calendar, Slack, Linear and the OpenAI key) and asks if that is right. Then it asks only what is missing, one question at a time, each with a short reason: quiet hours, holiday countries, which channels to watch, when your team's daily call happens.
+Hermes starts from what it already knows (your name, timezone, connected mail, calendar, Slack, Linear, OpenAI key) and asks only what is missing, one question at a time: quiet hours, holiday countries, channels to watch, when your team's daily is. It also asks what it may do without asking you (see [approval levels](#approval-levels)) and suggests two or three first watches.
 
-Setup also asks what Hermes may do without asking you (see [approval levels](#approval-levels)), whether you use the Hermes mobile app, and offers two or three first watches from your life.
-
-You see every job and its times before anything is created. At the end Hermes posts a test message and asks if it reached your phone. Run setup again any time; it updates the same jobs.
+You see every job and its times before anything is created. At the end it sends a test message. Run setup again any time; it updates the same jobs.
 
 ### Instant mail push (optional)
 
-The mail radar checks your mail every 15 minutes. With push, new mail wakes it within 1 to 3 minutes. iCloud is usually under a minute. Push needs one app password per mailbox: a separate password for one app, which you can revoke any time without changing your normal password.
+The mail radar checks your mail every 15 minutes. With push, new mail wakes it within 1 to 3 minutes. iCloud is usually under a minute. Push needs an app password per mailbox. You can revoke it any time.
 
 1. **Make an app password.**
    - Gmail: open [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). 2-Step Verification must be on. Work or school accounts, Advanced Protection and security key only accounts may not offer app passwords.
@@ -149,11 +147,11 @@ The mail radar checks your mail every 15 minutes. With push, new mail wakes it w
    - Fastmail, Yahoo and others: your provider's app password page. If your provider has none, that mailbox stays on the 15 minute checks.
 2. **Paste it into Hermes, not into a chat.** Open **Settings → Plugins → Proactive Hermes** in the desktop app, or run `hermes plugins config proactive-hermes`. Fill **Mailbox 1 address** and **Mailbox 1 app password**. Use Mailbox 2 to 6 for more mailboxes. If your address does not end in gmail.com, icloud.com, me.com, mac.com, fastmail.com or a yahoo domain, also fill **Mailbox 1 IMAP server**. For a work Gmail on your company's domain that is imap.gmail.com. For anything else, take it from your provider's help page. The port is 993 unless your provider says otherwise.
 3. **Restart Hermes** so push starts: `hermes gateway restart`, or quit and reopen the desktop app. Run `/proactive setup` first if you have not yet. Restart again every time you add, change or replace a mailbox or its app password. Hermes reads them only when it starts.
-4. **Check it.** Wait a minute, then run `hermes proactive doctor`. Under `mail_push` there is one row per mailbox, such as `Mailbox 1 (gmail.com)`. It shows `instant push`, or `15 min checks` with the reason (no app password, unknown mail server, login refused, Microsoft allows only its own sign-in) and the next step. You may also see a row named `Gmail API` or `himalaya account` with `15 min checks`. That is the reading connection for the same mailbox. It is normal.
+4. **Check it.** Run `hermes proactive doctor`. Under `mail_push`, each mailbox (`Mailbox 1 (gmail.com)`) shows `instant push`, or `15 min checks` with the reason and the fix. A `Gmail API` or `himalaya account` row on `15 min checks` is the normal reading connection.
 
-**If you skip it,** nothing breaks: every mailbox is checked on the radar's schedule, every 15 minutes in Juan's setup. Push only makes the radar run sooner. The radar still reads mail through what you connected in [Give Hermes access](#give-hermes-access), so connect the mailbox there too. During quiet hours push is paused, and night mail is read at the first check in the morning. With `plugins.isolation: host`, push stays off. If you change your normal password, Google and Apple cancel your app passwords: make a new one and paste it again.
+**If you skip it,** mail is checked every 15 minutes. Push only wakes the radar sooner, so the mailbox still has to be connected in [Give Hermes access](#give-hermes-access). Push pauses in quiet hours and stays off with `plugins.isolation: host`. Changing your normal password cancels Google and Apple app passwords; make a new one.
 
-**Privacy.** Hermes stores the app password with your profile's other keys, never in the plugin's files. The plugin gets it from Hermes and uses it only to log in to that mailbox's IMAP server. It is never sent anywhere else, never written to a log and never asked for in chat. Push reads no mail: it only notices that new mail arrived. If you paste an app password into a chat by mistake, revoke it and make a new one.
+**Privacy.** Hermes stores the app password, not the plugin. It is used only to log in to that mailbox, never logged and never asked for in chat. Push reads no mail; it only notices new mail. Pasted one into a chat by mistake? Revoke it.
 
 ### Approval levels
 
@@ -205,9 +203,9 @@ To uninstall completely: `hermes proactive remove`, then `hermes plugins remove 
      6. small things done, the rest after your yes
 ```
 
-1. **Wake up.** Each job runs on its schedule. A small script runs first and checks whether anything changed since last time (new mail, call notes posted). Nothing new means no agent run. With [instant mail push](#instant-mail-push-optional) turned on for a mailbox, new mail also wakes the mail radar as soon as your mail server announces it (usually within 1 to 3 minutes). Hermes keeps an IMAP IDLE connection open to that mailbox, inside its own gateway, so it needs no public URL. It needs an app password you add in Hermes's settings. Every other mailbox stays on the 15 minute schedule; `doctor` shows which mailboxes have push. Polling on the schedule stays on as the safety net.
+1. **Wake up.** Each job runs on its schedule. A small script checks first whether anything changed (new mail, call notes posted). Nothing new, no agent run. Mailboxes with [instant mail push](#instant-mail-push-optional) also wake the radar when new mail arrives, through an IMAP IDLE connection inside the Hermes gateway.
 2. **Filter.** With an OpenAI key, the decision model scores each new mail from its sender, subject and the start of the body. Clear noise is dropped and logged, so the agent never spends time on it.
-3. **Read and pick.** The desk agent reads what is left and writes candidate items: a decision you must make, an action you must take, or a digest line. Anything else is left out.
+3. **Read and pick.** The desk agent reads what is left and writes candidate items: a decision you must make, an action you must take, or a digest line.
 4. **Resolve.** If an item needs you to send, reply, intro, book or decide, the agent searches mail, Slack, past chats and its own records first. It stores a draft with a source for every fact.
 5. **Gate.** The gate ranks the items, removes anything you heard recently, caps the message at 3 items (5 in a brief) and holds non-urgent items during quiet hours. It sends one short numbered message as a normal chat reply.
 6. **Act.** What your approval levels allow happens right away (a block, a reminder, an alarm, a leave time) and the message says so. Everything else waits for you: reply "1" and Hermes shows the draft or action with its sources and asks "Send as is?". A yes does it.
@@ -255,7 +253,7 @@ The cut-off is 0.10, so the filter only removes mail it is close to certain abou
 
 **After the filter, the gate ranks items in this order:** urgent first, then priority (p0, p1, p2), then items where someone is waiting on you, then the nearest deadline, then decisions before actions, then the oldest.
 
-**Where the key goes.** Fill **OpenAI key for the decision filter** in **Settings → Plugins → Proactive Hermes**, or run `hermes plugins config proactive-hermes`. Hermes stores it as `PROACTIVE_OPENAI_API_KEY`. It can be the same key as `OPENAI_API_KEY`, but it has to be set here: Hermes hides `OPENAI_API_KEY` from scheduled jobs, so a key set only there never reaches the mail radar. Run `hermes proactive doctor` and look at `decisions`. `ok: true` with "PROACTIVE_OPENAI_API_KEY found" means it works. "only OPENAI_API_KEY found" or "no PROACTIVE_OPENAI_API_KEY" means you still need to fill the field. Most people can stop here. Only if several of your profiles share one gateway (`hermes gateway list` shows them: profiles with the same PID share one), also add `PROACTIVE_OPENAI_API_KEY` to the `terminal.env_passthrough` list in this profile's `config.yaml`. `hermes config edit` opens it.
+**Where the key goes.** Fill **OpenAI key for the decision filter** in **Settings → Plugins → Proactive Hermes** (or `hermes plugins config proactive-hermes`). It can be the same key as `OPENAI_API_KEY`, but it has to be set here, because Hermes hides `OPENAI_API_KEY` from scheduled jobs. `hermes proactive doctor` shows `ok: true` under `decisions` when scheduled runs can see it. If several profiles share one gateway (same PID in `hermes gateway list`), also add `PROACTIVE_OPENAI_API_KEY` to `terminal.env_passthrough` in this profile's `config.yaml`.
 
 **Without a key** the desk still works. The agent reads every mail that passes a simple sender and subject filter (newsletters, no-reply senders, "% off") and makes the yes or no calls itself, which is slower and costs more model time. If OpenAI is unreachable, nothing is dropped.
 
@@ -263,18 +261,18 @@ The cut-off is 0.10, so the filter only removes mail it is close to certain abou
 
 | Feature | What you get |
 | :--- | :--- |
-| **One chat, real messages** | Short numbered replies in your Bot Chat, action first, with the app's normal notification on your phone. No job cards and no second notification on top. |
-| **Quiet hours and holidays** | Nothing non-urgent at night. Public holidays in the countries you pick are skipped. Only urgent items come through at night. In Juan's setup the mail radar and the look-ahead rest from 23:00 to 07:00, so at night that means your own watches. Night mail is read in the morning. |
+| **One chat, real messages** | Short numbered replies in your Bot Chat, action first, with the app's normal notification. |
+| **Quiet hours and holidays** | Non-urgent items wait until morning, and holidays in the countries you pick are skipped. In Juan's setup the mail radar and look-ahead rest from 23:00 to 07:00. |
 | **Drafts before questions** | For anything you must send, reply to, book or decide, it searches first and brings a draft with sources. |
 | **Promise tracker** | Records each "I'll send it tomorrow" from your mail, Slack and chat with your exact words, and closes it only on proof. |
 | **Work recap after the daily** | Reads your team's call notes in Slack and checks each point against Linear and Slack: done, not done, Linear and Slack disagreeing, and today's focus. An evening wrap-up covers what shipped and what slipped. |
 | **Mail radar** | Wakes when new mail arrives (and every 15 minutes as a safety net) and surfaces only what you must answer, pay or decide. |
 | **Briefs and close-out** | Morning brief, an evening close-out you answer by number ("1 yes, 2 tomorrow"), and a weekly review. |
-| **Meeting prep** | About an hour before each meeting, one short message: who is in it, your last thread with them, what you owe, what is open, a goal and an ask. External meetings always get one. Your team daily gets what you owe, what is blocked and what to raise. Internal one-to-ones only when something is open. The evening close-out flags tomorrow's meetings that need a doc or numbers tonight. |
-| **Look-ahead** | Checks your upcoming plans ahead of time. It reads your calendar and the booking, ticket and registration mails in every mailbox you connect, work and personal; a ticket mail means the trip is yours, a marketing mail is ignored. The bigger the stakes, the earlier the first look: flights and longer trips from 30 days out, trains and in-town events from 7 days, ticket sales and bills ahead of their date. More checks as the day gets closer (2 days, the evening before, that morning, leave time). Each check speaks only for a gap, a change or a decision: "If the 09:50 train is yours, it lands 16 min before the start. The 09:09 lands 10:14, €15. Walking or Uber?" Weekly routines get one quiet look; races you watch on TV are skipped. |
+| **Meeting prep** | About an hour before each meeting: who is in it, your last thread, what you owe, what is open, a goal and an ask. Always for external meetings, internal ones only when something is open. The evening close-out flags meetings that need prep tonight. |
+| **Look-ahead** | Checks upcoming plans from your calendar and the booking, ticket and registration mails in all your mailboxes. Bigger stakes, earlier first look: flights 30 days out, trains and local events 7 days, then more checks as the day gets closer. It speaks only for a gap, a change or a decision: "If the 09:50 train is yours, it lands 16 min before the start. The 09:09 lands 10:14, €15. Walking or Uber?" |
 | **Trips and leave times** | A ticket or booking in your mail becomes a calendar block and a "leave now" reminder based on where your phone is, with a buffer. |
 | **Watches** | Your own proactive tasks: marketplaces, shops, drops, event registrations, anything with a page. Tell, remind, alarm, draft or act. |
-| **Phone reminders and alarms** | Reminders for deadlines and promises, alarms that ring through Focus for the few things that cannot wait. Reminders are retried until the phone confirms. Both land when the Hermes app refreshes, which can be late, so time critical items also get a Bot Chat message and a calendar alert (see [Your phone](#your-phone)). |
+| **Phone reminders and alarms** | Reminders for deadlines and promises, alarms for the few things that cannot wait. They land when the Hermes app refreshes, so time critical items also get a calendar alert (see [Your phone](#your-phone)). |
 | **Private calendar blocks** | Focus blocks on your own calendar for key tasks, a few per day at most, never touching events it did not create. |
 | **Health checks** | A watchdog checks every job, the message outbox and failed deliveries, and only tells you when something needs you. |
 
@@ -290,7 +288,7 @@ To add a source like this, give Hermes one way to read it (a CLI, an API or a sc
 
 Every desk message lands in your Bot Chat with the app's normal notification. That is the main signal.
 
-Phone reminders and alarms are a bonus. The desk does not wake your phone. It hands each reminder or alarm to the Hermes mobile app, and the app picks it up the next time it refreshes or you open it. That can take minutes or longer. An alarm that reaches the phone after its time does not ring.
+Phone reminders and alarms are a bonus. The Hermes mobile app picks them up when it refreshes or you open it, which can take minutes. An alarm that arrives after its time does not ring.
 
 So anything time critical (an alarm, or a reminder that is high priority or due within 12 hours) also gets a calendar alert, which your phone fires by itself. This needs three things: a Google calendar connected to Hermes, private calendar blocks allowed without asking in setup, and that calendar added to your phone's Calendar app with notifications on.
 
@@ -318,15 +316,15 @@ Works with sites that book on the web: Uber (m.uber.com), most rail operators, W
 - **Your Bot's model sees what the desk reads.** Mail, Slack and calendar text go to the model provider of your Bot's profile, as in any Hermes chat.
 - **What goes to OpenAI** (only with a key, only to the Decisions API): for mail, the sender, subject and first 600 characters of the body; for Slack, the message being judged; for promises and the work recap, the message or call item and the Linear title it is matched against; for your replies, the reply and the numbered list it answers; and the text of anything checked for prompt injection. Nothing else, and no files. OpenAI offers zero data retention for eligible accounts.
 - **Keys come only through Hermes.** The plugin never opens `.env` files, Hermes's sign-in files, another tool's config or login, or a keychain. Your OpenAI key and mail push app passwords are read through Hermes, for your profile only.
-- **Mail push app passwords** (only if you turn [push](#instant-mail-push-optional) on) are used only to log in to that mailbox's IMAP server, to notice new mail. They are never sent anywhere else, never logged and never in chat. The push log names a mailbox by its slot number, never by its address.
-- **Phone reminders and alarms** go through the Hermes mobile app's bridge database (`plugin-data/hermes-mobile-device-access/bridge.db` in your Hermes home). Hermes has no other way for a scheduled job to create them, so the plugin uses that plugin's own code to add, complete and check its requests, all in one function (`bridge()` in `runtime/ea_reminders.py`). It also reads when your phone last synced and its last shared location there, for health checks and leave times. The desk never wakes your phone itself and calls no push relay.
+- **Mail push app passwords** log in only to that mailbox's IMAP server. The push log names mailboxes by slot number, never by address.
+- **Phone reminders and alarms** go through the Hermes mobile app's bridge database (`plugin-data/hermes-mobile-device-access/bridge.db`), the only route a scheduled job has. All access sits in one function, `bridge()` in `runtime/ea_reminders.py`. It also reads your phone's last sync time and last shared location there, for health checks and leave times.
 - **Work and personal stay apart.** A work draft never uses facts from personal sources, and every fact carries a source.
 - **Bounded.** Searches have call and time limits. Reminders, alarms and calendar blocks have daily caps, and each action is done once even if a job retries.
 - **Text from mail, Slack or the web is treated as data.** Instructions inside it are never followed, and it never goes on a command line: the desk writes it to a file and passes the file.
 
 ### Disclosure
 
-What the plugin does beyond its own folder, in one list:
+Everything the plugin touches outside its own folder:
 
 - **Background IMAP connections** to the mailboxes you set up for [instant mail push](#instant-mail-push-optional), and only those, from inside the Hermes gateway.
 - **OpenAI Decisions API calls**, only if you add a key (see "What goes to OpenAI" above).
@@ -357,11 +355,7 @@ Found a security problem? See [SECURITY.md](SECURITY.md).
 
 ## Built by HeyRito.AI
 
-Proactive Hermes started as the desk behind our own work at **[HeyRito.AI](https://heyrito.ai)**, and we still use it every day. It follows the rules we build everything on: it stays quiet unless something needs you, acts only within what you approved, and every claim points back to its source.
-
-Those are the rules Rito enforces for companies. Rito is the security and governance layer for AI at work. Teams use AI assistants and agents on real work, and Rito controls what each one can see and do: access scoped to each identity, approval before actions, an audit trail, and policies for every model and tool.
-
-If your team is putting AI to work and needs it safe and governed, talk to us at **[heyrito.ai](https://heyrito.ai)**.
+Proactive Hermes is the desk we use every day at **[HeyRito.AI](https://heyrito.ai)**. We build Rito, the security and governance layer for AI at work: access scoped to each identity, approval before actions, an audit trail, and policies for every model and tool. Talk to us at **[heyrito.ai](https://heyrito.ai)**.
 
 ---
 
