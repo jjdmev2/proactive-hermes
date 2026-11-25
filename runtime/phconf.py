@@ -34,6 +34,11 @@ DEFAULTS: dict = {
         "never": ["payments", "share_credentials", "delete_data"],
     },
     "mobile": {"enabled": False},
+    # Look-ahead (ea_lookahead.py). Empty strings fall back: calendar_account -> calendar.id, mail_account ->
+    # owner.work_emails[0]. home_places = regex words for where the owner lives; watch_words = title words of
+    # things watched remotely (see ea_lookahead.watched_remotely); senders/keywords = {kind: [extra words]}.
+    "lookahead": {"calendar_account": "", "mail_account": "", "home_places": [], "watch_words": [],
+                  "airport_codes": [], "senders": {}, "keywords": {}, "mail_query": ""},
     "reminders": {"enabled": False, "per_day": 6},
     "watches": [],
     "mail": {"gmail_api": False, "himalaya_accounts": [], "noise_senders": [], "noise_subjects": []},
@@ -48,7 +53,7 @@ DEFAULTS: dict = {
     "features": {
         "morning_brief": True, "evening_brief": True, "weekly_review": True, "mail_radar": True,
         "slack_sweep": False, "promises": True, "resolve_first": True, "work_recap": False,
-        "health": True,
+        "health": True, "lookahead": True,
     },
     "schedule": {
         "morning_brief": "0 8 * * 1-5",
@@ -60,6 +65,7 @@ DEFAULTS: dict = {
         "work_recap_after_daily": "*/5 9-11 * * 1-5",
         "work_recap_evening": "0 21 * * 1-5",
         "health": "7 * * * *",
+        "lookahead": "*/30 7-22 * * *",
         "tick": "*/10 7-23 * * *",
     },
 }

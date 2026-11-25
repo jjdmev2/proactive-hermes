@@ -44,6 +44,7 @@ These all happened on our own desk.
 | **A promise to a partner** | The owner had promised a list of questions "over the weekend". A teammate posted the list in Slack on Monday. Hermes connected the two, drafted the email in the right thread, and sent it after "yes". |
 | **A meeting moved** | A client proposed a new time. Hermes checked the calendar, said it was free, and accepted on "yes". |
 | **A bill about to cut service** | An overdue notice said service stops in 3 days. Hermes set a reminder for the next morning with the amount and due date. |
+| **Looking ahead at a weekend** | Three days before, Hermes noticed two tournament registrations in different cities on the same weekend as a train already in the calendar, and that the shop's mail and the tournament site disagreed on the date of a third event. It asked which plan was real and suggested checking the date with the shop. |
 | **A daily call** | After the team's daily, Hermes read the call notes in Slack, checked each point against Linear, and sent the owner what was done, what was not, and today's focus. Nothing was posted in Slack. |
 
 Things you can set up the same way: a new card set or sneaker drop ("alarm me when preorders open"), concert or Luma event registration ("tell me the minute it opens, with the form filled"), stock at your local hardware store or on Amazon, replies to offers on Vinted, eBay or Marketplace, and "suggest a reply to every mail from X".
@@ -79,6 +80,7 @@ The desk only sees what you connect. Everything here is optional except the gate
 | **OpenAI API key** (highly recommended) | The [decision model](#the-decision-model-highly-recommended): drops noise before any agent runs and spots your promises. About 3 cents per 1,000 emails. | Add `OPENAI_API_KEY=...` to your Hermes `.env` and put a few dollars of credit on [platform.openai.com](https://platform.openai.com). |
 | **Mail and calendar** | Mail radar, promise tracker, trips, calendar blocks and conflicts. | The `google-workspace` skill for Gmail and Google Calendar; [himalaya](https://github.com/pimalaya/himalaya) for any other mailbox (IMAP). |
 | **Slack and Linear** | Asks waiting on you, the work recap, promises made in Slack. | Hermes connectors (Nous Portal). |
+| **Rides, trains and food** (optional extra) | Bookings from the look-ahead: "Uber to the station at 08:40?" on your yes. | Sign in once to Uber's site (m.uber.com), your rail operator and your food delivery site in Hermes's browser. See [Bookings](#bookings-optional-extra). |
 | **Your apps and sites** | Watches on marketplaces (Vinted, eBay), shops (Amazon, your local hardware store), event pages (Luma, Eventbrite, conferences), ticket drops. | Sign in once in Hermes's browser (the browser tool; with `local` it uses a copy of your own Chrome profile). Never paste passwords into chat. |
 | **Public holidays** | Skip holidays in the countries you pick. | `pip install holidays` |
 
@@ -217,11 +219,27 @@ The 0.10 cut-off is low on purpose: the filter only removes mail it is close to 
 | **Work recap after the daily** | Reads your team's call notes in Slack and checks each point against Linear and Slack: done, not done, Linear and Slack disagreeing, and today's focus. An evening wrap-up covers what shipped and what slipped. |
 | **Mail radar** | Checks new mail every 15 minutes and surfaces only what you must answer, pay or decide. |
 | **Briefs and close-out** | Morning brief, an evening close-out you answer by number ("1 yes, 2 tomorrow"), and a weekly review. |
+| **Look-ahead** | Checks upcoming plans before you feel the need, like a good assistant. The bigger the stakes, the earlier the first look: flights and longer trips from 30 days out, trains and in-town events from 7 days, ticket sales and bills ahead of their date. More checks as the day gets closer (2 days, the evening before, that morning, leave time). Each check speaks only for a gap, a change or a decision: "If the 09:50 train is yours, it lands 16 min before the start. The 09:09 lands 10:14, €15. Walking or Uber?" Weekly routines get one quiet look; races you watch on TV are skipped. |
 | **Trips and leave times** | A ticket or booking in your mail becomes a calendar block and a "leave now" reminder based on where your phone is, with a buffer. |
 | **Watches** | Your own proactive tasks: marketplaces, shops, drops, event registrations, anything with a page. Tell, remind, alarm, draft or act. |
 | **Phone reminders and alarms** | Reminders for deadlines and promises, alarms that ring through Focus for the few things that cannot wait. Retried until the phone confirms. |
 | **Private calendar blocks** | Focus blocks on your own calendar for key tasks, a few per day at most, never touching events it did not create. |
 | **Health checks** | A watchdog checks every job, the message outbox and failed deliveries, and only tells you when something needs you. |
+
+## Bookings (optional extra)
+
+When the look-ahead asks "walking or Uber?" and you answer "Uber", Hermes books it through the website, never on its own:
+
+1. It fills in the ride, train or order in its logged-in browser and stops on the price screen.
+2. You get the quote with a screenshot: product, price, pickup time and place, payment method.
+3. It books only after your "yes" to that exact quote. One yes is one booking. If the price rises more than 10% or the time moves, it asks again.
+4. Payment approvals (bank app, Face ID) stay on your phone, on purpose.
+
+Works with sites that book on the web: Uber (m.uber.com), most rail operators, Wolt and similar. App-only services (for example Bolt rides) are out of scope; Hermes says so instead of guessing.
+
+**Connect once:** Hermes opens the site in its browser and you sign in yourself, codes included. Hermes never sees or stores your password.
+
+**Risk, plainly:** Uber's terms forbid automated access. Every ride here has a human approving it and the volume stays human, but the risk to your account is yours. To skip it, just never sign in to those sites; without a login Hermes can only quote, never book.
 
 ## Privacy and safety
 

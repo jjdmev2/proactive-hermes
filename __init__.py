@@ -1,9 +1,10 @@
 """Proactive Hermes: a quiet, proactive executive-assistant desk for Hermes Agent.
 
 Registers the `hermes proactive` CLI (setup, status, remove, questions), the `/proactive` slash command,
-and two bundled skills: `proactive-setup` (the guided interview) and `proactive-desk` (how to work
-the desk in chat: drafts, close-outs, promises). The scheduled jobs and runtime scripts are installed by
-`hermes proactive setup`; this module only registers.
+and three bundled skills: `proactive-setup` (the guided interview), `proactive-desk` (how to work
+the desk in chat: drafts, close-outs, promises) and `browser-bookings` (approval-gated rides, tickets,
+food). The scheduled jobs and runtime scripts are installed by `hermes proactive setup`; this module
+only registers.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ HERE = Path(__file__).resolve().parent
 SKILLS = {
     "proactive-setup": "Use when setting up Proactive Hermes. Interview, then apply.",
     "proactive-desk": "Use when answering Proactive Hermes desk messages.",
+    "browser-bookings": "Use when booking a ride, ticket or food via the browser.",
 }
 
 

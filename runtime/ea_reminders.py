@@ -5,11 +5,14 @@ The bridge expires pending requests after ~15 minutes. Each retry uses a new
 bridge key only after the previous request is explicitly expired. Pending,
 running, or unreadable requests are not replaced. Confirmations go in the desk
 ledger; queueing alone does not mean the phone created the reminder or alarm.
+A reminder the desk created (it has the id) is ticked off on the phone once its item is
+finished in the promise, goal or action records; the same expiry rules apply to that request.
 
   ea_reminders.py add --key KEY --title T [--due ISO | --due-date D] [--notes N] [--priority P]
   ea_reminders.py alarm --key KEY --at ISO --label TEXT  # urgent only, requires automatic alarm authority
   ea_reminders.py adopt --key KEY --request-id RID       # track a reminder made via the tool
-  ea_reminders.py tick                                  # check / re-queue (silent)
+  ea_reminders.py close --key KEY [--evidence E]        # item is done: tick the phone reminder off
+  ea_reminders.py tick                                  # check / re-queue / close finished items (silent)
   ea_reminders.py status
 """
 from __future__ import annotations
@@ -32,8 +35,13 @@ OUTBOX = "reminder_outbox.json"
 LEDGER = "actions.json"
 RUN_LOG = "run_log.jsonl"
 PLUGIN = PROFILE / "plugins" / "hermes-mobile-device-access"
+PROMISES = "promises.json"
+GOALS = "goals.json"
 MAX_ATTEMPTS = 40          # ~10h of 15-minute retries while the phone sleeps
 TTL = 900
+DONE = {"done", "closed", "dropped", "resolved", "cancelled", "complete", "completed"}
+# Outbox keys that track the same thing as a promise or goal under another name: {outbox_key: record_key}.
+ALIASES: dict[str, str] = {}
 
 
 def now_iso() -> str:
@@ -148,6 +156,140 @@ def submit(store, box: dict, item: dict) -> None:
     wake(req["device_id"])
 
 
+def read_records(name: str, default):
+    """Tolerant read of a record file this module never writes: unreadable counts as empty."""
+    try:
+        return load(name, default)
+    except (OSError, ValueError):
+        return default
+
+
+def goal_rows(data) -> list:
+    """goals.json is {"goals": [...]} (or a bare list)."""
+    rows = data.get("goals", []) if isinstance(data, dict) else data
+    return rows if isinstance(rows, list) else []
+
+
+def finished_keys() -> dict[str, str]:
+    """Keys whose item is finished somewhere in the desk's records, with the evidence."""
+    out: dict[str, str] = {}
+    promises, ledger = read_records(PROMISES, {}), read_records(LEDGER, {})
+    for k, v in (promises if isinstance(promises, dict) else {}).items():
+        if isinstance(v, dict) and str(v.get("status", "")).lower() in DONE:
+            out[k] = str(v.get("evidence") or v.get("closed_evidence") or "promise closed")[:200]
+    for g in goal_rows(read_records(GOALS, {})):
+        if isinstance(g, dict) and g.get("key") and str(g.get("status", "")).lower() in DONE:
+            out[g["key"]] = str(g.get("evidence") or "goal closed")[:200]
+    for k, v in (ledger if isinstance(ledger, dict) else {}).items():
+        if isinstance(v, dict) and (str(v.get("status", "")).lower() in DONE or v.get("closed")):
+            out[k] = str(v.get("evidence") or v.get("closed") or "action closed")[:200]
+    return out
+
+
+def close_allowed(item: dict) -> bool:
+    """Ticking a reminder off is still a phone action: honour 'never' and the authority it was queued under."""
+    return phconf.allowed("reminders") != "never" and all(map(auto_allowed, item.get("required_authority", ())))
+
+
+def _finished_evidence(key: str, done: dict[str, str]) -> str | None:
+    return done.get(key) or done.get(ALIASES.get(key, ""))
+
+
+def closable(box: dict) -> bool:
+    done = finished_keys()
+    return any(i.get("status") == "landed" and i.get("reminder_id") and _finished_evidence(k, done)
+               and close_allowed(i) for k, i in box.items())
+
+
+def request_close(store, item: dict, evidence: str) -> dict:
+    attempt = int(item.get("close_attempts", 0)) + 1
+    # The bridge limits keys to 128 characters; hash the item key so the attempt is never truncated away.
+    digest = hashlib.sha256(item["key"].encode()).hexdigest()
+    req = store.request("reminders.complete", {"id": item["reminder_id"]},
+                        idempotency_key=f"proactive-hermes:done:{digest}:{attempt}", ttl=TTL)
+    item.update(status="closing", close_attempts=attempt, close_request_id=req["id"],
+                close_evidence=evidence[:200], close_try=now_iso())
+    wake(req["device_id"])
+    return item
+
+
+def close_finished(store, box: dict) -> bool:
+    """Tick off phone reminders whose item is finished. Only reminders the desk created (it has their id)."""
+    done = finished_keys()
+    changed = False
+    for key, item in box.items():
+        if item.get("status") != "landed" or not item.get("reminder_id") or not close_allowed(item):
+            continue
+        evidence = _finished_evidence(key, done)
+        if evidence:
+            try:
+                request_close(store, item, evidence)
+            except Exception as exc:  # leave the item landed; the next tick tries again
+                log({"close_error": key, "error": f"{type(exc).__name__}: {exc}"[:200]})
+                continue
+            save(OUTBOX, box)  # the request exists now; never lose track of it
+            log({"closing": key, "evidence": evidence})
+            changed = True
+    return changed
+
+
+def check_closing(store, box: dict) -> bool:
+    changed = False
+    for key, item in box.items():
+        if item.get("status") != "closing":
+            continue
+        if item.get("close_request_id"):
+            try:
+                res = store.result(item["close_request_id"])
+            except Exception:
+                continue  # A failed lookup is not evidence the phone didn't act.
+        else:
+            res = {"status": "expired"}
+        status = res.get("status")
+        if status == "succeeded":
+            item.update(status="done", done=now_iso())
+            ledger_set(key, {"reminder_status": "done"})
+            log({"closed": key})
+        elif status in {"pending", "running"}:
+            continue
+        elif status == "expired" and int(item.get("close_attempts", 0)) < MAX_ATTEMPTS:
+            if not close_allowed(item):
+                continue
+            try:
+                request_close(store, item, item.get("close_evidence", ""))
+            except Exception as exc:
+                log({"close_retry_error": key, "error": f"{type(exc).__name__}: {exc}"[:200]})
+                continue
+        else:
+            # Gone on the phone already (deleted or completed by hand) counts as done.
+            err = str(res.get("error") or status)
+            item.update(status="done" if "not found" in err.lower() else "close_failed", close_error=err[:200])
+            log({"close_result": key, "why": err[:200]})
+        save(OUTBOX, box)
+        changed = True
+    return changed
+
+
+def close_reminder(key: str, evidence: str = "") -> dict:
+    """Tick off the phone reminder the desk created for KEY. Returns a receipt; nothing else is touched."""
+    if not enabled():
+        return {"status": "disabled"}
+    with state_lock(OUTBOX):
+        box = load(OUTBOX, {})
+        item = box.get(key)
+        if not item or not item.get("reminder_id"):
+            return {"status": "no_reminder", "key": key}
+        if item.get("status") in {"closing", "done"}:
+            return {"status": item["status"], "key": key}
+        if not close_allowed(item):
+            return {"status": "not_allowed", "key": key}
+        _, store = bridge()
+        request_close(store, item, evidence or "closed by owner")
+        save(OUTBOX, box)
+        log({"closing": key, "evidence": item["close_evidence"]})
+        return {"status": "closing", "key": key, "request_id": item["close_request_id"]}
+
+
 def enqueue(item: dict, *, force: bool = False) -> dict:
     key, kind = item["key"], item_kind(item)
     with state_lock(OUTBOX):
@@ -231,9 +373,11 @@ def cmd_adopt(a) -> int:
 def cmd_tick(_a) -> int:
     with state_lock(OUTBOX):
         box = load(OUTBOX, {})
-        if not any(i.get("status") == "queued" for i in box.values()):
+        if not any(i.get("status") in {"queued", "closing"} for i in box.values()) and not closable(box):
             return 0
         _, store = bridge()
+        close_finished(store, box)
+        check_closing(store, box)
         for key, item in box.items():
             if item.get("status") != "queued":
                 continue
@@ -269,6 +413,11 @@ def cmd_tick(_a) -> int:
     return 0
 
 
+def cmd_close(a) -> int:
+    print(json.dumps(close_reminder(a.key, a.evidence), ensure_ascii=False))
+    return 0
+
+
 def cmd_status(_a) -> int:
     print(json.dumps(load(OUTBOX, {}), indent=1, ensure_ascii=False))
     return 0
@@ -292,13 +441,17 @@ def main() -> int:
     ap = sub.add_parser("adopt")
     ap.add_argument("--key", required=True)
     ap.add_argument("--request-id", required=True)
+    cl = sub.add_parser("close", help="tick off the phone reminder for a finished item")
+    cl.add_argument("--key", required=True)
+    cl.add_argument("--evidence", default="")
     sub.add_parser("tick")
     sub.add_parser("status")
     a = p.parse_args()
     if not enabled():
         print(json.dumps({"status": "disabled"}))
         return 0
-    return {"add": cmd_add, "alarm": cmd_alarm, "adopt": cmd_adopt, "tick": cmd_tick, "status": cmd_status}[a.cmd](a)
+    return {"add": cmd_add, "alarm": cmd_alarm, "adopt": cmd_adopt, "close": cmd_close,
+            "tick": cmd_tick, "status": cmd_status}[a.cmd](a)
 
 
 if __name__ == "__main__":

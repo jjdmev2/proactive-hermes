@@ -392,6 +392,17 @@ def compose(a, items: list[dict], *, flush=False) -> int:
     return 0
 
 
+CLOSED_STATUSES = {"done", "closed", "dropped", "resolved", "cancelled"}
+
+
+def closed_keys() -> set[str]:
+    """Keys closed in the action ledger (ea_close.py writes status there)."""
+    led = load_json(LEDGER, {})
+    if not isinstance(led, dict):
+        return set()
+    return {k for k, v in led.items() if isinstance(v, dict) and str(v.get("status", "")).lower() in CLOSED_STATUSES}
+
+
 def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
     at = t.isoformat(timespec="seconds")
     said_at = t.isoformat()
@@ -404,6 +415,14 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
     if getattr(a, "take_pending", False):
         keys = {i["key"] for i in items}
         items += [r for row in take(PENDING) if (r := normalize_item(row)) and r["key"] not in keys]
+
+    # Closed anywhere (the owner said done/remove in chat, or proof was found): never raise it again.
+    closed = closed_keys()
+    if closed:
+        dropped_closed = [i["key"] for i in items if i["key"] in closed]
+        items = [i for i in items if i["key"] not in closed]
+        if dropped_closed:
+            append(RUN_LOG, {"at": at, "job": a.job, "skipped_closed": dropped_closed})
 
     consumed, digest_rows, digest_additions = [], [], []
     keys = {i["key"] for i in items}

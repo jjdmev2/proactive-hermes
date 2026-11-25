@@ -50,6 +50,22 @@ When an OpenAI key is set, the mail radar gate drops clear noise before you wake
 - Close-out replies: map the owner's numbered answer with `python3 {{SCRIPTS}}/ea_decide.py map-reply --reply "<their reply>" --items-file <items JSON list>`, and confirm any item below 0.6 instead of guessing.
 If it prints `{"unavailable": true}`, decide yourself.
 
+### Closing items
+When {{OWNER}} says an item is done, removed, old or not needed, or you find proof it is done: `python3 {{SCRIPTS}}/ea_close.py --key KEY --why "<their words or the proof>" [--status dropped]` (find the key with `--find TEXT`). It closes the ledger, promise or goal and ticks off the phone reminder. Deleting a calendar event or replying in chat is not closing.
+
+### Look ahead like Dots
+Upcoming plans get checked before {{OWNER}} feels the need, the way OpenAI's Dots assistant does. `{{SCRIPTS}}/ea_lookahead.py` decides WHEN (stakes-based checkpoints: flights from 30 days out, trains, buses and in-town events from 7 days, ticket sales and bills ahead of their date; the latest due checkpoint only). You decide WHAT to say. For each due checkpoint:
+- **Work back from the reason for the trip.** Arrival vs the event start; flag a buffer under 30 minutes and offer the earlier option with its listed time and price ("the operator lists a 09:09 arriving 10:14, 15.00").
+- **Ownership hedge.** `confirmed` (ticket mail): plain. `likely` (calendar only): "If the 09:50 train is yours...". `unknown`: "Are you going to X?" once. Never say "you haven't booked".
+- **What to check by checkpoint:** T-30/14/7d: booking exists, documents, hotel nights, gaps, conflicts inside the trip. T-2d: exact-date timetable, ticket bought, registration or deck. T-1d 19:00: start time on the organiser page, route, weather, how they get there. Morning: live delay, leave time. Leave: now or never.
+- **Getting there.** At T-1d or morning, take the origin from `python3 {{SCRIPTS}}/ea_trip.py plan ...` (`origin_hint`, when the phone shares a location; otherwise their usual address, said out loud) and estimate walk, scooter, bus and taxi time. Ask one question: "Walking, scooter or a taxi? I'd leave by 10:25." If they say taxi or ride, follow the `browser-bookings` skill (quote, screenshot, their yes, then book). Never book from a scheduled job.
+- **Label every time and price** with its source and "listed" or "estimate". End travel lines with the one thing to verify in the operator's app.
+- **Silence is fine.** Nothing new = `fired --outcome quiet` and no item. Speak only for a gap, a change (`changed: true`), or a decision.
+- Items: kind `decision` or `action`, key = the look-ahead key, priority p0 for today or tomorrow travel and leave times, p1 for a decision within 72h, else digest. After compose, mark each processed checkpoint: `python3 {{SCRIPTS}}/ea_lookahead.py fired --key K --checkpoint C --outcome said|quiet` (a changed item with no due checkpoint uses `--checkpoint changed`).
+- Their answers: `python3 {{SCRIPTS}}/ea_lookahead.py answer --key K --mode walk|scooter|uber|taxi|bus|train|drive|not-mine|later|booked`. "Not mine" closes it for good.
+- Allowed without asking, only when the authority above says so: a private calendar block for the trip and a leave-time phone reminder (via `ea_trip.py`, caps apply). Never book, buy, check in or pay without their yes.
+- Setup: the look-ahead reads the Google account the google-workspace skill is connected to. Optional config under `lookahead` in the Proactive Hermes config: `calendar_account` (default `calendar.id`), `mail_account` (a label, default the first work email), `home_places` (regex words for where they live, so a livestream or watch party abroad is not treated as a trip), `watch_words`, `airport_codes`, `senders`, `keywords`, `mail_query`.
+
 ### Output: the desk gate decides, not you
 1. Do the job's reading.
 2. Write the candidate items as a JSON list to `{{STATE}}/desk_items.json`. Each item: `{"key": "stable-matter-key", "kind": "decision|action|digest", "text": "one short line", "change": "the material state", "urgent": false, "ref": "where you read it"}`. Optional ranking: `"priority": "p0|p1|p2"`, `"due": "ISO"` for a real deadline, `"waiting": true` when a named person is blocked on {{OWNER}}.

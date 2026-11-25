@@ -80,6 +80,8 @@ JOBS: list[dict] = [
      "body": "Weekly review. Look back 7 days: promises kept and missed (`ea_promises.py list`), decisions still open, "
              "drafts shown vs sent (`python3 {{SCRIPTS}}/ea_resolve.py list`). At most 5 items, the ones that need {{OWNER}} next week. "
              "Header: --header \"Your week, <N> things:\"."},
+    {"key": "lookahead", "name": "look-ahead", "job": "lookahead", "flags": "", "script": "lookahead_gate.py",
+     "skills": ["proactive-hermes:proactive-desk", "proactive-hermes:browser-bookings"], "body_file": "lookahead.md"},
     {"key": "health", "name": "health", "script": "ea_health.py", "no_agent": True,
      "body": "Proactive Hermes health watchdog (no-agent script)."},
     {"key": "tick", "name": "tick", "script": "desk_tick.py", "no_agent": True,
@@ -97,6 +99,8 @@ def enabled(cfg: dict, job: dict) -> bool:
         return bool(feats.get("slack_sweep") and cfg["slack"].get("enabled"))
     if job["key"].startswith("work_recap"):
         return bool(feats.get("work_recap") and cfg["daily_call"].get("enabled"))
+    if job["key"] == "lookahead":  # reads calendar and booking mail through the google-workspace skill
+        return bool(feats.get("lookahead") and (cfg["mail"].get("gmail_api") or cfg["calendar"].get("enabled")))
     return bool(feats.get(FEATURE.get(job["key"], job["key"]), False))
 
 
@@ -239,7 +243,7 @@ def prompt_for(job: dict, cfg: dict) -> str:
     else:
         v["ITEM_FILE"] = f"{v['STATE']}/desk_items.json"
         v["ITEM_HINT"] = " (an empty list [] is fine)"
-        body = job["body"]
+        body = job.get("body") or (HERE / "prompts" / job["body_file"]).read_text().strip()
     return render(HEAD + body + TAIL, v)
 
 
@@ -324,6 +328,8 @@ def _remove(run, jid: str) -> None:
 def _options(fields: dict, *, edit: bool) -> list[str]:
     argv = ["--name", fields["name"], "--deliver", fields["deliver"],
             "--failure-deliver", fields["failure_deliver"], "--no-wrap-response", "--catch-up", "off"]
+    for skill in fields.get("skills", []):
+        argv.extend(["--skill", skill])
     if fields["timezone"] or edit:
         argv.extend(["--timezone", fields["timezone"] or ""])
     if fields["script"] or edit:
@@ -364,6 +370,8 @@ def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run) -> list[dict]
             "wrap_response": False,
             "catch_up": False,
         }
+        if job.get("skills"):  # only jobs with skills carry the key, so other jobs' specs stay unchanged
+            fields["skills"] = job["skills"]
         # The CLI list omits settings like prompt and catch-up. Cache the last
         # applied spec (not the private prompt text) for no-op reapplication.
         spec = sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
