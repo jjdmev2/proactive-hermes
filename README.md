@@ -12,7 +12,7 @@
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-8b5cf6" alt="MIT license" /></a>
   </p>
   <p>
-    <a href="#install"><strong>Install</strong></a> · <a href="#set-it-up"><strong>Set it up</strong></a> · <a href="#how-it-works"><strong>How it works</strong></a> · <a href="#real-examples">Real examples</a> · <a href="#the-decision-model-highly-recommended">Decision model</a> · <a href="#what-it-does">Features</a> · <a href="#privacy-and-safety">Privacy</a> · <a href="#built-by-heyritoai">About</a>
+    <a href="#install"><strong>Install</strong></a> · <a href="#set-it-up"><strong>Set it up</strong></a> · <a href="#how-it-works"><strong>How it works</strong></a> · <a href="#what-it-looks-like">Screenshots</a> · <a href="#real-examples">Real examples</a> · <a href="#the-decision-model-highly-recommended">Decision model</a> · <a href="#what-it-does">Features</a> · <a href="#privacy-and-safety">Privacy</a> · <a href="#built-by-heyritoai">About</a>
   </p>
 </div>
 
@@ -31,6 +31,37 @@ When it does write, small things are already done (the calendar block is in, the
 > "Train to Lahti Fri 07:12: blocked, leave at 06:35 (10 min buffer)."
 > "Alex: the pricing questions are in, your reply is 2 days late. Draft ready, reply 1."
 > "Buyer offers 356 for the graphics card (listed 400). Counter at 380? Reply 1."
+
+## What it looks like
+
+One afternoon on our own phone, 25 Nov 2026. The mail, release update, Vinted offer and meeting prep happened live; the train, seat alarm and stock hit replay real watches for the camera. Last names, the map and card details are blurred.
+
+#### Mail and work
+
+<table>
+<tr>
+<td width="50%" valign="top"><img src="docs/assets/screens/01-email-draft.png" alt="A teammate asks how to install. The reply is drafted before you open the mail." width="100%" /><br /><sub>A teammate asks how to install. The reply is drafted before you open the mail.</sub></td>
+<td width="50%" valign="top"><img src="docs/assets/screens/02-shipped-update.png" alt="Last week's releases, checked against Linear, turned into a client update." width="100%" /><br /><sub>Last week's releases, checked against Linear, turned into a client update.</sub></td>
+</tr>
+</table>
+
+#### Looking ahead
+
+<table>
+<tr>
+<td width="50%" valign="top"><img src="docs/assets/screens/03-train-uber-leave.png" alt="Train blocked on the calendar, walk time from your phone, an Uber quote, then the reminder to leave." width="100%" /><br /><sub>Train blocked on the calendar, walk time from your phone, an Uber quote, then the reminder to leave.</sub></td>
+<td width="50%" valign="top"><img src="docs/assets/screens/04-quote-in-app.png" alt="Tap it: the quote with Uber's own screen. Nothing is booked until you say yes." width="100%" /><br /><sub>Tap it: the quote with Uber's own screen. Nothing is booked until you say yes.</sub></td>
+</tr>
+</table>
+
+#### Watches
+
+<table>
+<tr>
+<td width="50%" valign="top"><img src="docs/assets/screens/05-seat-alarm.png" alt="A seat opened at a sold out event. The alarm rings through Focus." width="100%" /><br /><sub>A seat opened at a sold out event. The alarm rings through Focus.</sub></td>
+<td width="50%" valign="top"><img src="docs/assets/screens/06-vinted-offer.png" alt="A buyer offer on Vinted, ready to answer." width="100%" /><br /><sub>A buyer offer on Vinted, ready to answer.</sub><br /><br /><img src="docs/assets/screens/07-stock-and-prep.png" alt="Shop stock found, and prep before a client call." width="100%" /><br /><sub>Shop stock found, and prep before a client call.</sub></td>
+</tr>
+</table>
 
 ## Real examples
 
