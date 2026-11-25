@@ -122,6 +122,7 @@ def wake(device_id: str) -> None:
         pass
 
 
+@state_lock(LEDGER)
 def ledger_set(key: str, patch: dict) -> None:
     led = load(LEDGER, {})
     row = led.get(key, {})
@@ -423,30 +424,69 @@ def cmd_status(_a) -> int:
     return 0
 
 
+# Untrusted text (mail, Slack, calendar, web, people) never rides on a shell command line: each text option has
+# a sibling --NAME-file that reads UTF-8 from a file ('-' = stdin, one trailing newline stripped). Prompts write
+# that file with the write_file tool, then pass --NAME-file. The plain option stays for backwards compatibility.
+_TEXT_OPTIONS: list[str] = []
+
+
+def _text_option(target, name: str, *, required: bool = False, group: bool = True, **kw) -> None:
+    dest = target.add_mutually_exclusive_group(required=required) if group else target
+    dest.add_argument(f"--{name}", **kw)
+    dest.add_argument(f"--{name}-file", metavar="PATH", help=f"read --{name} from a UTF-8 file ('-' = stdin)")
+    if name not in _TEXT_OPTIONS:
+        _TEXT_OPTIONS.append(name)
+
+
+def _read_text_file(path: str) -> str:
+    if path == "-":
+        text = sys.stdin.buffer.read().decode("utf-8")
+    else:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    return text[:-1] if text.endswith("\n") else text
+
+
+def _load_text_files(args, parser) -> None:
+    for name in _TEXT_OPTIONS:
+        attr = name.replace("-", "_") + "_file"
+        if not hasattr(args, attr):
+            continue
+        path = getattr(args, attr)
+        delattr(args, attr)
+        if path is None:
+            continue
+        try:
+            setattr(args, name.replace("-", "_"), _read_text_file(path))
+        except (OSError, UnicodeError) as exc:
+            parser.error(f"--{name}-file {path}: {exc}")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     ad = sub.add_parser("add")
     ad.add_argument("--key", required=True)
-    ad.add_argument("--title", required=True)
+    _text_option(ad, "title", required=True)
     ad.add_argument("--due")
     ad.add_argument("--due-date", dest="due_date")
-    ad.add_argument("--notes", default="")
+    _text_option(ad, "notes", default="")
     ad.add_argument("--priority", choices=["none", "low", "medium", "high"], default="medium")
     ad.add_argument("--force", action="store_true", help="ignore the reminder daily cap")
     alarm = sub.add_parser("alarm", help="queue an urgent, one-time alarm")
     alarm.add_argument("--key", required=True)
     alarm.add_argument("--at", required=True)
-    alarm.add_argument("--label", required=True)
+    _text_option(alarm, "label", required=True)
     ap = sub.add_parser("adopt")
     ap.add_argument("--key", required=True)
     ap.add_argument("--request-id", required=True)
     cl = sub.add_parser("close", help="tick off the phone reminder for a finished item")
     cl.add_argument("--key", required=True)
-    cl.add_argument("--evidence", default="")
+    _text_option(cl, "evidence", default="")
     sub.add_parser("tick")
     sub.add_parser("status")
     a = p.parse_args()
+    _load_text_files(a, p)
     if not enabled():
         print(json.dumps({"status": "disabled"}))
         return 0

@@ -117,24 +117,62 @@ def _age(row: dict, t: datetime) -> float | None:
     return round((t - made).total_seconds() / 86400, 1) if made else None
 
 
+# Untrusted text (mail, Slack, calendar, web, people) never rides on a shell command line: each text option has
+# a sibling --NAME-file that reads UTF-8 from a file ('-' = stdin, one trailing newline stripped). Prompts write
+# that file with the write_file tool, then pass --NAME-file. The plain option stays for backwards compatibility.
+_TEXT_OPTIONS: list[str] = []
+
+
+def _text_option(target, name: str, *, required: bool = False, group: bool = True, **kw) -> None:
+    dest = target.add_mutually_exclusive_group(required=required) if group else target
+    dest.add_argument(f"--{name}", **kw)
+    dest.add_argument(f"--{name}-file", metavar="PATH", help=f"read --{name} from a UTF-8 file ('-' = stdin)")
+    if name not in _TEXT_OPTIONS:
+        _TEXT_OPTIONS.append(name)
+
+
+def _read_text_file(path: str) -> str:
+    if path == "-":
+        text = sys.stdin.buffer.read().decode("utf-8")
+    else:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    return text[:-1] if text.endswith("\n") else text
+
+
+def _load_text_files(args, parser) -> None:
+    for name in _TEXT_OPTIONS:
+        attr = name.replace("-", "_") + "_file"
+        if not hasattr(args, attr):
+            continue
+        path = getattr(args, attr)
+        delattr(args, attr)
+        if path is None:
+            continue
+        try:
+            setattr(args, name.replace("-", "_"), _read_text_file(path))
+        except (OSError, UnicodeError) as exc:
+            parser.error(f"--{name}-file {path}: {exc}")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("add")
     s.add_argument("--key")
-    s.add_argument("--to", required=True)
-    s.add_argument("--what", required=True)
+    _text_option(s, "to", required=True)
+    _text_option(s, "what", required=True)
     s.add_argument("--due")
     s.add_argument("--made", help="when the promise was made (ISO); default now")
-    s.add_argument("--source", required=True)
-    s.add_argument("--quote", default="")
+    _text_option(s, "source", required=True)
+    _text_option(s, "quote", default="")
     s.add_argument("--channel", default="mail", choices=["mail", "slack", "chat", "imessage", "whatsapp", "meeting"])
     s = sub.add_parser("close")
     s.add_argument("--key", required=True)
-    s.add_argument("--evidence", required=True)
+    _text_option(s, "evidence", required=True)
     s = sub.add_parser("drop")
     s.add_argument("--key", required=True)
-    s.add_argument("--why", required=True)
+    _text_option(s, "why", required=True)
     s = sub.add_parser("snooze")
     s.add_argument("--key", required=True)
     s.add_argument("--until", required=True)
@@ -142,6 +180,7 @@ def main(argv=None) -> int:
     s.add_argument("--open", action="store_true")
     s.add_argument("--due-within", type=float)
     a = p.parse_args(argv)
+    _load_text_files(a, p)
     t = now().isoformat(timespec="minutes")
     if a.cmd == "add":
         res = cmd_add(a)

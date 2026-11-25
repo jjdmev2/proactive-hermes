@@ -18,15 +18,15 @@
 
 ---
 
-> **Quick start:** turn on Bot Mode in the Hermes desktop app (on by default), run `hermes plugins install jjdmev2/proactive-hermes --enable`, then open your Bot Chat and type **`/proactive setup`**. Add an OpenAI API key for the [decision model](#the-decision-model-highly-recommended).
+> **Quick start:** in the Hermes desktop app, open the **Bots** tab and click your Bot once (Bot Mode is on by default). Run `hermes plugins install jjdmev2/proactive-hermes --enable`, then open your Bot Chat and type **`/proactive setup`**. `hermes proactive doctor` checks that it all works. Add an OpenAI API key for the [decision model](#the-decision-model-highly-recommended).
 
 ## Why Proactive Hermes?
 
-Most "proactive" assistants send alerts you configured in advance. The messages worth getting are about things you never set up an alert for: the client call that now overlaps your dentist, the invoice due today, the reply you promised yesterday and never sent.
+The messages worth getting from an assistant are about things you never set up an alert for: the client call that now overlaps your dentist, the invoice due today, the reply you promised yesterday and never sent.
 
 Proactive Hermes runs a small desk inside your own Hermes. Scheduled jobs read your mail, calendar, Slack and Linear, and watches keep an eye on the shops, marketplaces and event pages you choose. A gate decides what reaches you, and the rest goes to a private log. Most runs end with no message at all.
 
-When it does write, it brings the work with it. Small things are already done (the calendar block is in, the reminder is set), and the rest is prepared so a "yes" finishes it:
+When it does write, small things are already done (the calendar block is in, the reminder is set), and the rest is prepared so a "yes" finishes it:
 
 > "Train to Lahti Fri 07:12: blocked, leave at 06:35 (10 min buffer)."
 > "Alex: the pricing questions are in, your reply is 2 days late. Draft ready, reply 1."
@@ -59,7 +59,7 @@ Things you can set up the same way: a new card set or sneaker drop ("alarm me wh
 | **Bot Mode** | Every desk message is a real reply in your Bot's **Bot Chat**, the one permanent conversation each Bot has. It arrives like a text from a person, with the app's normal notification and nothing extra. | Bot Mode is on by default in the Hermes desktop app. Open the **Bots** tab and click your Bot once so its Bot Chat exists. You read it in the desktop app or the Hermes mobile app. |
 | **The gateway running** | Messages are delivered through your profile's running gateway. If it is off, nothing reaches you. | Keep the Hermes desktop app open, or run `hermes gateway start`. |
 | **The right profile** | The desk talks in the Bot Chat of the profile (Bot) you install it into. | Use your main assistant Bot. If that is not your default profile, add `-p <profile name>` to every command below, for example `hermes -p assistant plugins install ...`. `hermes profile list` shows the names. |
-| **Hermes mobile app** (highly recommended) | Desk messages buzz your phone like a text; reminders, alarms and leave times need it. Tested on iPhone. | See [Give Hermes access](#give-hermes-access). The plugin works without it, and `doctor` tells you it is missing. |
+| **Hermes mobile app** (recommended) | Desk messages buzz your phone like a text; reminders, alarms and leave times need it. Tested on iPhone. | See [Give Hermes access](#give-hermes-access). The plugin works without it, and `doctor` tells you it is missing. |
 
 ### Install
 
@@ -68,21 +68,21 @@ hermes plugins install jjdmev2/proactive-hermes --enable
 hermes proactive doctor
 ```
 
-While the repository is private, ask us for access first. `hermes proactive doctor` checks the gateway, the Bot Chat, the phone, the OpenAI key and your mail, and tells you how to fix anything missing. `hermes proactive doctor --send-test` posts one test message into your Bot Chat, so you can see it land on your phone.
+`hermes proactive doctor` checks the gateway, the Bot Chat, the phone, the OpenAI key and your mail, and tells you how to fix anything missing. `hermes proactive doctor --send-test` posts one test message into your Bot Chat, so you can see it land on your phone. If `hermes proactive` is not found (plugins running with `plugins.isolation: host`), use `python3 ~/.hermes/plugins/proactive-hermes/cli.py doctor` and the same flags.
 
 ### Give Hermes access
 
-The desk only sees what you connect. Everything here is optional except the gateway and Bot Mode above.
+The desk only sees what you connect. Everything here is optional except the gateway and Bot Mode above, but connect at least one mailbox or calendar: without one, only watches have anything to read.
 
 | Access | What it unlocks | How |
 | :--- | :--- | :--- |
-| **Hermes mobile app** (highly recommended) | Reminders and alarms on your phone, leave times based on where you are, your phone calendar and contacts. | Install the Hermes app, sign in to the same Hermes, and share **Reminders, Alarms, Location, Calendar and Contacts** in its settings. |
-| **OpenAI API key** (highly recommended) | The [decision model](#the-decision-model-highly-recommended): drops noise before any agent runs and spots your promises. About 3 cents per 1,000 emails. | Add `OPENAI_API_KEY=...` to your Hermes `.env` and put a few dollars of credit on [platform.openai.com](https://platform.openai.com). |
-| **Mail and calendar** | Mail radar, promise tracker, trips, calendar blocks and conflicts. | The `google-workspace` skill for Gmail and Google Calendar; [himalaya](https://github.com/pimalaya/himalaya) for any other mailbox (IMAP). |
+| **Hermes mobile app** | Reminders and alarms on your phone, leave times based on where you are, your phone calendar and contacts. | Install the Hermes app, sign in to the same Hermes, and share **Reminders, Alarms, Location and Calendar** in its settings (Contacts too, if you want it to find people's numbers). |
+| **OpenAI API key** | The [decision model](#the-decision-model-highly-recommended): drops noise before any agent runs and spots your promises. About 3 cents per 1,000 emails. | Add `OPENAI_API_KEY=...` to the `.env` file in your Hermes home (`~/.hermes`, or `~/.hermes/profiles/<name>` for a profile) and put a few dollars of credit on [platform.openai.com](https://platform.openai.com). |
+| **Mail and calendar** | Mail radar, promise tracker, look-ahead, trips, calendar blocks and conflicts. Connect every mailbox you use, work and personal: tickets and bookings often land in a personal one. | The `google-workspace` skill for Gmail and Google Calendar; [himalaya](https://github.com/pimalaya/himalaya) for any other mailbox (IMAP). |
 | **Slack and Linear** | Asks waiting on you, the work recap, promises made in Slack. | Hermes connectors (Nous Portal). |
 | **Rides, trains and food** (optional extra) | Bookings from the look-ahead: "Uber to the station at 08:40?" on your yes. | Sign in once to Uber's site (m.uber.com), your rail operator and your food delivery site in Hermes's browser. See [Bookings](#bookings-optional-extra). |
 | **Your apps and sites** | Watches on marketplaces (Vinted, eBay), shops (Amazon, your local hardware store), event pages (Luma, Eventbrite, conferences), ticket drops. | Sign in once in Hermes's browser (the browser tool; with `local` it uses a copy of your own Chrome profile). Never paste passwords into chat. |
-| **Public holidays** | Skip holidays in the countries you pick. | `pip install holidays` |
+| **Public holidays** | Skip holidays in the countries you pick. | `~/.hermes/hermes-agent/venv/bin/pip install holidays` (the Python Hermes runs on) |
 
 ## Set it up
 
@@ -111,8 +111,8 @@ You see every job and its times before anything is created. At the end Hermes po
 | Level | Juan's setup | You can change it to |
 | :--- | :--- | :--- |
 | **Without asking** | Private calendar blocks, phone reminders, alarms for urgent things, leave times for trips. | Any of these, or none. Watch actions too, if you want a watch to act on its own. |
-| **Ask first** | Sending email or Slack, replying to offers, registering for events, purchases and bookings (Hermes fills the form or cart, you confirm and pay), accepting invites. | Everything not allowed above lands here. Hermes prepares it fully and asks in one line; a "yes" approves that one action. |
-| **Never** | Payments, card details, passwords, deleting data. | These always stay with you. |
+| **Ask first** | Sending email or Slack, replying to offers, registering for events, purchases (Hermes fills the cart, you pay), bookings (Hermes stops at the price and books on your yes to that exact quote), accepting invites. | Everything not allowed above lands here. Hermes prepares it fully and asks in one line; a "yes" approves that one action. |
+| **Never** | Entering or changing card details or payment methods, approving a payment in your bank app, passwords, deleting data. | These always stay with you. |
 
 ### Add your own watches
 
@@ -123,7 +123,7 @@ hermes proactive watch add --name "Card drop" --schedule "*/15 * * * *" \
   --check "the shop page for the new card set" --when "preorders open" --then alarm --urgent
 ```
 
-`--then` is what happens when the condition is true: `tell` (a line in chat), `reminder`, `alarm` (urgent only), `draft` (prepared and waiting for your yes) or `act` (done on its own, only if you allowed watch actions; a watch never pays or enters card details, and purchases still wait for your yes). `hermes proactive watch list` and `watch remove --name` manage them.
+`--then` is what happens when the condition is true: `tell` (a line in chat), `reminder`, `alarm` (urgent only), `draft` (prepared and waiting for your yes) or `act` (done on its own; needs `--act "<exact action>"` and watch actions allowed in setup; a watch never pays, books or enters card details). `hermes proactive watch list` and `watch remove --name` manage them.
 
 | Command | What it does |
 | :--- | :--- |
@@ -134,7 +134,7 @@ hermes proactive watch add --name "Card drop" --schedule "*/15 * * * *" \
 | `hermes proactive watch add ...` | Add a watch (see above) |
 | `hermes proactive remove` | Remove every job the plugin created (settings and history stay) |
 
-To uninstall completely: `hermes proactive remove`, then `hermes plugins remove proactive-hermes`, then delete `HERMES_HOME/plugin-data/proactive-hermes/` and `HERMES_HOME/scripts/proactive-hermes/`.
+To uninstall completely: `hermes proactive remove`, then `hermes plugins remove proactive-hermes`, then delete `plugin-data/proactive-hermes/` and `scripts/proactive-hermes/` in your Hermes home (`~/.hermes`, or `~/.hermes/profiles/<name>`).
 
 ## How it works
 
@@ -151,7 +151,7 @@ To uninstall completely: `hermes proactive remove`, then `hermes plugins remove 
                     │
      5. gate: dedupe, rank, cap, quiet hours
                     │  one short numbered message
-   your Bot Chat (and phone)  ──►  you reply "1"
+   your Bot Chat (and phone)  ->  you reply "1"
                     │
      6. small things done, the rest after your yes
 ```
@@ -163,13 +163,13 @@ To uninstall completely: `hermes proactive remove`, then `hermes plugins remove 
 5. **Gate.** The gate ranks the items, removes anything you heard recently, caps the message at 3 items (5 in a brief) and holds non-urgent items during quiet hours. It sends one short numbered message as a normal chat reply.
 6. **Act.** What your approval levels allow happens right away (a block, a reminder, an alarm, a leave time) and the message says so. Everything else waits for you: reply "1" and Hermes shows the draft or action with its sources and asks "Send as is?". A yes does it.
 
-**What it costs to run.** The desk jobs are ordinary agent runs on the model of your Bot's profile. A cheap, fast model is enough: on our desk they use about 1% of a day's Nous allowance, because most runs stop at step 1 or 2.
+**What it costs to run.** The desk jobs are ordinary agent runs on the model of your Bot's profile. A cheap, fast model is enough: on our desk they use about 1% of the daily usage included in a Nous Portal plan, because most runs stop at step 1 or 2.
 
-The plugin installs plain Python scripts under `HERMES_HOME/scripts/proactive-hermes/` and ordinary Hermes cron jobs named `Proactive · ...`. Your settings and history stay in `HERMES_HOME/plugin-data/proactive-hermes/`.
+The plugin installs plain Python scripts under `scripts/proactive-hermes/` in your Hermes home and ordinary Hermes cron jobs named `Proactive · ...`. Your settings and history stay in `plugin-data/proactive-hermes/` there.
 
 ## The decision model (highly recommended)
 
-Juan's setup is built around OpenAI's [**Decisions API**](https://developers.openai.com/api/docs/guides/decisions) with `gpt-6-luna`. It does not write text. You ask it a question with a fixed kind of answer and it returns a probability, a choice or a score in about 0.3 seconds. Input costs $0.10 per million tokens and output is free, so 1,000 emails cost about 3 cents.
+Juan's setup is built around OpenAI's [**Decisions API**](https://developers.openai.com/api/docs/guides/decisions) with `gpt-6-luna`. It does not write text. You ask it a question with a fixed kind of answer and it returns a probability, a choice or a score (about 0.3 seconds in our runs). Input costs $0.10 per million tokens and output tokens are not charged, so 1,000 emails cost about 3 cents.
 
 **How it ranks.** Every check is a yes or no statement, and the model returns how likely it is to be true, from 0 to 1. The desk acts only above fixed thresholds:
 
@@ -202,7 +202,7 @@ Real scores from testing:
 
 On one real inbox, the filter dropped 23 of 38 recent emails, all promotions (sportswear, supermarket, food delivery, news digests). It kept the other 15, including a rescheduled client meeting, an overdue bill and an expired identity check.
 
-The 0.10 cut-off is low on purpose: the filter only removes mail it is close to certain about. Reading the start of the body catches asks hidden behind a vague subject ("Re: hi"). The mail stays unread in your inbox.
+The cut-off is 0.10, so the filter only removes mail it is close to certain about. Reading the start of the body catches asks hidden behind a vague subject ("Re: hi"). The mail stays unread in your inbox.
 
 **After the filter, the gate ranks items in this order:** urgent first, then priority (p0, p1, p2), then items where someone is waiting on you, then the nearest deadline, then decisions before actions, then the oldest.
 
@@ -219,7 +219,7 @@ The 0.10 cut-off is low on purpose: the filter only removes mail it is close to 
 | **Work recap after the daily** | Reads your team's call notes in Slack and checks each point against Linear and Slack: done, not done, Linear and Slack disagreeing, and today's focus. An evening wrap-up covers what shipped and what slipped. |
 | **Mail radar** | Checks new mail every 15 minutes and surfaces only what you must answer, pay or decide. |
 | **Briefs and close-out** | Morning brief, an evening close-out you answer by number ("1 yes, 2 tomorrow"), and a weekly review. |
-| **Look-ahead** | Checks upcoming plans before you feel the need, like a good assistant. The bigger the stakes, the earlier the first look: flights and longer trips from 30 days out, trains and in-town events from 7 days, ticket sales and bills ahead of their date. More checks as the day gets closer (2 days, the evening before, that morning, leave time). Each check speaks only for a gap, a change or a decision: "If the 09:50 train is yours, it lands 16 min before the start. The 09:09 lands 10:14, €15. Walking or Uber?" Weekly routines get one quiet look; races you watch on TV are skipped. |
+| **Look-ahead** | Checks your upcoming plans ahead of time. It reads your calendar and the booking, ticket and registration mails in every mailbox you connect, work and personal; a ticket mail means the trip is yours, a marketing mail is ignored. The bigger the stakes, the earlier the first look: flights and longer trips from 30 days out, trains and in-town events from 7 days, ticket sales and bills ahead of their date. More checks as the day gets closer (2 days, the evening before, that morning, leave time). Each check speaks only for a gap, a change or a decision: "If the 09:50 train is yours, it lands 16 min before the start. The 09:09 lands 10:14, €15. Walking or Uber?" Weekly routines get one quiet look; races you watch on TV are skipped. |
 | **Trips and leave times** | A ticket or booking in your mail becomes a calendar block and a "leave now" reminder based on where your phone is, with a buffer. |
 | **Watches** | Your own proactive tasks: marketplaces, shops, drops, event registrations, anything with a page. Tell, remind, alarm, draft or act. |
 | **Phone reminders and alarms** | Reminders for deadlines and promises, alarms that ring through Focus for the few things that cannot wait. Retried until the phone confirms. |
@@ -239,17 +239,20 @@ Works with sites that book on the web: Uber (m.uber.com), most rail operators, W
 
 **Connect once:** Hermes opens the site in its browser and you sign in yourself, codes included. Hermes never sees or stores your password.
 
-**Risk, plainly:** Uber's terms forbid automated access. Every ride here has a human approving it and the volume stays human, but the risk to your account is yours. To skip it, just never sign in to those sites; without a login Hermes cannot book anything.
+**Account risk.** Uber's terms forbid automated access. Every ride here has a human approving it and the volume stays human, but the risk to your account is yours. To skip it, never sign in to those sites; without a login Hermes cannot book anything.
 
 ## Privacy and safety
 
-- **Approval first.** The desk only does on its own what you allowed in setup (blocks, reminders, alarms, leave times by default). Sending, replying, registering, buying and booking wait for your yes to that exact action. Payments, card details and passwords always stay with you.
-- **Local.** Settings, drafts, promises and logs stay in your Hermes home. We run no server and collect no telemetry.
+- **Approval first.** The desk only does on its own what you allowed in setup (in Juan's setup: blocks, reminders, alarms, leave times). Sending, replying, registering, buying and booking wait for your yes to that exact action, unless you let a specific watch act on its own. Hermes never enters card details or passwords, and nothing is paid without your yes to an exact quote.
+- **Local.** Settings, drafts, promises and logs stay in your Hermes home, in a folder only your user can read. We run no server and collect no telemetry.
 - **Your Bot's model sees what the desk reads.** Mail, Slack and calendar text go to the model provider of your Bot's profile, as in any Hermes chat.
-- **The decision model sees little:** for mail, the sender, subject and first 600 characters of the body; for promise checks, the one message being checked. OpenAI offers zero data retention for eligible accounts.
+- **What goes to OpenAI** (only with a key, only to the Decisions API): for mail, the sender, subject and first 600 characters of the body; for Slack, the message being judged; for promises and the work recap, the message or call item and the Linear title it is matched against; for your replies, the reply and the numbered list it answers; and the text of anything checked for prompt injection. Nothing else, and no files. OpenAI offers zero data retention for eligible accounts.
+- **Phone wake-ups.** To make a reminder or alarm land while your phone sleeps, the desk asks the Hermes mobile push relay to wake the device. It sends the device id only, never the reminder text.
 - **Work and personal stay apart.** A work draft never uses facts from personal sources, and every fact carries a source.
 - **Bounded.** Searches have call and time limits. Reminders, alarms and calendar blocks have daily caps, and each action is done once even if a job retries.
-- **Text from mail, Slack or the web is treated as data.** Instructions inside it are never followed.
+- **Text from mail, Slack or the web is treated as data.** Instructions inside it are never followed, and it never goes on a command line: the desk writes it to a file and passes the file.
+
+Found a security problem? See [SECURITY.md](SECURITY.md).
 
 ## Project guide
 
@@ -258,7 +261,7 @@ Works with sites that book on the web: Uber (m.uber.com), most rail operators, W
 | [`skills/proactive-desk/references/desk-contract.md`](skills/proactive-desk/references/desk-contract.md) | The rules every desk job follows |
 | [`skills/proactive-setup/SKILL.md`](skills/proactive-setup/SKILL.md) | The setup interview |
 | [`skills/proactive-desk/SKILL.md`](skills/proactive-desk/SKILL.md) | Answering desk messages, approvals, watches and close-outs in chat |
-| [`presets/juan.json`](presets/juan.json) | Juan's setup: choices only, no personal data |
+| [`presets/juan.json`](presets/juan.json) | Juan's setup: schedules, time zones, holiday countries and features; no accounts or contact details |
 | [`jobs.py`](jobs.py) | Job templates and the installer |
 | [`runtime/`](runtime) | The desk: sender, gate, resolver, decision model, promises, health |
 | [`tests/`](tests) | Tests with no network access: `python3 -m unittest discover -s tests -t .` |
@@ -267,7 +270,7 @@ Works with sites that book on the web: Uber (m.uber.com), most rail operators, W
 
 Proactive Hermes started as the desk behind our own work at **[HeyRito.AI](https://heyrito.ai)**, and we still use it every day. It follows the rules we build everything on: it stays quiet unless something needs you, acts only within what you approved, and every claim points back to its source.
 
-Those are the rules **Rito** enforces for companies. **Rito is the security and governance harness for AI at work.** Teams use AI assistants and agents on real work, and Rito controls what each one can see and do: access scoped to each identity, approval before actions, an audit trail, and policies for every model and tool.
+Those are the rules Rito enforces for companies. Rito is the security and governance layer for AI at work. Teams use AI assistants and agents on real work, and Rito controls what each one can see and do: access scoped to each identity, approval before actions, an audit trail, and policies for every model and tool.
 
 If your team is putting AI to work and needs it safe and governed, talk to us at **[heyrito.ai](https://heyrito.ai)**.
 
@@ -275,5 +278,5 @@ If your team is putting AI to work and needs it safe and governed, talk to us at
 
 <div align="center">
   <strong>Proactive Hermes</strong><br />
-  Built by <a href="https://heyrito.ai">HeyRito.AI</a> · Rito, the security and governance harness for AI at work.
+  Built by <a href="https://heyrito.ai">HeyRito.AI</a> · Rito, the security and governance layer for AI at work.
 </div>

@@ -12,6 +12,8 @@ Rules enforced here, not in prompts:
     is dropped.
   * Dedupe on what was SAID: an item key that was said before stays quiet until
     its `change` text differs, or 48h pass (decisions re-surface at most daily).
+  * A key closed with ea_close.py stays quiet while the item still says what was closed, and for 7 days after
+    the close. After that a changed text is a new matter (a monthly bill with a stable key speaks again).
   * No daily cap. Items are ranked by importance instead: urgent, then priority p0/p1/p2, then someone waiting on the owner,
     then the soonest due date, then decisions before actions, then the oldest first.
   * Configured item limits per message and brief, best first. The rest roll over: every compose
@@ -46,6 +48,8 @@ import json
 import re
 import shlex
 import sys
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -76,6 +80,39 @@ FLUSH_GAP = timedelta(minutes=60)  # flush waits this long after the last desk m
 PRIORITY = {"p0": 0, "p1": 1, "p2": 2}
 
 
+_ledger_held = threading.local()
+
+
+@contextmanager
+def ledger_lock(path=None):
+    """One cross-process lock for every read-modify-write of actions.json (the action ledger).
+
+    `path` is the ledger file, a callable returning it (resolved when the lock is taken, so
+    `@ledger_lock(lambda: LEDGER)` can decorate a writer), or None for this module's LEDGER.
+    The lock file sits next to the ledger as `<ledger name>.lock`. Reentrant per thread, so a writer
+    called inside the block does not deadlock. Never hold it across a network call.
+    """
+    target = path() if callable(path) else path
+    target = Path(target) if target is not None else LEDGER
+    target.parent.mkdir(parents=True, exist_ok=True)
+    name = str(target.with_name(target.name + ".lock"))
+    held = _ledger_held.__dict__.setdefault("names", {})
+    if held.get(name):
+        held[name] += 1
+        try:
+            yield
+        finally:
+            held[name] -= 1
+        return
+    with open(name, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        held[name] = 1
+        try:
+            yield
+        finally:
+            held.pop(name, None)
+
+
 def now() -> datetime:
     return datetime.now(phconf.tz())
 
@@ -89,9 +126,16 @@ def load_json(path: Path, default):
 
 def save_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False, sort_keys=True))
-    tmp.replace(path)
+    # A unique temp file in the same directory: two writers never share one half-written file.
+    with NamedTemporaryFile(mode="w", dir=path.parent, prefix=path.name + ".", suffix=".tmp",
+                            encoding="utf-8", delete=False) as fh:
+        tmp = Path(fh.name)
+        try:
+            fh.write(json.dumps(data, indent=1, ensure_ascii=False, sort_keys=True))
+            fh.close()
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def append(path: Path, row: dict) -> None:
@@ -393,14 +437,47 @@ def compose(a, items: list[dict], *, flush=False) -> int:
 
 
 CLOSED_STATUSES = {"done", "closed", "dropped", "resolved", "cancelled"}
+RECUR_WINDOW = timedelta(days=7)  # a closed key stays shut this long even when its text changed
+
+
+def closed_rows() -> dict:
+    """Ledger rows closed through ea_close.py (status closed/done/dropped/...)."""
+    led = load_json(LEDGER, {})
+    if not isinstance(led, dict):
+        return {}
+    return {k: v for k, v in led.items() if isinstance(v, dict) and str(v.get("status", "")).lower() in CLOSED_STATUSES}
 
 
 def closed_keys() -> set[str]:
-    """Keys closed in the action ledger (ea_close.py writes status there)."""
-    led = load_json(LEDGER, {})
-    if not isinstance(led, dict):
-        return set()
-    return {k for k, v in led.items() if isinstance(v, dict) and str(v.get("status", "")).lower() in CLOSED_STATUSES}
+    """Keys closed in the action ledger (ea_close.py writes status there), recurring or not."""
+    return set(closed_rows())
+
+
+def same_text(a, b) -> bool:
+    return " ".join(str(a or "").split()).casefold() == " ".join(str(b or "").split()).casefold()
+
+
+def stays_closed(row: dict, item: dict, t: datetime) -> bool:
+    """Does a closed ledger row still silence this item? A stable key can recur (a monthly bill), so the
+    closure holds while the item says what was closed or within RECUR_WINDOW of closed_at. Rows closed before
+    the text and time were recorded cannot prove a recurrence and stay shut."""
+    closed_text = row.get("closed_text")
+    closed_at = timestamp(row.get("closed_at")) or timestamp(row.get("closed"))
+    if not closed_text or closed_at is None:
+        return True
+    return same_text(closed_text, item.get("text")) or t - closed_at < RECUR_WINDOW
+
+
+def drop_closed(items: list[dict], t: datetime) -> tuple[list[dict], list[str]]:
+    """(items still allowed to speak, keys dropped because the owner closed them)."""
+    closed = closed_rows()
+    if not closed:
+        return items, []
+    kept, dropped = [], []
+    for it in items:
+        row = closed.get(it["key"])
+        (dropped if row is not None and stays_closed(row, it, t) else kept).append(it)
+    return kept, [i["key"] for i in dropped]
 
 
 def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
@@ -417,12 +494,7 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
         items += [r for row in take(PENDING) if (r := normalize_item(row)) and r["key"] not in keys]
 
     # Closed anywhere (the owner said done/remove in chat, or proof was found): never raise it again.
-    closed = closed_keys()
-    if closed:
-        dropped_closed = [i["key"] for i in items if i["key"] in closed]
-        items = [i for i in items if i["key"] not in closed]
-        if dropped_closed:
-            append(RUN_LOG, {"at": at, "job": a.job, "skipped_closed": dropped_closed})
+    items, skipped_closed = drop_closed(items, t)
 
     consumed, digest_rows, digest_additions = [], [], []
     keys = {i["key"] for i in items}
@@ -454,7 +526,14 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
         if key not in keys and (key in expired_wait or (overflow_allowed and resolution_for(row, t))):
             items.append(row)
             keys.add(key)
+    # Overflow and waiting rows joined the batch above: a key the owner closed meanwhile must not speak.
+    items, late_closed = drop_closed(items, t)
+    skipped_closed += late_closed
+    if skipped_closed:
+        append(RUN_LOG, {"at": at, "job": a.job, "skipped_closed": skipped_closed})
     remaining_wait = dict(wait)
+    for key in skipped_closed:
+        remaining_wait.pop(key, None)
     need, drafts_by_item, returned_wait = {}, {}, {}
     unresolved = set()
     speak, queued, held, quiet = [], 0, 0, [(k, "expired 7d, moved to digest") for k in expired]
@@ -616,42 +695,44 @@ def cmd_forget(a) -> int:
 
 def cmd_ledger(a) -> int:
     """What the desk already created for a matter (reminder id, calendar block key)."""
-    led = load_json(LEDGER, {})
     if a.list:
-        print(json.dumps(led, ensure_ascii=False, indent=1))
+        print(json.dumps(load_json(LEDGER, {}), ensure_ascii=False, indent=1))
         return 0
     if not a.key:
         print(json.dumps({"error": "--key or --list"}))
         return 0
-    if a.claim:
-        kind = a.claim
-        row = led.get(a.key, {})
-        today = now().date().isoformat()
-        used = sum(1 for r in led.values() if str(r.get(f"claimed_{kind}", "")).startswith(today))
-        if row.get(f"{kind}_id") or row.get(f"claimed_{kind}"):
-            print(json.dumps({"allowed": False, "reason": f"{kind} already exists for this key", "row": row}))
+    # Read-modify-write under the shared actions.json lock: ea_close.py and ea_reminders.py write it too.
+    with ledger_lock():
+        led = load_json(LEDGER, {})
+        if a.claim:
+            kind = a.claim
+            row = led.get(a.key, {})
+            today = now().date().isoformat()
+            used = sum(1 for r in led.values() if str(r.get(f"claimed_{kind}", "")).startswith(today))
+            if row.get(f"{kind}_id") or row.get(f"claimed_{kind}"):
+                print(json.dumps({"allowed": False, "reason": f"{kind} already exists for this key", "row": row}))
+                return 0
+            if used >= CLAIM_CAPS[kind]:
+                print(json.dumps({"allowed": False, "reason": f"daily {kind} cap {CLAIM_CAPS[kind]} reached"}))
+                return 0
+            row[f"claimed_{kind}"] = now().isoformat(timespec="seconds")
+            led[a.key] = row
+            save_json(LEDGER, led)
+            print(json.dumps({"allowed": True, "key": a.key, "kind": kind,
+                              "idempotency_key": f"{phconf.profile_name()}:{a.key}:{kind}"[:120]}))
             return 0
-        if used >= CLAIM_CAPS[kind]:
-            print(json.dumps({"allowed": False, "reason": f"daily {kind} cap {CLAIM_CAPS[kind]} reached"}))
-            return 0
-        row[f"claimed_{kind}"] = now().isoformat(timespec="seconds")
-        led[a.key] = row
-        save_json(LEDGER, led)
-        print(json.dumps({"allowed": True, "key": a.key, "kind": kind,
-                          "idempotency_key": f"{phconf.profile_name()}:{a.key}:{kind}"[:120]}))
-        return 0
-    if a.set:
-        try:
-            patch = json.loads(a.set)
-        except ValueError as exc:
-            print(json.dumps({"error": f"bad --set json: {exc}"}))
-            return 0
-        row = led.get(a.key, {})
-        row.update(patch)
-        row["updated_at"] = now().isoformat(timespec="seconds")
-        led[a.key] = row
-        save_json(LEDGER, led)
-    print(json.dumps({a.key: led.get(a.key)}, ensure_ascii=False))
+        if a.set:
+            try:
+                patch = json.loads(a.set)
+            except ValueError as exc:
+                print(json.dumps({"error": f"bad --set json: {exc}"}))
+                return 0
+            row = led.get(a.key, {})
+            row.update(patch)
+            row["updated_at"] = now().isoformat(timespec="seconds")
+            led[a.key] = row
+            save_json(LEDGER, led)
+        print(json.dumps({a.key: led.get(a.key)}, ensure_ascii=False))
     return 0
 
 

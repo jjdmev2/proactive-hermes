@@ -3,3 +3,8 @@ __pycache__/
 *.bak*
 .env
 plugin-data/
+*.jsonl
+state/
+*.log
+.venv/
+.DS_Store

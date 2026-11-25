@@ -57,15 +57,14 @@ def api_key() -> str:
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if key:
         return key
-    homes = [str(phconf.hermes_home()), os.environ.get("HERMES_HOME"), str(Path.home() / ".hermes")]
-    for home in filter(None, homes):
-        env = Path(home) / ".env"
-        try:
-            for line in env.read_text().splitlines():
-                if line.startswith("OPENAI_API_KEY="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-        except OSError:
-            continue
+    # Only this profile's own .env: never fall back to another profile's (or the default profile's) secrets.
+    env = phconf.hermes_home() / ".env"
+    try:
+        for line in env.read_text().splitlines():
+            if line.startswith("OPENAI_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
     return ""
 
 
@@ -277,11 +276,49 @@ def _json_list(path: Path, item_type: type, parser: argparse.ArgumentParser) -> 
     return rows
 
 
+# Untrusted text (mail, Slack, calendar, web, people) never rides on a shell command line: each text option has
+# a sibling --NAME-file that reads UTF-8 from a file ('-' = stdin, one trailing newline stripped). Prompts write
+# that file with the write_file tool, then pass --NAME-file. The plain option stays for backwards compatibility.
+_TEXT_OPTIONS: list[str] = []
+
+
+def _text_option(target, name: str, *, required: bool = False, group: bool = True, **kw) -> None:
+    dest = target.add_mutually_exclusive_group(required=required) if group else target
+    dest.add_argument(f"--{name}", **kw)
+    dest.add_argument(f"--{name}-file", metavar="PATH", help=f"read --{name} from a UTF-8 file ('-' = stdin)")
+    if name not in _TEXT_OPTIONS:
+        _TEXT_OPTIONS.append(name)
+
+
+def _read_text_file(path: str) -> str:
+    if path == "-":
+        text = sys.stdin.buffer.read().decode("utf-8")
+    else:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    return text[:-1] if text.endswith("\n") else text
+
+
+def _load_text_files(args, parser) -> None:
+    for name in _TEXT_OPTIONS:
+        attr = name.replace("-", "_") + "_file"
+        if not hasattr(args, attr):
+            continue
+        path = getattr(args, attr)
+        delattr(args, attr)
+        if path is None:
+            continue
+        try:
+            setattr(args, name.replace("-", "_"), _read_text_file(path))
+        except (OSError, UnicodeError) as exc:
+            parser.error(f"--{name}-file {path}: {exc}")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("ask")
-    a.add_argument("--input", required=True)
+    _text_option(a, "input", required=True)
     a.add_argument("--predicate")
     a.add_argument("--choice")
     a.add_argument("--options", default="")
@@ -290,18 +327,20 @@ def main(argv=None) -> int:
     s.add_argument("--file", required=True, type=Path)
     s.add_argument("--owner", required=True)
     u = sub.add_parser("urgent", help="Score whether the owner needs to act today")
-    u.add_argument("--input", required=True)
+    _text_option(u, "input", required=True)
     i = sub.add_parser("injection", help="Score each text for possible prompt injection")
     inputs = i.add_mutually_exclusive_group(required=True)
-    inputs.add_argument("--input")
+    inputs.add_argument("--input-file", metavar="PATH",
+                        help="the text to check, from a UTF-8 file ('-' = stdin); never pass it inline")
     inputs.add_argument("--file", type=Path)
     m = sub.add_parser("match", help="Find the same matter among candidates")
     m.add_argument("--items-file", required=True, type=Path)
     m.add_argument("--candidates-file", required=True, type=Path)
     r = sub.add_parser("map-reply", help="Score which numbered items a reply answers")
-    r.add_argument("--reply", required=True)
+    _text_option(r, "reply", required=True)
     r.add_argument("--items-file", required=True, type=Path)
     args = p.parse_args(argv)
+    _load_text_files(args, p)
     if args.cmd == "status":
         result = {"key_found": bool(api_key()), "model": MODEL}
     elif args.cmd == "slack":

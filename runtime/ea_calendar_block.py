@@ -193,6 +193,44 @@ def cmd_delete(a) -> None:
     out({"status": "deleted", "key": a.key, "id": ev["id"]})
 
 
+# Untrusted text (mail, Slack, calendar, web, people) never rides on a shell command line: each text option has
+# a sibling --NAME-file that reads UTF-8 from a file ('-' = stdin, one trailing newline stripped). Prompts write
+# that file with the write_file tool, then pass --NAME-file. The plain option stays for backwards compatibility.
+_TEXT_OPTIONS: list[str] = []
+
+
+def _text_option(target, name: str, *, required: bool = False, group: bool = True, **kw) -> None:
+    dest = target.add_mutually_exclusive_group(required=required) if group else target
+    dest.add_argument(f"--{name}", **kw)
+    dest.add_argument(f"--{name}-file", metavar="PATH", help=f"read --{name} from a UTF-8 file ('-' = stdin)")
+    if name not in _TEXT_OPTIONS:
+        _TEXT_OPTIONS.append(name)
+
+
+def _read_text_file(path: str) -> str:
+    if path == "-":
+        text = sys.stdin.buffer.read().decode("utf-8")
+    else:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    return text[:-1] if text.endswith("\n") else text
+
+
+def _load_text_files(args, parser) -> None:
+    for name in _TEXT_OPTIONS:
+        attr = name.replace("-", "_") + "_file"
+        if not hasattr(args, attr):
+            continue
+        path = getattr(args, attr)
+        delattr(args, attr)
+        if path is None:
+            continue
+        try:
+            setattr(args, name.replace("-", "_"), _read_text_file(path))
+        except (OSError, UnicodeError) as exc:
+            parser.error(f"--{name}-file {path}: {exc}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -203,10 +241,10 @@ def main() -> None:
     f.add_argument("--to", default="18:00")
     c = sub.add_parser("create")
     c.add_argument("--key", required=True)
-    c.add_argument("--title", required=True)
+    _text_option(c, "title", required=True)
     c.add_argument("--start", required=True)
     c.add_argument("--end", required=True)
-    c.add_argument("--notes", default="")
+    _text_option(c, "notes", default="")
     c.add_argument("--alert", type=int, default=5)
     c.add_argument("--allow-overlap", action="store_true")
     c.add_argument("--force", action="store_true", help="ignore the daily cap")
@@ -215,6 +253,7 @@ def main() -> None:
     d = sub.add_parser("delete")
     d.add_argument("--key", required=True)
     a = p.parse_args()
+    _load_text_files(a, p)
     if not phconf.CFG["calendar"]["enabled"]:
         out({"status": "disabled"})
     try:

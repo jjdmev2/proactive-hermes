@@ -16,7 +16,8 @@
   "caps": {"max_items": 3, "max_brief_items": 5, "line_chars": 140, "message_chars": 700},
   "features": {
     "morning_brief": true, "evening_brief": true, "weekly_review": true, "mail_radar": true,
-    "slack_sweep": true, "promises": true, "resolve_first": true, "work_recap": true, "health": true
+    "slack_sweep": true, "promises": true, "resolve_first": true, "work_recap": true, "health": true,
+    "lookahead": true
   },
   "schedule": {
     "morning_brief": "0 8 * * 1-5",

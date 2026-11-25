@@ -1,12 +1,17 @@
 """Finished desk items tick their phone reminder off, and never touch reminders the desk did not create."""
 
 import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 from unittest.mock import patch
 
 try:  # `discover -s tests -t .` imports the package; plain `discover -s tests` does not.
-    from .test_desk import FakeStore, OfflineTestCase, phconf, reminders
+    from .test_desk import FakeStore, OfflineTestCase, desk, phconf, reminders
 except ImportError:
-    from test_desk import FakeStore, OfflineTestCase, phconf, reminders
+    from test_desk import FakeStore, OfflineTestCase, desk, phconf, reminders
 
 
 class CloseTestCase(OfflineTestCase):
@@ -285,3 +290,22 @@ class CloseCommandTests(CloseTestCase):
         self.assertEqual(self.close("--key", "still-open"), {"status": "disabled"})
         self.assertEqual(json.loads(self.cli(reminders, "tick")), {"status": "disabled"})
         self.bridge.assert_not_called()
+
+
+class LedgerLockTests(CloseTestCase):
+    def test_ledger_set_waits_for_whoever_holds_the_shared_actions_lock(self):
+        if not hasattr(reminders.ledger_set, "__wrapped__"):
+            self.skipTest("ea_reminders.ledger_set is not under the actions.json lock yet (see ea_desk.ledger_lock)")
+        ledger = phconf.state_dir() / reminders.LEDGER
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import ea_desk; from pathlib import Path\n"
+                "with ea_desk.ledger_lock(Path(sys.argv[2])):\n print('held', flush=True); time.sleep(1.0)")
+        holder = subprocess.Popen([sys.executable, "-c", code, str(Path(desk.__file__).parent), str(ledger)],
+                                  stdout=subprocess.PIPE, text=True, env=os.environ.copy())
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        started = time.monotonic()
+        reminders.ledger_set("k", {"reminder_status": "queued"})
+        waited = time.monotonic() - started
+        holder.stdout.close()
+        holder.wait(timeout=10)
+        self.assertGreater(waited, 0.5)
+        self.assertEqual(self.read_json(ledger)["k"]["reminder_status"], "queued")

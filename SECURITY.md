@@ -1,0 +1,25 @@
+# Security
+
+## Reporting
+
+Email **hey@heyrito.ai** with what you found and how to reproduce it. Please do not open a public issue for a security problem.
+
+## The approval model
+
+Proactive Hermes reads your mail, calendar, Slack, Linear and, with the mobile app, your phone's location. It acts on its own only where you allowed it in setup: private calendar blocks, phone reminders, alarms and leave times. Everything else waits for your yes to that exact action:
+
+- **Sending** mail or Slack, replying to offers, registering for events and accepting invites.
+- **Bookings** stop on the price screen. One yes books that exact quote; any change in price, product, time or payment method asks again. Scheduled jobs never book.
+- **Never**, even with a yes: entering or changing card details or payment methods, approving a payment in your bank app, handling passwords, deleting data.
+
+## Untrusted text
+
+Mail, Slack, calendar and web text is treated as data. The desk never follows instructions inside it and never puts it on a command line; it writes the text to a file and passes the file path. With an OpenAI key, kept mail is also scored for prompt injection and flagged to you.
+
+## Data that leaves your machine
+
+- Your Bot's model provider sees what the desk reads, as in any Hermes chat.
+- With an OpenAI key, the Decisions API receives the short inputs listed under "Privacy and safety" in the README.
+- The Hermes mobile push relay receives your device id to wake the phone for reminders.
+
+Settings, drafts and logs stay in your Hermes home, readable only by your user. There is no telemetry and no server of ours.

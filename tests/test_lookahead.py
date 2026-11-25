@@ -181,7 +181,7 @@ class ConfigTests(Base):
     def test_defaults_ship_in_phconf(self):
         d = phconf.DEFAULTS
         self.assertEqual(d["schedule"]["lookahead"], "*/30 7-22 * * *")
-        self.assertIs(d["features"]["lookahead"], True)
+        self.assertIs(d["features"]["lookahead"], False)  # opt-in through setup
         self.assertEqual(d["lookahead"]["home_places"], [])
         self.assertEqual({"calendar_account", "mail_account"} - set(d["lookahead"]), set())
 
@@ -310,7 +310,7 @@ class CheckpointTests(Base):
     def test_fired_is_not_repeated(self):
         self.flight(days=5)
         self.assertEqual(self.due_keys(self.scan()), ["la:cal:fl1"])
-        self.assertEqual(self.due_keys(self.scan(now=NOW + timedelta(minutes=10))), ["la:cal:fl1"])  # not acked yet
+        self.assertEqual(self.scan(now=NOW + timedelta(minutes=10)), {"wakeAgent": False})  # offered, not acked yet
         res = self.run_cli("fired", "--key", "la:cal:fl1", "--checkpoint", "t7d", "--outcome", "quiet")
         self.assertEqual(res["status"], "fired")
         self.assertEqual(self.scan(now=NOW + timedelta(minutes=20)), {"wakeAgent": False})
@@ -342,10 +342,12 @@ class CheckpointTests(Base):
         self.assertNotIn("morning", la.schedule("train", early))
         self.assertEqual(la.schedule("train", early + timedelta(hours=1))["morning"],
                          datetime(2026, 12, 1, 7, 30, tzinfo=BER))
-        f = la.schedule("flight", datetime(2026, 12, 1, 9, 0, tzinfo=BER))
-        self.assertEqual(f["morning"], datetime(2026, 12, 1, 6, 0, tzinfo=BER))
+        f = la.schedule("flight", datetime(2026, 12, 1, 11, 0, tzinfo=BER))
+        self.assertEqual(f["morning"], datetime(2026, 12, 1, 7, 30, tzinfo=BER))
         self.assertEqual(f["t1d"], datetime(2026, 11, 30, 19, 0, tzinfo=BER))
-        self.assertEqual(f["leave"], datetime(2026, 12, 1, 5, 0, tzinfo=BER))
+        self.assertEqual(f["leave"], datetime(2026, 12, 1, 7, 0, tzinfo=BER))
+        self.assertEqual(la.schedule("flight", datetime(2026, 12, 1, 10, 0, tzinfo=BER))["morning"],
+                         datetime(2026, 12, 1, 7, 0, tzinfo=BER))  # before 10:30: three hours before
         self.assertEqual(set(la.schedule("ticket_sale", early)), {"t7d", "t1d", "open30"})
         self.assertEqual(set(la.schedule("bill", early)), {"t14d", "t3d", "t1d"})
 
@@ -523,6 +525,156 @@ class NoiseRules(Base):
         self.assertEqual(list(la.schedule("event", start, True)), ["t1d"])
 
 
+class PersonalBase(Base):
+    """Look-ahead reads every mailbox, work and personal: himalaya rows come in next to the Gmail API mail."""
+
+    def scan_p(self, rows, unread=None, now=NOW):
+        cf, mf, pf = self.tmp / "cal.json", self.tmp / "mail.json", self.tmp / "personal.json"
+        cf.write_text(json.dumps(self.cal))
+        mf.write_text(json.dumps(self.mails))
+        pf.write_text(json.dumps({"rows": rows, "unread": unread or []}))
+        return self.run_cli("scan", "--calendar-json", cf, "--mail-json", mf, "--personal-json", pf, "--now", ts(now))
+
+    @staticmethod
+    def row(acc, mid, subject, sent, sender, folder="[Gmail]/All Mail"):
+        return {"id": f"{acc}:{mid}", "date": sent.strftime("%Y-%m-%d %H:%M+00:00"), "subject": subject,
+                "from": sender, "account": acc, "folder": folder}
+
+
+class PersonalMailTests(PersonalBase):
+    def test_ticket_in_personal_mailbox_becomes_confirmed_train(self):
+        sent = NOW - timedelta(days=1)
+        self.scan_p([self.row("home", "77", "Your tickets 29.11. Berlin – Hamburg (09:50 - 10:44)", sent, "tickets@vr.fi")])
+        row = self.state()["items"]["la:mail:home:77"]
+        self.assertEqual((row["type"], row["ownership"]), ("train", "confirmed"))
+        self.assertEqual(row["sources"], ["himalaya:home:[Gmail]/All Mail:77"])
+
+    def test_marketing_and_login_alerts_are_ignored(self):
+        sent = NOW - timedelta(days=1)
+        self.scan_p([self.row("a", "1", "Your flight search to Oslo is waiting", sent, "Offers@email.finnair.com"),
+                     self.row("b", "2", "We detected a new login", sent, "noreply@finnair.com"),
+                     self.row("b", "3", "Promotional Award Tickets", sent, "milesandsmiles@miles.example")])
+        self.assertEqual(self.state()["items"], {})
+
+    def test_registration_mail_confirms_calendar_event_and_is_not_its_own_item(self):
+        self.cal = [ev("hh", "Showdown: Spielwiese Hamburg", NOW + timedelta(days=3), location="Spielwiese Hamburg")]
+        self.scan_p([self.row("home", "6229", "You Are Registered For Spielwiese Hamburg Night City Showdown",
+                              NOW - timedelta(days=4), "noreply@melee.gg")])
+        items = self.state()["items"]
+        self.assertEqual(list(items), ["la:cal:hh"])
+        self.assertEqual(items["la:cal:hh"]["ownership"], "confirmed")
+
+    def test_generic_words_do_not_confirm_an_unrelated_event(self):
+        self.cal = [ev("x", "Showdown: Corner Hobby Shop (Berlin)", NOW + timedelta(days=3), location="Market Street 32, Berlin")]
+        self.scan_p([self.row("home", "6155", "You Are Registered For Night City Showdown", NOW - timedelta(days=4),
+                              "noreply@melee.gg")])
+        self.assertEqual(self.state()["items"]["la:cal:x"]["ownership"], "likely")
+
+    def test_configured_generic_words_do_not_confirm_either(self):
+        self.configure(**{**self.settings, "lookahead": {"generic_words": ["Spielwiese"]}})
+        self.cal = [ev("hh", "Showdown: Spielwiese Hamburg", NOW + timedelta(days=3), location="Hamburg")]
+        self.scan_p([self.row("home", "1", "You Are Registered For Spielwiese Munich", NOW - timedelta(days=4),
+                              "noreply@melee.gg")])
+        self.assertEqual(self.state()["items"]["la:cal:hh"]["ownership"], "likely")
+
+    def test_failed_mailbox_is_reported_not_hidden(self):
+        failed = {"source": "mail:work2", "error": "himalaya exit 1"}
+        self.scan_p([], unread=[failed])
+        self.assertIn(failed, self.state()["last_scan"]["sources_unread"])
+
+    def test_gmail_created_calendar_event_counts_as_booked(self):
+        self.cal = [ev("tr", "Train to Hamburg", NOW + timedelta(days=3), location="Berlin",
+                       description="This event was created from an email you received in Gmail. https://mail.google.com")]
+        self.scan_p([])
+        self.assertEqual(self.state()["items"]["la:cal:tr"]["ownership"], "confirmed")
+
+    def himalaya(self, accounts, folders=None, failing=(), envelopes=None):
+        """A fake `himalaya`: records every call and answers account, folder and envelope lists."""
+        calls = []
+        envelopes = envelopes or [{"id": "9", "date": "2026-11-24 10:00+00:00", "from": {"addr": "tickets@vr.fi"},
+                                   "subject": "Your tickets 29.11. Berlin – Hamburg (09:50 - 10:44)"}]
+
+        def fake(args, **kw):
+            calls.append(args[1:])
+            acc = args[args.index("-a") + 1] if "-a" in args else None
+            if acc in failing:
+                return subprocess.CompletedProcess(args, 1, "", "boom")
+            if args[1:3] == ["account", "list"]:
+                out = [{"name": a} for a in accounts]
+            elif args[1:3] == ["folder", "list"]:
+                out = [{"name": f} for f in (folders or {}).get(acc, ["INBOX"])]
+            else:
+                out = envelopes
+            return subprocess.CompletedProcess(args, 0, json.dumps(out), "")
+        self.live.side_effect = fake
+        return calls
+
+    def test_live_fetch_skips_configured_account_and_survives_one_failure(self):
+        self.configure(**{**self.settings, "mail": {"himalaya_accounts": ["work", "home", "other"]},
+                          "lookahead": {"skip_accounts": ["work"]}})
+        calls = self.himalaya(["work", "home", "other"], failing=["other"])
+        rows, unread = la.fetch_personal(NOW, None)
+        self.assertEqual([r["id"] for r in rows], ["home:9"])
+        self.assertEqual([u["source"] for u in unread], ["mail:other"])
+        self.assertFalse([c for c in calls if "work" in c])
+        query = next(c for c in calls if c[:2] == ["envelope", "list"] and "home" in c)[-1]
+        self.assertTrue(query.startswith("after 2026-09-26 and (from "), query)
+        self.assertIn("from vr.fi", query)
+        self.assertIn("subject registered", query)
+        self.assertIn("25", next(c for c in calls if c[:2] == ["envelope", "list"]))  # newest 25 per account
+
+    def test_skip_accounts_applies_to_configured_accounts_without_listing_them(self):
+        self.configure(**{**self.settings, "mail": {"himalaya_accounts": ["a", {"account": "b", "folders": ["INBOX"]}, "c"]},
+                          "lookahead": {"skip_accounts": ["b"]}})
+        calls = self.himalaya(["never-listed"])
+        rows, unread = la.fetch_personal(NOW, None)
+        self.assertEqual(sorted(r["account"] for r in rows), ["a", "c"])
+        self.assertEqual(unread, [])
+        self.assertNotIn(["account", "list", "-o", "json"], calls)
+        self.assertFalse([c for c in calls if "b" in c])
+
+    def test_folder_is_detected_per_account_unless_configured(self):
+        self.configure(**{**self.settings, "mail": {"himalaya_accounts": ["g", "plain", "pinned"]},
+                          "lookahead": {"folders": {"pinned": "Travel"}}})
+        calls = self.himalaya([], folders={"g": ["INBOX", "[Gmail]/All Mail"], "plain": ["INBOX", "Sent"],
+                                          "pinned": ["INBOX", "[Gmail]/All Mail"]})
+        rows, _ = la.fetch_personal(NOW, None)
+        self.assertEqual({r["account"]: r["folder"] for r in rows}, {"g": "[Gmail]/All Mail", "plain": "INBOX", "pinned": "Travel"})
+        listed = [c[c.index("-a") + 1] for c in calls if c[:2] == ["folder", "list"]]
+        self.assertEqual(sorted(listed), ["g", "plain"])  # once per account, never for a configured folder
+        self.assertEqual(len(listed), len(set(listed)))
+        sources = {r["account"]: la.mail_items([r], NOW)[0]["sources"][0] for r in rows}
+        self.assertEqual(sources["g"], "himalaya:g:[Gmail]/All Mail:9")
+        self.assertEqual(sources["pinned"], "himalaya:pinned:Travel:9")
+
+    def test_no_himalaya_means_no_personal_mailboxes_and_no_noise(self):
+        self.live.side_effect = FileNotFoundError("himalaya")
+        self.assertEqual(la.fetch_personal(NOW, None), ([], []))
+
+    def test_no_configured_accounts_reads_no_mailbox(self):
+        calls = self.himalaya(["work", "home"])  # himalaya knows accounts, but none were given to the desk
+        self.assertEqual(la.fetch_personal(NOW, None), ([], []))
+        self.assertEqual(calls, [])
+
+    def test_personal_outage_keeps_stored_items_alive(self):
+        sent = NOW - timedelta(days=1)
+        depart = (NOW + timedelta(days=2)).replace(hour=9, minute=50)
+        self.scan_p([self.row("home", "5", f"Your tickets {depart:%d.%m.} Berlin – Hamburg (09:50 - 10:44)", sent, "tickets@vr.fi")])
+        self.run_cli("fired", "--key", "la:mail:home:5", "--checkpoint", "t2d", "--outcome", "quiet")
+        later = NOW.replace(day=26, hour=19, minute=5)  # t1d, 19:00 the evening before
+        out = self.scan_p([], unread=[{"source": "mail:home", "error": "himalaya exit 1"}], now=later)
+        self.assertEqual(self.due_keys(out), ["la:mail:home:5"])
+        self.assertEqual(self.due_keys(self.scan_p([], now=later)), [])  # read fine and gone: not kept alive
+
+
+class RegistrationVenueTests(PersonalBase):
+    def test_registration_at_same_shop_does_not_confirm_other_events_there(self):
+        self.cal = [ev("pl", "Weekly League Cup", NOW + timedelta(days=6), location="Spielwiese, Market Street 15, Hamburg")]
+        self.scan_p([self.row("home", "6205", "You Are Registered For Night City Brawl - Spielwiese Hamburg",
+                              NOW - timedelta(days=5), "noreply@melee.gg")])
+        self.assertEqual(self.state()["items"]["la:cal:pl"]["ownership"], "likely")
+
+
 class JobTests(unittest.TestCase):
     def setUp(self):
         home = self.enterContext(TemporaryDirectory())
@@ -546,8 +698,8 @@ class JobTests(unittest.TestCase):
         self.assertEqual(opt("--script"), "proactive-hermes/lookahead_gate.py")
         self.assertEqual((opt("--deliver"), opt("--failure-deliver"), opt("--timezone")), ("local", "local", "Europe/Berlin"))
         self.assertEqual(opt("--name"), "Proactive · look-ahead")
-        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--skill"],
-                         ["proactive-hermes:proactive-desk", "proactive-hermes:browser-bookings"])
+        # browser-bookings is jobs.py's call (review item 1: not in a scheduled job); the desk skill always loads
+        self.assertIn("proactive-hermes:proactive-desk", [argv[i + 1] for i, a in enumerate(argv) if a == "--skill"])
         self.assertNotIn("--no-agent", argv)
         self.assertEqual(argv[argv.index("--") + 1], "*/30 7-22 * * *")
         prompt = argv[-1]
@@ -575,8 +727,7 @@ class JobTests(unittest.TestCase):
         jobs.apply(self.cfg, run=self.run)
         (edit,) = [argv for argv in self.run.calls if argv[2] == "edit"]
         self.assertEqual(edit[edit.index("--schedule") + 1], "*/15 8-20 * * *")
-        self.assertEqual([edit[i + 1] for i, a in enumerate(edit) if a == "--skill"],
-                         ["proactive-hermes:proactive-desk", "proactive-hermes:browser-bookings"])
+        self.assertIn("proactive-hermes:proactive-desk", [edit[i + 1] for i, a in enumerate(edit) if a == "--skill"])
 
     def test_not_created_without_google_or_when_the_feature_is_off(self):
         self.cfg["mail"]["gmail_api"] = False
@@ -594,3 +745,213 @@ class JobTests(unittest.TestCase):
         jobs.apply(self.cfg, run=self.run)
         self.assertTrue(self.created())
         self.assertFalse([argv for argv in self.created() if "--skill" in argv])
+
+
+# ----------------------------------------------------------------------------- review fixes (robustness)
+
+class ConcurrencyTests(Base):
+    """Item 2: scan fetches without the lock, then load-change-save under it; nothing written meanwhile is lost."""
+
+    def setUp(self):
+        super().setUp()
+        self.cal = [ev("tcg", "Card night", (NOW + timedelta(days=3)).replace(hour=11), location="Game Shop 3, Berlin"),
+                    ev("gig", "Gig", (NOW + timedelta(days=4)).replace(hour=20), location="Club Mitte, Berlin")]
+
+    def test_answer_written_during_a_slow_scan_survives(self):
+        self.scan()
+        real = la.fetch_calendar
+
+        def slow_fetch(now, fixture):  # the owner answers while the scan is still reading its sources
+            self.run_cli("answer", "--key", "la:cal:tcg", "--mode", "not-mine", "--now", ts(now))
+            return real(now, fixture)
+
+        with patch.object(la, "fetch_calendar", side_effect=slow_fetch):
+            self.scan(now=NOW + timedelta(hours=3))
+        row = self.state()["items"]["la:cal:tcg"]
+        self.assertEqual(row["status"], "dropped")
+        self.assertEqual(row["answers"][-1]["mode"], "not-mine")
+
+    def test_parallel_processes_never_lose_a_write(self):
+        self.scan()
+        env = {**os.environ, **isolated_env(self.tmp)}
+        procs = [subprocess.Popen([sys.executable, str(SCRIPT), "answer", "--key", key, "--mode", "scooter",
+                                   "--note", f"n{i}"], env=env, stdout=subprocess.PIPE, text=True)
+                 for i in range(6) for key in ("la:cal:tcg", "la:cal:gig")]
+        for p in procs:
+            p.communicate(timeout=60)
+        items = self.state()["items"]
+        self.assertEqual(len(items["la:cal:tcg"]["answers"]) + len(items["la:cal:gig"]["answers"]), 12)
+        self.assertEqual(sorted(p.name for p in self.tmp.glob("*.tmp")), [])  # no stray temp files
+
+
+class RewakeTests(Base):
+    """Item 3: a checkpoint that woke the agent is "offered"; without `fired` it re-offers after 2h, twice, then missed."""
+
+    def test_offered_then_reoffered_twice_then_missed(self):
+        self.cal = [ev("fl1", "Flight LH1331 to Stockholm", (NOW + timedelta(days=5)).replace(hour=12),
+                       location="Berlin Airport")]
+        self.assertEqual(self.due_keys(self.scan()), ["la:cal:fl1"])
+        cp = lambda: self.state()["items"]["la:cal:fl1"]["checkpoints"]["t7d"]  # noqa: E731
+        self.assertEqual((cp()["state"], cp()["offers"]), ("offered", 1))
+        self.assertEqual(self.scan(now=NOW + timedelta(minutes=20)), {"wakeAgent": False})
+        self.assertEqual(self.scan(now=NOW + timedelta(hours=1, minutes=59)), {"wakeAgent": False})
+        self.assertEqual(self.due_keys(self.scan(now=NOW + timedelta(hours=2))), ["la:cal:fl1"])
+        self.assertEqual(self.due_keys(self.scan(now=NOW + timedelta(hours=4))), ["la:cal:fl1"])
+        self.assertEqual(cp()["offers"], 3)
+        self.assertEqual(self.scan(now=NOW + timedelta(hours=6)), {"wakeAgent": False})
+        self.assertEqual(cp()["state"], "missed")
+        self.assertEqual(self.scan(now=NOW + timedelta(hours=9)), {"wakeAgent": False})
+
+    def test_leave_checkpoint_does_not_wake_every_scan(self):
+        start = (NOW + timedelta(days=1)).replace(hour=12)
+        self.cal = [ev("tr", "Train to Hamburg", start, location="Berlin Hbf")]
+        leave = start - timedelta(minutes=90)
+        self.assertEqual(self.scan(now=leave + timedelta(minutes=1))["context"]["due"][0]["checkpoint"], "leave")
+        self.assertEqual(self.scan(now=leave + timedelta(minutes=21)), {"wakeAgent": False})
+
+    def test_pending_change_wakes_once_and_again_when_moved_again(self):
+        start = (NOW + timedelta(days=5)).replace(hour=12)
+        self.cal = [ev("fl1", "Flight LH1331 to Stockholm", start, location="Berlin Airport")]
+        self.scan()
+        self.run_cli("fired", "--key", "la:cal:fl1", "--checkpoint", "t7d", "--outcome", "said")
+        self.cal = [ev("fl1", "Flight LH1331 to Stockholm", start + timedelta(hours=3), location="Berlin Airport")]
+        self.assertTrue(self.scan(now=NOW + timedelta(hours=1))["context"]["due"][0]["changed"])
+        self.assertEqual(self.scan(now=NOW + timedelta(hours=1, minutes=30)), {"wakeAgent": False})
+        self.cal = [ev("fl1", "Flight LH1331 to Stockholm", start + timedelta(hours=5), location="Berlin Airport")]
+        d = self.scan(now=NOW + timedelta(hours=1, minutes=40))["context"]["due"][0]
+        self.assertEqual((d["changed"], d["old_start"]), (True, la.iso(start)))
+
+    def test_only_shown_items_count_as_offered(self):
+        self.cal = [ev(f"e{i}", f"Gig {i}", NOW + timedelta(days=6 - i * 0.5), location="Club Mitte, Berlin")
+                    for i in range(8)]
+        shown = set(self.due_keys(self.scan()))
+        self.assertEqual(len(shown), 6)
+        rest = set(self.due_keys(self.scan(now=NOW + timedelta(minutes=30))))
+        self.assertEqual(len(rest), 2)
+        self.assertFalse(shown & rest)
+
+
+class QuietCheckpointTests(Base):
+    """Item 4: a checkpoint inside quiet hours moves to the last scan before they begin (22:30 for 23-07)."""
+
+    def test_early_train_leave_time_comes_the_evening_before(self):
+        start = datetime(2026, 12, 1, 7, 30, tzinfo=BER)
+        cps = la.schedule("train", start)
+        self.assertEqual(cps["leave"], datetime(2026, 11, 30, 22, 30, tzinfo=BER))
+        self.assertEqual(cps["t1d"], datetime(2026, 11, 30, 19, 0, tzinfo=BER))
+        self.cal = [ev("tr", "Train to Hamburg", start, location="Berlin Hbf")]
+        self.scan(now=datetime(2026, 11, 30, 19, 5, tzinfo=BER))
+        out = self.scan(now=datetime(2026, 11, 30, 22, 30, tzinfo=BER))  # the last scan before quiet hours
+        self.assertEqual(out["context"]["due"][0]["checkpoint"], "leave")
+
+    def test_early_flight_morning_and_leave_wake_once_before_quiet(self):
+        f = la.schedule("flight", datetime(2026, 12, 1, 6, 0, tzinfo=BER))  # leave 02:00, morning 03:00
+        self.assertEqual(f["leave"], datetime(2026, 11, 30, 22, 30, tzinfo=BER))
+        self.assertNotIn("morning", f)  # same slot: one wake, leave wins
+        self.assertEqual(f["t1d"], datetime(2026, 11, 30, 19, 0, tzinfo=BER))
+        self.assertTrue(all(not la.is_quiet(at) for at in f.values()))
+
+    def test_configured_quiet_hours_move_checkpoints(self):
+        self.configure(**{**self.settings, "quiet_hours": {"start": 21, "end": 9}})
+        cps = la.schedule("event", datetime(2026, 12, 1, 9, 30, tzinfo=BER))
+        self.assertEqual(cps["leave"], datetime(2026, 11, 30, 20, 30, tzinfo=BER))
+        self.assertNotIn("morning", cps)  # 07:30 also moved onto 20:30: leave wins
+        self.assertTrue(all(not la.is_quiet(at) for at in cps.values()))
+
+
+class CrossSourceDedupeTests(PersonalBase):
+    """Item 6: one booking mail is one item, whichever source or folder saw it first."""
+
+    SUBJECT = "Your booking confirmation for Hotel Alster"
+
+    def gmail_and_himalaya(self, sent):
+        self.mails = [mail("g1", self.SUBJECT, sent, sender="Booking.com <noreply@booking.com>")]
+        return self.row("home", "41", self.SUBJECT, sent.astimezone(ZoneInfo("UTC")), "noreply@booking.com")
+
+    def test_same_mail_from_gmail_api_and_himalaya_is_one_item(self):
+        sent = (NOW - timedelta(days=1)).replace(second=37)
+        out = self.scan_p([self.gmail_and_himalaya(sent)])
+        self.assertEqual(self.due_keys(out), ["la:mail:g1"])
+        row = self.state()["items"]["la:mail:g1"]
+        self.assertEqual(row["sources"], [f"gmail:{ACCOUNT}:g1", "himalaya:home:[Gmail]/All Mail:41"])
+        self.assertNotIn("la:mail:home:41", self.state()["items"])
+
+    def test_folder_fallback_keeps_the_first_key(self):
+        sent = NOW - timedelta(days=1)
+        first = self.row("home", "41", self.SUBJECT, sent, "noreply@booking.com")
+        self.scan_p([first])
+        self.run_cli("answer", "--key", "la:mail:home:41", "--mode", "not-mine")
+        inbox = self.row("home", "7", self.SUBJECT, sent, "Booking <noreply@booking.com>", folder="INBOX")
+        self.assertEqual(self.scan_p([inbox], now=NOW + timedelta(hours=3)), {"wakeAgent": False})
+        self.assertEqual(set(self.state()["items"]), {"la:mail:home:41"})
+
+    def test_message_id_matches_when_the_source_gives_one(self):
+        sent = NOW - timedelta(days=1)
+        a = {**self.row("home", "1", self.SUBJECT, sent, "noreply@booking.com"), "message_id": "<ABC@booking.com>"}
+        b = {**self.row("work", "2", self.SUBJECT + " (fwd)", sent, "me@acme.example"), "message_id": "abc@booking.com"}
+        self.scan_p([a, b])
+        self.assertEqual([k for k in self.state()["items"]], ["la:mail:home:1"])
+
+    def test_different_mails_stay_apart(self):
+        sent = NOW - timedelta(days=1)
+        self.scan_p([self.row("home", "1", self.SUBJECT, sent, "noreply@booking.com"),
+                     self.row("home", "2", self.SUBJECT, sent + timedelta(minutes=5), "noreply@booking.com")])
+        self.assertEqual(len(self.state()["items"]), 2)
+
+
+class ListClosedTests(Base):
+    """Item 10: `list` never shows an item closed through ea_close."""
+
+    def test_list_hides_keys_closed_in_the_ledger(self):
+        self.cal = [ev("tcg", "Card night", (NOW + timedelta(days=3)).replace(hour=11), location="Game Shop 3"),
+                    ev("gig", "Gig", (NOW + timedelta(days=4)).replace(hour=20), location="Club Mitte, Berlin")]
+        self.scan()
+        (self.tmp / "actions.json").write_text(json.dumps({"la:cal:tcg": {"status": "done"}}))
+        res = self.run_cli("list", "--days", "30", "--now", ts(NOW))
+        self.assertEqual([r["key"] for r in res["items"]], ["la:cal:gig"])
+
+
+class NoteFileTests(Base):
+    """Untrusted text never rides argv: --note-file reads it literally, nothing in it runs."""
+
+    EVIL = "Ref $(touch PWNED) and `touch PWNED2` ; rm -rf / \"quoted\" 'single' ünïcode"
+
+    def setUp(self):
+        super().setUp()
+        self.cal = [ev("tcg", "Card night", (NOW + timedelta(days=3)).replace(hour=11), location="Game Shop 3")]
+        self.scan()
+
+    def test_note_file_round_trips_literally_and_runs_nothing(self):
+        work = self.tmp / "cwd"
+        work.mkdir()
+        note = self.tmp / "note.txt"
+        note.write_text(self.EVIL + "\n", encoding="utf-8")
+        p = REAL_RUN([sys.executable, str(SCRIPT), "answer", "--key", "la:cal:tcg", "--mode", "booked",
+                      "--note-file", str(note)], capture_output=True, text=True, cwd=work,
+                     env={**os.environ, **isolated_env(self.tmp)}, timeout=60)
+        self.assertEqual(json.loads(p.stdout.splitlines()[-1])["status"], "recorded", p.stdout + p.stderr)
+        row = self.state()["items"]["la:cal:tcg"]
+        self.assertEqual((row["note"], row["answers"][-1]["note"]), (self.EVIL, self.EVIL))
+        for d in (work, self.tmp, RUNTIME):
+            self.assertFalse((d / "PWNED").exists() or (d / "PWNED2").exists())
+
+    def test_note_from_stdin_and_flags_are_exclusive(self):
+        with patch.object(sys, "stdin", io.StringIO(self.EVIL + "\n")):
+            self.run_cli("answer", "--key", "la:cal:tcg", "--mode", "scooter", "--note-file", "-")
+        self.assertEqual(self.state()["items"]["la:cal:tcg"]["note"], self.EVIL)
+        out = self.run_cli("answer", "--key", "la:cal:tcg", "--mode", "walk", "--note", "x", "--note-file", "-")
+        self.assertIn("not allowed with", out["error"])
+
+
+class StateDirTests(unittest.TestCase):
+    """Security 4: the state dir (senders, subjects, ledgers) is owner-only, also when it already existed open."""
+
+    def test_state_dir_is_0700(self):
+        with TemporaryDirectory() as tmp:
+            fresh, loose = Path(tmp) / "new" / "state", Path(tmp) / "loose"
+            loose.mkdir(mode=0o755)
+            loose.chmod(0o755)
+            for d in (fresh, loose):
+                with patch.dict(os.environ, {"EA_STATE_DIR": str(d)}):
+                    self.assertEqual(phconf.state_dir(), d)
+                self.assertEqual(d.stat().st_mode & 0o777, 0o700)

@@ -514,6 +514,44 @@ def _date(value):
     return _iso(value)
 
 
+# Untrusted text (mail, Slack, calendar, web, people) never rides on a shell command line: each text option has
+# a sibling --NAME-file that reads UTF-8 from a file ('-' = stdin, one trailing newline stripped). Prompts write
+# that file with the write_file tool, then pass --NAME-file. The plain option stays for backwards compatibility.
+_TEXT_OPTIONS: list[str] = []
+
+
+def _text_option(target, name: str, *, required: bool = False, group: bool = True, **kw) -> None:
+    dest = target.add_mutually_exclusive_group(required=required) if group else target
+    dest.add_argument(f"--{name}", **kw)
+    dest.add_argument(f"--{name}-file", metavar="PATH", help=f"read --{name} from a UTF-8 file ('-' = stdin)")
+    if name not in _TEXT_OPTIONS:
+        _TEXT_OPTIONS.append(name)
+
+
+def _read_text_file(path: str) -> str:
+    if path == "-":
+        text = sys.stdin.buffer.read().decode("utf-8")
+    else:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    return text[:-1] if text.endswith("\n") else text
+
+
+def _load_text_files(args, parser) -> None:
+    for name in _TEXT_OPTIONS:
+        attr = name.replace("-", "_") + "_file"
+        if not hasattr(args, attr):
+            continue
+        path = getattr(args, attr)
+        delattr(args, attr)
+        if path is None:
+            continue
+        try:
+            setattr(args, name.replace("-", "_"), _read_text_file(path))
+        except (OSError, UnicodeError) as exc:
+            parser.error(f"--{name}-file {path}: {exc}")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -527,20 +565,21 @@ def main(argv=None) -> int:
     s.add_argument("--key", required=True)
     select = s.add_mutually_exclusive_group(required=True)
     select.add_argument("--approved", action="store_true")
-    select.add_argument("--sent", metavar="REF")
-    select.add_argument("--dropped", metavar="WHY")
+    _text_option(select, "sent", group=False, metavar="REF")
+    _text_option(select, "dropped", group=False, metavar="WHY")
     sub.add_parser("list").add_argument("--open", action="store_true")
     s = sub.add_parser("probe")
     s.add_argument("--key", required=True)
     s.add_argument("--act", required=True, choices=sorted(RESOLVABLE))
-    s.add_argument("--who", required=True)
+    _text_option(s, "who", required=True)
     s.add_argument("--email")
-    s.add_argument("--terms", required=True)
-    s.add_argument("--ref", default="")
+    _text_option(s, "terms", required=True)
+    _text_option(s, "ref", default="")
     s.add_argument("--since", type=_iso)
     s.add_argument("--before", type=_date)
     s.add_argument("--no-mail", action="store_true")
     a = p.parse_args(argv)
+    _load_text_files(a, p)
     if a.cmd == "probe":
         print(_probe_json(_probe(a)))
         return 0

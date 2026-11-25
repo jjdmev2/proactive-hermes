@@ -37,8 +37,13 @@ DEFAULTS: dict = {
     # Look-ahead (ea_lookahead.py). Empty strings fall back: calendar_account -> calendar.id, mail_account ->
     # owner.work_emails[0]. home_places = regex words for where the owner lives; watch_words = title words of
     # things watched remotely (see ea_lookahead.watched_remotely); senders/keywords = {kind: [extra words]}.
+    # Mail is read from the Gmail API plus the configured himalaya accounts (mail.himalaya_accounts; none configured
+    # means none read) minus skip_accounts. folders = {account: folder}; unset, the folder is detected per scan
+    # ("[Gmail]/All Mail" if the account has it, else INBOX). generic_words = extra words too common in event titles
+    # for a "You are registered for X" mail to confirm the event.
     "lookahead": {"calendar_account": "", "mail_account": "", "home_places": [], "watch_words": [],
-                  "airport_codes": [], "senders": {}, "keywords": {}, "mail_query": ""},
+                  "airport_codes": [], "senders": {}, "keywords": {}, "mail_query": "",
+                  "skip_accounts": [], "folders": {}, "generic_words": []},
     "reminders": {"enabled": False, "per_day": 6},
     "watches": [],
     "mail": {"gmail_api": False, "himalaya_accounts": [], "noise_senders": [], "noise_subjects": []},
@@ -53,7 +58,7 @@ DEFAULTS: dict = {
     "features": {
         "morning_brief": True, "evening_brief": True, "weekly_review": True, "mail_radar": True,
         "slack_sweep": False, "promises": True, "resolve_first": True, "work_recap": False,
-        "health": True, "lookahead": True,
+        "health": True, "lookahead": False,  # look-ahead is opt-in through setup
     },
     "schedule": {
         "morning_brief": "0 8 * * 1-5",
@@ -95,9 +100,15 @@ def config_path() -> Path:
 
 
 def state_dir() -> Path:
+    """Private state (mail senders and subjects, ledgers): owner-only, 0700, also when it already existed."""
     env = os.environ.get("EA_STATE_DIR")
     d = Path(env) if env else data_dir() / "state"
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        if d.stat().st_mode & 0o077:
+            d.chmod(0o700)
+    except OSError:
+        pass  # not ours to change (e.g. a shared EA_STATE_DIR): leave it, never crash a job
     return d
 
 

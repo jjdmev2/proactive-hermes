@@ -5,12 +5,21 @@ Higher stakes = earlier first look and more checkpoints. A checkpoint wakes the 
 speaks only when it finds a gap, a change or a decision, then records the outcome with `fired`.
 Read-only on calendar and mail; private state in <state>/lookahead.json.
 
-  ea_lookahead.py scan [--calendar-json F] [--mail-json F] [--now ISO]
+  ea_lookahead.py scan [--calendar-json F] [--mail-json F] [--personal-json F] [--now ISO]
   ea_lookahead.py fired --key K --checkpoint C --outcome said|quiet
-  ea_lookahead.py answer --key K --mode walk|scooter|uber|taxi|bus|train|drive|not-mine|later|booked [--note TEXT]
+  ea_lookahead.py answer --key K --mode walk|scooter|uber|taxi|bus|train|drive|not-mine|later|booked
+                         [--note-file PATH | --note TEXT]
   ea_lookahead.py list [--days N]
 
 Every command exits 0 and prints JSON. `scan` prints {"wakeAgent": ...} as the LAST stdout line.
+Text from mail, calendar or a person goes in a file: `--note-file PATH` (UTF-8, one trailing newline stripped,
+`-` reads stdin). `--note` stays for backwards compatibility; never paste untrusted text into a command line.
+
+Waking: a due checkpoint (or a moved start) wakes the agent once and is recorded as "offered". Without `fired`
+it is offered again after 2 hours, at most twice more, then marked "missed". A checkpoint that falls in quiet
+hours moves to the last scan before quiet hours start (30 minutes before, the scan runs every 30 minutes).
+Concurrency: every command holds <state>/lookahead.lock around load-change-save (scan fetches first, without the
+lock); the state file is replaced atomically.
 
 Config (all optional, under "lookahead" in the Proactive Hermes config; nothing personal lives in code):
   calendar_account  calendar id to read (default: calendar.id, then "primary")
@@ -22,6 +31,22 @@ Config (all optional, under "lookahead" in the Proactive Hermes config; nothing 
   senders           {"train": ["bahn.de"], ...} extra sender fragments per kind (flight, stay, train, bus, event).
   keywords          {"train": ["bahn"], ...} extra regex words per kind (flight, stay, train, bus, ticket_sale, bill).
   mail_query        replace the whole Gmail booking-mail query.
+  skip_accounts     himalaya accounts NOT to read here (e.g. the account the Gmail API above already reads).
+                    Only mail.himalaya_accounts are read; with none configured no personal mailbox is read.
+  folders           {"account": "folder"} folder to search per himalaya account. Otherwise it is detected once per
+                    scan: "[Gmail]/All Mail" when the account has it, else "INBOX".
+  generic_words     extra words too common in event titles to confirm ownership from a registration mail.
+
+Mail is read from the Gmail API (calendar and booking mail, see mail_account) plus every configured himalaya
+account, searched server-side for booking senders and subjects (newest 25 per account, accounts in parallel, one
+failing account is reported in sources_unread and never hides the others). The himalaya accounts are exactly
+mail.himalaya_accounts minus skip_accounts; none configured means none read. Booking mail from them becomes items
+sourced "himalaya:<account>:<folder>:<id>". The same mail seen through two sources (Gmail API and himalaya, or two
+folders) is one item: mails are matched on Message-ID when the source gives one, else on sender address, subject
+and minute sent; the first key seen wins and later sightings keep it. A "You are registered for X" mail is not an
+item: it confirms ownership of a calendar event whose title shares a word of 4+ letters with it (never the
+location: a shop name there would confirm every event held at that shop). A calendar event created from an email
+(its description says so) counts as booked.
 Quiet hours come from the top-level quiet_hours; wall-clock logic uses the top-level timezone.
 
 A "watched remotely" event (title has a watch word, e.g. a race livestream or a watch party) is skipped
@@ -31,19 +56,27 @@ event whose title has a watch word is skipped; set home_places to keep local wat
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import os
 import re
 import subprocess
 import sys
-from datetime import date, datetime, time, timedelta, tzinfo
-from email.utils import parsedate_to_datetime
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import phconf
 
 WINDOW_DAYS = 30
 DETAIL_MAIL_DAYS = 14
 MAX_DUE = 6
+REOFFER_AFTER = timedelta(hours=2)  # an offered checkpoint the agent never marked `fired` wakes again after this
+MAX_REOFFERS = 2  # then it is "missed"
+QUIET_LEAD = timedelta(minutes=30)  # quiet-hour checkpoints move to the last scan before quiet hours (cron */30)
 MERGE_WINDOW = timedelta(hours=3)
 CLOSED = {"done", "closed", "dropped", "resolved", "cancelled"}
 MODES = ["walk", "scooter", "uber", "taxi", "bus", "train", "drive", "not-mine", "later", "booked"]
@@ -72,6 +105,24 @@ SENDERS = {
 SUBJECT_WORDS = ["booking confirmation", "itinerary", "e-ticket", "your tickets"]
 VIRTUAL = re.compile(r"meet\.google|zoom|teams|slack|huddle|discord|webex|whereby|online|virtual", re.I)
 WATCH_WORDS = r"watch party|livestream|live stream|viewing party|watch along"
+
+# Personal mailboxes (himalaya). The server-side query is built from SENDERS (plus lookahead.senders) and these
+# subject words; himalaya matches one word per pattern, and "ticket" also finds "e-ticket" and "your tickets".
+PERSONAL_DAYS = 60
+PERSONAL_SCAN = 25
+GMAIL_ALL_MAIL = "[Gmail]/All Mail"
+PERSONAL_SUBJECTS = ["ticket", "itinerary", "booking", "reservation", "registered", "lippu", "varaus"]
+BOOKING_SUBJECT = re.compile(
+    r"your tickets|lippusi|e-?ticket|booking (confirmation|confirmed|reference)|your booking|reservation|"
+    r"itinerary|boarding pass|check-?in|varausvahvistus|vahvistus|matkalippu|order confirmation|"
+    r"tilausvahvistus|registered for|registration (confirmed|complete)|trip (has been )?changed", re.I)
+MARKETING = re.compile(r"offers@|promo|newsletter|news@|comms\.|marketing|milesandsmiles|deals@|@e\.|mailing\.", re.I)
+NOT_BOOKING = re.compile(r"new login|promotional|% off|sale|discover|waiting|inspiration", re.I)
+REGISTERED = re.compile(r"registered for|registration (confirmed|complete)|ilmoittautuminen", re.I)
+# Words too common in event titles to prove that a registration mail is about this event.
+GENERIC_WORDS = {"night", "city", "showdown", "brawl", "weekly", "event", "events", "tournament", "league", "pelit",
+                 "the", "for", "and", "with", "you", "are", "registered", "your", "registration", "confirmed"}
+CREATED_FROM_MAIL = "created from an email you received in gmail"
 
 
 # --------------------------------------------------------------------------- config
@@ -135,6 +186,32 @@ def mail_query() -> str:
     return f"newer_than:60d ({' OR '.join(terms)})"
 
 
+def himalaya_accounts() -> list[str]:
+    """Accounts to read through himalaya: mail.himalaya_accounts (names or {"account": name}) minus
+    lookahead.skip_accounts. None configured means none read: the desk never reads a mailbox it was not given."""
+    raw = (phconf.CFG.get("mail") or {}).get("himalaya_accounts")
+    names = [str((a.get("account") if isinstance(a, dict) else a) or "").strip() for a in (raw if isinstance(raw, list) else [])]
+    return skipped([n for n in names if n])
+
+
+def skipped(names: list[str]) -> list[str]:
+    skip = set(_words(conf().get("skip_accounts")))
+    return [n for n in dict.fromkeys(names) if n not in skip]
+
+
+def personal_query(now: datetime) -> str:
+    """Server-side himalaya filter: recent mail from a booking sender or with a booking word in the subject."""
+    since = (now - timedelta(days=PERSONAL_DAYS)).date().isoformat()
+    senders = sorted({n for ns, _ in sender_types() for n in ns})
+    subjects = list(dict.fromkeys(PERSONAL_SUBJECTS + [w for w in SUBJECT_WORDS if re.fullmatch(r"\w+", w)]))
+    terms = [f"from {n}" for n in senders] + [f"subject {w}" for w in subjects]
+    return f"after {since} and ({' or '.join(terms)})"
+
+
+def generic_words() -> set[str]:
+    return GENERIC_WORDS | {w.lower() for w in _words(conf().get("generic_words"))}
+
+
 # --------------------------------------------------------------------------- state
 
 def _load(path: Path, default):
@@ -151,11 +228,38 @@ def load() -> dict:
     return data
 
 
+@contextmanager
+def locked(shared: bool = False):
+    """Hold <state>/lookahead.lock around a load-change-save so no writer loses another's change."""
+    with (phconf.state_dir() / "lookahead.lock").open("a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        yield
+
+
 def save(data: dict) -> None:
+    """Atomic replace through a private temp file in the same directory (never a shared fixed name)."""
     path = phconf.state_dir() / "lookahead.json"
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True))
-    tmp.replace(path)
+    with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=".lookahead.", suffix=".tmp",
+                            delete=False) as fh:
+        tmp = fh.name
+        try:
+            fh.write(json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True))
+            fh.flush()
+            os.fsync(fh.fileno())
+        except BaseException:
+            fh.close()
+            os.unlink(tmp)
+            raise
+    os.replace(tmp, path)
+
+
+def read_text_file(path: str) -> str:
+    """UTF-8 text from PATH (`-` = stdin), one trailing newline stripped: untrusted text never rides argv."""
+    raw = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    for end in ("\r\n", "\n"):
+        if raw.endswith(end):
+            return raw[:-len(end)]
+    return raw
 
 
 def closed_keys() -> set[str]:
@@ -181,6 +285,18 @@ def is_quiet(now: datetime) -> bool:
     start, end = phconf.quiet_hours()
     hour = now.astimezone(tz()).hour
     return start <= hour < end if start <= end else hour >= start or hour < end
+
+
+def before_quiet(at: datetime) -> datetime:
+    """A time inside quiet hours moves to the last scan before those quiet hours began; others stay."""
+    if not is_quiet(at):
+        return at
+    zone = tz()
+    local = at.astimezone(zone)
+    begin = datetime.combine(local.date(), time(phconf.quiet_hours()[0], 0), zone)
+    if begin > local:
+        begin -= timedelta(days=1)
+    return begin - QUIET_LEAD
 
 
 # --------------------------------------------------------------------------- classification
@@ -312,6 +428,79 @@ def fetch_calendar(now: datetime, fixture: str | None) -> list:
                           "--calendar", calendar_account()]), "items", "events")
 
 
+class NotInstalled(SourceError):
+    pass
+
+
+def _himalaya(args: list[str], timeout: int = 40) -> str:
+    try:
+        proc = subprocess.run(["himalaya", *args], capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError as e:
+        raise NotInstalled("himalaya is not installed") from e
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise SourceError(f"himalaya: {type(e).__name__}") from e
+    if proc.returncode != 0:
+        raise SourceError(f"himalaya exit {proc.returncode}: {(proc.stderr or '').strip()[-160:]}")
+    return proc.stdout
+
+
+def personal_folder(account: str) -> str:
+    """lookahead.folders[account], else detected: the Gmail all-mail folder when the account has one, else INBOX."""
+    chosen = conf().get("folders")
+    if isinstance(chosen, dict) and str(chosen.get(account) or "").strip():
+        return str(chosen[account]).strip()
+    try:
+        names = {r.get("name") for r in json.loads(_himalaya(["folder", "list", "-a", account, "-o", "json"], 30))}
+    except (SourceError, ValueError, TypeError, AttributeError):
+        return "INBOX"  # the envelope read that follows reports a mailbox that is really down
+    return GMAIL_ALL_MAIL if GMAIL_ALL_MAIL in names else "INBOX"
+
+
+def booking_like(row: dict) -> bool:
+    subject, sender = row.get("subject") or "", row.get("from") or ""
+    return bool(BOOKING_SUBJECT.search(subject)) and not MARKETING.search(sender) and not NOT_BOOKING.search(subject)
+
+
+def _read_account(account: str, query: str) -> list[dict]:
+    folder = personal_folder(account)
+    raw = _himalaya(["envelope", "list", "-a", account, "-f", folder, "-s", str(PERSONAL_SCAN), "-o", "json", query])
+    out = []
+    for r in json.loads(raw or "[]"):
+        sender = r.get("from")
+        out.append({"id": f"{account}:{r.get('id')}", "date": r.get("date"), "subject": r.get("subject") or "",
+                    "from": (sender.get("addr") if isinstance(sender, dict) else sender) or "",
+                    "account": account, "folder": folder})
+    return out
+
+
+def fetch_personal(now: datetime, fixture: str | None, skip: bool = False) -> tuple[list, list]:
+    """(rows, unread) from every personal himalaya account. Rows: id, date, from, subject, account, folder."""
+    if fixture:
+        data = _read_fixture(fixture)
+        rows = data.get("rows", []) if isinstance(data, dict) else data
+        unread = data.get("unread", []) if isinstance(data, dict) else []
+        return [r for r in rows if isinstance(r, dict) and booking_like(r)], unread
+    if skip:
+        return [], []
+    accounts = himalaya_accounts()
+    if not accounts:  # only configured mailboxes are read
+        return [], []
+    query = personal_query(now)
+    rows, unread = [], []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {acc: pool.submit(_read_account, acc, query) for acc in accounts}
+        for acc, fut in futs.items():
+            try:
+                rows += fut.result()
+            except Exception as e:  # noqa: BLE001 - one mailbox down never hides the others
+                unread.append({"source": f"mail:{acc}", "error": str(e)[:200]})
+    return [r for r in rows if booking_like(r)], unread
+
+
+def registration_words(rows: list) -> list[set[str]]:
+    return [_significant(r.get("subject") or "") for r in rows if REGISTERED.search(r.get("subject") or "")]
+
+
 def fetch_mail(fixture: str | None) -> list:
     if fixture:
         return _rows(_read_fixture(fixture), "messages", "items")
@@ -361,7 +550,8 @@ def calendar_items(events: list, now: datetime) -> list[dict]:
         out.append({
             "key": f"la:cal:{ev['id']}", "type": kind, "title": summary, "start": start, "end": end,
             "all_day": all_day, "location": location,
-            "ownership": "confirmed" if kind in TRAVEL and accepted and organizer_self else "likely",
+            "ownership": ("confirmed" if (kind in TRAVEL and accepted and organizer_self)
+                          or CREATED_FROM_MAIL in (ev.get("description") or "").lower() else "likely"),
             "sources": [f"gcal:{ev['id']}"], "needs_detail": False, "mail_ids": [],
         })
     # A routine (same title and place at least twice in the window, e.g. a weekly league night) is known
@@ -376,6 +566,63 @@ def calendar_items(events: list, now: datetime) -> list[dict]:
     return out
 
 
+def _mail_source(m: dict, gmail_account: str) -> str:
+    """Where the agent reads this mail: gmail:<label>:<id> (Gmail API) or himalaya:<account>:<folder>:<id>."""
+    account = m.get("account")
+    if not account:
+        return f"gmail:{gmail_account}:{m['id']}"
+    mid = str(m["id"])
+    mid = mid[len(account) + 1:] if mid.startswith(f"{account}:") else mid
+    return f"himalaya:{account}:{m.get('folder') or 'INBOX'}:{mid}"
+
+
+def mail_fingerprints(m: dict, sent: datetime | None) -> list[str]:
+    """Identity of one mail across sources: its Message-ID when the source gives one, plus (sender address,
+    subject, minute sent), which the Gmail API and himalaya both expose."""
+    fps = []
+    mid = next((m.get(k) for k in ("message_id", "messageId", "Message-ID", "message-id") if m.get(k)), None)
+    if mid:
+        fps.append("mid:" + str(mid).strip().strip("<>").strip().lower())
+    sender = m.get("from") or ""
+    sender = sender.get("addr") or "" if isinstance(sender, dict) else str(sender)
+    addr = (parseaddr(sender)[1] or sender).strip().lower()
+    subject = " ".join(str(m.get("subject") or "").lower().split())
+    if sent and (addr or subject):
+        fps.append(f"msg:{addr}|{subject}|{sent.astimezone(timezone.utc):%Y-%m-%dT%H:%M}")
+    return fps
+
+
+def dedupe_mail(items: list[dict]) -> list[dict]:
+    """One item per mail: a later sighting of a fingerprint already seen folds its sources into the first."""
+    out, seen = [], {}
+    for it in items:
+        first = next((seen[fp] for fp in it.get("fp") or [] if fp in seen), None)
+        if first is None:
+            out.append(it)
+            first = it
+        else:
+            first["sources"] = first["sources"] + [s for s in it["sources"] if s not in first["sources"]]
+            first["mail_ids"] = list(dict.fromkeys(first["mail_ids"] + it["mail_ids"]))
+            first["fp"] = list(dict.fromkeys(first["fp"] + it["fp"]))
+        for fp in it.get("fp") or []:
+            seen.setdefault(fp, first)
+    return out
+
+
+def adopt_keys(found: list[dict], items: dict) -> None:
+    """A mail already stored under another key (other source, other folder) keeps that first key."""
+    index: dict[str, str] = {}
+    for key, row in items.items():
+        for fp in row.get("fp") or []:
+            index.setdefault(fp, key)
+    for it in found:
+        for fp in it.get("fp") or []:
+            known = index.get(fp)
+            if known and known != it["key"] and known.startswith("la:mail:"):
+                it["key"] = known
+                break
+
+
 def mail_items(mails: list, now: datetime) -> list[dict]:
     out = []
     account = mail_account()
@@ -384,8 +631,8 @@ def mail_items(mails: list, now: datetime) -> list[dict]:
             continue
         sent = mail_datetime(m.get("date"))
         subject, sender = m.get("subject") or "", m.get("from") or ""
-        base = {"key": f"la:mail:{m['id']}", "sources": [f"gmail:{account}:{m['id']}"], "mail_ids": [m["id"]],
-                "all_day": False}
+        base = {"key": f"la:mail:{m['id']}", "sources": [_mail_source(m, account)], "mail_ids": [m["id"]],
+                "all_day": False, "fp": mail_fingerprints(m, sent)}
         trip = parse_trip_subject(subject, sent) if sent else None
         if trip:
             if trip["depart"] <= now:
@@ -406,6 +653,11 @@ def mail_items(mails: list, now: datetime) -> list[dict]:
 
 def _words_of(*texts: str) -> set[str]:
     return {w for t in texts for w in re.findall(r"[^\W\d_]{3,}", (t or "").lower())}
+
+
+def _significant(*texts: str) -> set[str]:
+    """Words of 4+ letters that are not too generic to identify an event."""
+    return {w for w in _words_of(*texts) if len(w) >= 4 and w not in generic_words()}
 
 
 def merge(cal: list[dict], mail: list[dict]) -> tuple[list[dict], dict[str, str]]:
@@ -463,7 +715,19 @@ def schedule(kind: str, start: datetime, recurring: bool = False) -> dict[str, d
         cps = {"t14d": off(days=14), "t3d": off(days=3), "t1d": t1d}
     else:
         cps = {}
-    return {k: v for k, v in cps.items() if v < start}  # a checkpoint at or after start can never be due
+    cps = {k: v for k, v in cps.items() if v < start}  # a checkpoint at or after start can never be due
+    # Quiet hours: move to the last scan before they begin. Two moved checkpoints landing on one slot wake once:
+    # "leave" wins, else the one originally closer to the start.
+    out: dict[str, datetime] = {}
+    slot_of: dict[datetime, str] = {}
+    for name, at in sorted(cps.items(), key=lambda kv: (kv[0] == "leave", kv[1])):
+        moved = before_quiet(at)
+        if moved != at:
+            if moved in slot_of:
+                out.pop(slot_of[moved], None)
+            slot_of[moved] = name
+        out[name] = moved
+    return out
 
 
 def reschedule(row: dict, now: datetime) -> None:
@@ -495,15 +759,42 @@ def pick_due(row: dict, now: datetime) -> str | None:
         return None
     latest_at, latest = past[-1]
     for at, name in past[:-1]:
-        if row["checkpoints"][name]["state"] == "pending":
-            row["checkpoints"][name]["state"] = "skipped"
+        older = row["checkpoints"][name]
+        if older["state"] == "pending":
+            older["state"] = "skipped"
+        elif older["state"] == "offered":  # woke the agent, never marked fired, now superseded
+            older.update(state="missed", missed_at=iso(at))
     cp = row["checkpoints"][latest]
-    if cp["state"] != "pending":
+    if cp["state"] not in ("pending", "offered"):
         return None
     if later and latest_at < later:  # "later": quiet until the next checkpoint
         cp["state"] = "skipped"
         return None
     return latest
+
+
+OFFER_FIELDS = ("state", "offered_at", "offers", "missed_at")
+
+
+def wants_wake(rec: dict, now: datetime) -> bool:
+    """Should this checkpoint (or pending change) wake the agent now? Once offered, it waits REOFFER_AFTER for
+    `fired`; after MAX_REOFFERS more offers it becomes "missed" and stays quiet."""
+    state = rec.get("state") or "pending"
+    if state == "pending":
+        return True
+    if state != "offered":
+        return False
+    last = parse_dt(rec.get("offered_at"))
+    if last and now - last < REOFFER_AFTER:
+        return False
+    if int(rec.get("offers") or 1) > MAX_REOFFERS:
+        rec.update(state="missed", missed_at=iso(now))
+        return False
+    return True
+
+
+def mark_offered(rec: dict, now: datetime) -> None:
+    rec.update(state="offered", offered_at=iso(now), offers=int(rec.get("offers") or 0) + 1)
 
 
 def next_checkpoint(row: dict, now: datetime) -> dict | None:
@@ -554,11 +845,15 @@ def _prune(items: dict, now: datetime) -> None:
             del items[key]
 
 
-def cmd_scan(a, now: datetime) -> dict:
-    if is_quiet(now):
-        return {"wakeAgent": False}
-    data = load()
-    items = data["items"]
+def _himalaya_account(row: dict) -> str | None:
+    for src in row.get("sources") or []:
+        if str(src).startswith("himalaya:"):
+            return str(src).split(":", 2)[1]
+    return None
+
+
+def _fetch(a, now: datetime) -> dict:
+    """Read every source (slow, network): runs before the state lock is taken."""
     unread, read_ok = [], {"calendar": True, "mail": True}
     account = mail_account()
     try:
@@ -571,9 +866,36 @@ def cmd_scan(a, now: datetime) -> dict:
     except SourceError as e:
         mail, read_ok["mail"] = [], False
         unread.append({"source": f"mail:{account}", "error": str(e)})
-    unread.append({"source": "mail:other accounts", "error": f"not read (only the connected Google account, {account})"})
+    # personal mailboxes; fixtures for calendar or Gmail mail mean an offline run, so no live personal read
+    fixtures = bool(a.calendar_json or a.mail_json)
+    personal, p_unread = fetch_personal(now, getattr(a, "personal_json", None), skip=fixtures)
+    unread += p_unread
+    regs = registration_words(personal)  # "You are registered for X" is not an item: it confirms the event
+    mail = dedupe_mail(mail + mail_items([r for r in personal if not REGISTERED.search(r.get("subject") or "")], now))
+    return {"cal": cal, "mail": mail, "regs": regs, "unread": unread, "p_unread": p_unread, "read_ok": read_ok}
 
-    found, merged_into = merge(cal, mail)
+
+def cmd_scan(a, now: datetime) -> dict:
+    if is_quiet(now):
+        return {"wakeAgent": False}
+    got = _fetch(a, now)
+    with locked():
+        data = load()
+        res = _scan_state(data, got, now)
+        save(data)
+    return res
+
+
+def _scan_state(data: dict, got: dict, now: datetime) -> dict:
+    items = data["items"]
+    unread, p_unread, read_ok, regs = got["unread"], got["p_unread"], got["read_ok"], got["regs"]
+    adopt_keys(got["mail"], items)
+    found, merged_into = merge(got["cal"], got["mail"])
+    for it in found:
+        if it["key"].startswith("la:cal:") and it["ownership"] != "confirmed":
+            # title only: a shop name in the location would confirm every event held at that shop
+            if any(_significant(it["title"]) & r for r in regs):
+                it["ownership"] = "confirmed"
     closed = closed_keys()
     for mk, ck in merged_into.items():
         if mk in items and items[mk].get("status") == "open":
@@ -588,6 +910,9 @@ def cmd_scan(a, now: datetime) -> dict:
         new = parse_dt(row["start"])
         if prev and old and new and old != new:
             pc = row.get("pending_change") or {"old_start": prev["start"]}
+            if pc.get("new_start") != row["start"]:  # moved again: a new reason to speak
+                for f in OFFER_FIELDS:
+                    pc.pop(f, None)
             pc["new_start"] = row["start"]
             row["pending_change"] = pc
             if parse_dt(pc["old_start"]) == new:  # moved back to where it was: nothing to say
@@ -597,28 +922,51 @@ def cmd_scan(a, now: datetime) -> dict:
         items[key] = row
         live.add(key)
     # a source that could not be read keeps its stored items alive, so an outage never silences a leave-time
+    down = {u["source"].split(":", 1)[1] for u in p_unread if str(u.get("source", "")).startswith("mail:")}
     for key, row in items.items():
-        src = "calendar" if key.startswith("la:cal:") else "mail"
-        if key not in live and not read_ok[src] and row.get("status") == "open" and key not in closed:
+        if key in live or row.get("status") != "open" or key in closed:
+            continue
+        acc = _himalaya_account(row)
+        if acc:  # personal mail: down when its account could not be read
+            if acc in down:
+                live.add(key)
+        elif not read_ok["calendar" if key.startswith("la:cal:") else "mail"]:
             live.add(key)
 
-    due = []
+    wake = []
     for key in live:
         row = items[key]
         cp = pick_due(row, now)
-        if cp or row.get("pending_change"):
-            due.append(_entry(row, cp))
-    due.sort(key=lambda e: (e["start"] is None, parse_dt(e["start"]) or now, e["key"]))
+        cp_wake = bool(cp) and wants_wake(row["checkpoints"][cp], now)
+        pc = row.get("pending_change")
+        pc_wake = bool(pc) and wants_wake(pc, now)
+        if cp_wake or pc_wake:
+            wake.append((row, cp if cp_wake else None, pc_wake))
+    wake.sort(key=lambda w: (w[0].get("start") is None, parse_dt(w[0].get("start")) or now, w[0]["key"]))
+    due = []
+    for row, cp, pc_wake in wake[:MAX_DUE]:  # only what is shown counts as offered
+        if cp:
+            mark_offered(row["checkpoints"][cp], now)
+        if pc_wake:
+            mark_offered(row["pending_change"], now)
+        due.append(_entry(row, cp))
     _prune(items, now)
     data["last_scan"] = {"at": iso(now), "items": len(live), "due": len(due), "sources_unread": unread}
-    save(data)
     if not due:
         return {"wakeAgent": False}
-    return {"wakeAgent": True, "context": {"due": due[:MAX_DUE], "sources_unread": unread}}
+    return {"wakeAgent": True, "context": {"due": due, "sources_unread": unread}}
 
 
 def cmd_fired(a, now: datetime) -> dict:
-    data = load()
+    with locked():
+        data = load()
+        res = _fired(data, a, now)
+        if "error" not in res:
+            save(data)
+    return res
+
+
+def _fired(data: dict, a, now: datetime) -> dict:
     row = data["items"].get(a.key)
     if not row:
         return {"error": f"unknown key {a.key}"}
@@ -631,12 +979,21 @@ def cmd_fired(a, now: datetime) -> dict:
     else:
         cps[a.checkpoint].update(state="fired", outcome=a.outcome, fired_at=iso(now))
     row.pop("pending_change", None)  # whatever was said covered the time move
-    save(data)
     return {"status": "fired", "key": a.key, "checkpoint": a.checkpoint, "outcome": a.outcome}
 
 
 def cmd_answer(a, now: datetime) -> dict:
-    data = load()
+    if getattr(a, "note_file", None):
+        a.note = read_text_file(a.note_file)  # read before the lock: stdin may be slow
+    with locked():
+        data = load()
+        res = _answer(data, a, now)
+        if "error" not in res:
+            save(data)
+    return res
+
+
+def _answer(data: dict, a, now: datetime) -> dict:
     row = data["items"].get(a.key)
     if not row:
         return {"error": f"unknown key {a.key}"}
@@ -648,7 +1005,7 @@ def cmd_answer(a, now: datetime) -> dict:
         row.pop("pending_change", None)
     elif a.mode == "later":
         for c in row.get("checkpoints", {}).values():
-            if c.get("state") == "pending" and parse_dt(c.get("at")) and parse_dt(c["at"]) <= now:
+            if c.get("state") in ("pending", "offered") and parse_dt(c.get("at")) and parse_dt(c["at"]) <= now:
                 c["state"] = "skipped"
         nxt = next_checkpoint(row, now)
         row["later_until"] = nxt["at"] if nxt else row.get("start")
@@ -657,15 +1014,17 @@ def cmd_answer(a, now: datetime) -> dict:
         row["ownership"] = row["ownership_override"] = "confirmed"
     else:
         row["mode"] = a.mode
-    save(data)
     return {"status": "recorded", "key": a.key, "mode": a.mode, "item_status": row.get("status"),
             "later_until": row.get("later_until"), "ownership": row.get("ownership")}
 
 
 def cmd_list(a, now: datetime) -> dict:
     out = []
-    for row in load()["items"].values():
-        if row.get("status") != "open":
+    with locked(shared=True):
+        rows = load()["items"].values()
+    closed = closed_keys()  # closed through ea_close: never brought up again
+    for row in rows:
+        if row.get("status") != "open" or row.get("key") in closed:
             continue
         start = parse_dt(row.get("start"))
         if start and (start < now or start > now + timedelta(days=a.days)):
@@ -689,6 +1048,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("scan")
     s.add_argument("--calendar-json")
     s.add_argument("--mail-json")
+    s.add_argument("--personal-json", help="fixture: list of personal mail rows, or {rows, unread}")
     s.add_argument("--now", dest="now_sub")
     s = sub.add_parser("fired")
     s.add_argument("--key", required=True)
@@ -698,7 +1058,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("answer")
     s.add_argument("--key", required=True)
     s.add_argument("--mode", required=True, choices=MODES)
-    s.add_argument("--note")
+    note = s.add_mutually_exclusive_group()
+    note.add_argument("--note", help="legacy; untrusted text goes through --note-file")
+    note.add_argument("--note-file", help="read the note from this UTF-8 file ('-' = stdin)")
     s.add_argument("--now", dest="now_sub")
     s = sub.add_parser("list")
     s.add_argument("--days", type=int, default=WINDOW_DAYS)
