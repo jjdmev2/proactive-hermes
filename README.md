@@ -34,7 +34,7 @@ When it does write, small things are already done (the calendar block is in, the
 
 ## What it looks like
 
-One afternoon in the Hermes mobile app, 25 Nov 2026. The mail draft, release update, Vinted offer and meeting prep are live. The train, seat alarm and stock messages are real ones we triggered again to capture them. Last names, the map and card details are blurred.
+Real messages from the Hermes app. Private details blurred.
 
 #### Mail and work
 
