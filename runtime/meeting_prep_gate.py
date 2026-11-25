@@ -3,7 +3,8 @@
 
 Every run (cron, every 15 minutes in the day) looks at the calendar for meetings that start between
 meeting_prep.window_min and meeting_prep.window_max minutes from now (default 15 to 75) and offers each one
-once. The agent then researches each meeting (people, last threads, what the owner owes) and sends ONE short
+once. An offer the agent never closed with `done` (outcome still null; the run died or was cut short) is
+offered once more, at least 10 minutes after the first, while the meeting is still in the window. The agent then researches each meeting (people, last threads, what the owner owes) and sends ONE short
 prep line per meeting, or stays silent for routine internal ones with nothing open. The offer key is a hash of
 the event id and its start, so a moved meeting is prepped again at its new time.
 
@@ -37,6 +38,8 @@ import phconf
 HERE = Path(__file__).resolve().parent
 STATE_FILE = "meeting_prep.json"
 RETENTION = timedelta(days=14)
+REOFFER_AFTER = timedelta(minutes=10)    # an unanswered offer (outcome null) may come back once after this
+MAX_OFFERS = 2
 PLUGIN_BLOCK = "set by proactive hermes"  # marker ea_calendar_block.py puts in the notes of its private blocks
 CALENDAR_SYSTEM_DOMAINS = {"group.calendar.google.com", "resource.calendar.google.com"}
 # An address with only these characters has nothing a shell reads, so the agent may type it in a mail search.
@@ -193,6 +196,16 @@ def candidate(ev: dict) -> dict | None:
     }
 
 
+def offerable(row, now: datetime) -> bool:
+    """A meeting not offered yet, or offered once with no outcome at least REOFFER_AFTER ago."""
+    if not isinstance(row, dict):
+        return True
+    if row.get("outcome") is not None or int(row.get("offers") or 1) >= MAX_OFFERS:
+        return False
+    first = parse(row.get("at"))
+    return bool(first and now - first >= REOFFER_AFTER)
+
+
 def fetch(now: datetime, fixture: str | None) -> list[dict]:
     if fixture:
         rows = json.loads(Path(fixture).read_text(encoding="utf-8"))
@@ -221,9 +234,15 @@ def scan(now: datetime, fixture: str | None = None) -> dict:
     found = [c for _, c in sorted(found, key=lambda pair: pair[0])]
     with locked() as data:
         offered = data["offered"]
-        fresh = [c for c in found if c["key"] not in offered][:max_meetings()]
+        fresh = [c for c in found if offerable(offered.get(c["key"]), now)][:max_meetings()]
+        stamp = now.isoformat(timespec="seconds")
         for c in fresh:
-            offered[c["key"]] = {"at": now.isoformat(timespec="seconds"), "title": c["title"], "outcome": None}
+            row = offered.get(c["key"])
+            if isinstance(row, dict):     # second and last offer: the first one was never closed
+                row.update(offers=int(row.get("offers") or 1) + 1, reoffered_at=stamp)
+                c["reoffer"] = True
+            else:
+                offered[c["key"]] = {"at": stamp, "title": c["title"], "outcome": None, "offers": 1}
         cutoff = now - RETENTION
         data["offered"] = {k: v for k, v in offered.items()
                            if isinstance(v, dict) and (at := parse(v.get("at"))) and at >= cutoff}

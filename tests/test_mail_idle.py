@@ -158,15 +158,18 @@ class PokeTests(Base):
     def test_in_process_first_then_cli_fallback(self):
         self.write_registry({"id": "abcdef012345"})
         seen = []
+        live = lambda j: {"id": j, "enabled": True, "paused_at": None}
         self.assertTrue(mi.poke_radar(in_process=lambda j: seen.append(("in", j)) or True,
-                                      cli=lambda j: self.fail("cli used")))
-        self.assertTrue(mi.poke_radar(in_process=lambda j: None, cli=lambda j: seen.append(("cli", j)) or True))
+                                      cli=lambda j: self.fail("cli used"), job_state=live))
+        self.assertTrue(mi.poke_radar(in_process=lambda j: None, cli=lambda j: seen.append(("cli", j)) or True,
+                                      job_state=live))
         self.assertEqual(seen, [("in", "abcdef012345"), ("cli", "abcdef012345")])
 
     def test_no_job_no_poke_and_dry_run(self):
         self.assertFalse(mi.poke_radar(in_process=lambda j: self.fail("poked"), cli=lambda j: self.fail("poked")))
         self.write_registry({"id": "abcdef012345"})
-        self.assertTrue(mi.poke_radar(dry_run=True, in_process=lambda j: self.fail("dry"), cli=lambda j: self.fail("dry")))
+        self.assertTrue(mi.poke_radar(dry_run=True, in_process=lambda j: self.fail("dry"), cli=lambda j: self.fail("dry"),
+                                      job_state=lambda j: {"id": j, "enabled": True}))
 
     def test_cli_detached_uses_profile_home_and_defers_while_running(self):
         calls = []
@@ -387,6 +390,253 @@ class DoctorTests(Base):
             rep = ph_doctor.report()
         self.assertEqual(set(rep["mail_push"]), {"rawacct", "cmdacct", "oauth"})
         self.assertTrue(all(v.startswith(("push live", "polling only")) for v in rep["mail_push"].values()))
+
+
+class PausedRadarTests(Base):
+    """A poke must never un-pause a radar the owner paused (trigger_job sets enabled and clears paused_at)."""
+    JID = "abcdef012345"
+
+    def setUp(self):
+        super().setUp()
+        phconf.data_dir().mkdir(parents=True, exist_ok=True)
+        (phconf.data_dir() / "jobs.json").write_text(json.dumps({"mail_radar": {"id": self.JID}}))
+        self.jobs = phconf.hermes_home() / "cron" / "jobs.json"
+        self.jobs.parent.mkdir(parents=True, exist_ok=True)
+
+    def fail_poke(self, j):
+        self.fail("a paused radar was poked")
+
+    def test_paused_disabled_or_state_paused_skips_with_log(self):
+        for job in ({"id": self.JID, "enabled": False}, {"id": self.JID, "enabled": True, "paused_at": "2026-11-25T10:00"},
+                    {"id": self.JID, "enabled": True, "state": "paused"}):
+            with self.assertLogs(mi.log, "INFO") as cm:
+                self.assertFalse(mi.poke_radar(job_state=lambda j, job=job: job, in_process=self.fail_poke,
+                                               cli=self.fail_poke))
+            self.assertIn("radar paused, poke skipped", "\n".join(cm.output))
+
+    def test_unknown_or_missing_job_is_not_poked(self):
+        self.assertFalse(mi.poke_radar(job_state=lambda j: None, in_process=self.fail_poke, cli=self.fail_poke))
+        self.assertFalse(mi.poke_radar(job_state=lambda j: {}, in_process=self.fail_poke, cli=self.fail_poke))
+
+    def test_outside_hermes_reads_profile_jobs_file(self):
+        with patch.dict(sys.modules, {"cron.jobs": None}):
+            self.assertIsNone(mi.radar_job_state(self.JID))                       # no file: unknown
+            self.jobs.write_text(json.dumps({"jobs": [{"id": self.JID, "enabled": True, "paused_at": "x"}]}))
+            self.assertTrue(mi.job_paused(mi.radar_job_state(self.JID)))
+            self.assertFalse(mi.poke_radar(in_process=self.fail_poke, cli=self.fail_poke))
+            self.jobs.write_text(json.dumps([{"id": self.JID, "enabled": True, "paused_at": None}]))
+            self.assertTrue(mi.poke_radar(in_process=lambda j: True, cli=self.fail_poke))
+            self.assertEqual(mi.radar_job_state("0" * 12), {})
+
+    def test_inside_hermes_reads_job_through_cron_jobs(self):
+        import types
+        mod = types.ModuleType("cron.jobs")
+        mod.get_job = lambda j: {"id": j, "enabled": True, "paused_at": "2026-11-25T10:00"}
+        with patch.dict(sys.modules, {"cron": types.ModuleType("cron"), "cron.jobs": mod}):
+            self.assertFalse(mi.poke_radar(in_process=self.fail_poke, cli=self.fail_poke))
+            mod.get_job = lambda j: {"id": j, "enabled": True, "paused_at": None}
+            self.assertTrue(mi.poke_radar(in_process=lambda j: True, cli=self.fail_poke))
+
+
+class RecStop(threading.Event):
+    """stop.wait() records the wait and stops the worker after `limit` waits."""
+
+    def __init__(self, limit):
+        super().__init__()
+        self.waits, self.limit = [], limit
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if len(self.waits) >= self.limit:
+            self.set()
+        return self.is_set()
+
+
+class IdleConn(FakeConn):
+    def __init__(self):
+        self.untagged_responses = {"RECENT": [b"2"]}     # what SELECT left behind: the baseline, not new mail
+        self.sock = None
+
+    def noop(self):
+        self.untagged_responses.setdefault("EXISTS", []).append(b"6")
+        return "OK", [b""]
+
+
+class BackoffTests(unittest.TestCase):
+    def worker(self, connect, stop, **kw):
+        status = mi.Status(path=Path(self.enterContext(TemporaryDirectory())) / "hb.json")
+        self.deb = mi.Debouncer(lambda: True, mono=Clock(), wall=lambda: DAY)
+        return mi.Worker(mi.Account(name="secretname", host="h"), self.deb, status, stop, connect_fn=connect,
+                         backoff=(5, 300), label="acct#2", **kw)
+
+    def test_backoff_resets_only_after_a_full_idle_round(self):
+        rounds = iter([0, 0, 1, 0])      # IDLE rounds that complete before the error, per connection
+
+        def idle(conn, seconds, on_resp):
+            if conn.left <= 0:
+                raise socket.timeout("x")
+            conn.left -= 1
+
+        def connect(acct):
+            conn = IdleConn()
+            conn.left = next(rounds)
+            return conn
+
+        stop = RecStop(4)
+        with patch.object(mi, "idle_once", idle):
+            self.worker(connect, stop, rand=lambda a, b: 1.0).run()
+        self.assertEqual(stop.waits, [5, 10, 5, 10])   # SELECT alone never reset; the full round did
+
+    def test_jitter_is_plus_minus_20_percent(self):
+        seen = []
+        stop = RecStop(1)
+        w = self.worker(lambda a: (_ for _ in ()).throw(socket.timeout("x")), stop,
+                        rand=lambda a, b: seen.append((a, b)) or b)
+        w.run()
+        self.assertEqual(seen, [(0.8, 1.2)])
+        self.assertAlmostEqual(stop.waits[0], 6.0)
+
+    def test_auth_failure_waits_an_hour_and_logs_once_per_hour(self):
+        def refuse(acct):
+            raise mi.AuthError("login refused")
+
+        stop = RecStop(3)
+        with self.assertLogs(mi.log, "INFO") as cm:
+            self.worker(refuse, stop, rand=lambda a, b: 1.0, mono=lambda: 5000.0).run()
+        self.assertEqual(stop.waits, [3600, 3600, 3600])
+        refused = [l for l in cm.output if "login refused" in l]
+        self.assertEqual(len(refused), 1)
+        self.assertIn("acct#2", refused[0])
+        self.assertNotIn("secretname", "\n".join(cm.output))
+
+    def test_renew_drains_noop_responses_into_the_counter(self):
+        stop = threading.Event()
+        conns = []
+
+        def connect(acct):
+            conns.append(IdleConn())
+            return conns[-1]
+
+        calls = []
+
+        def idle(conn, seconds, on_resp):
+            calls.append(seconds)
+            if len(calls) == 2:
+                stop.set()
+
+        with patch.object(mi, "idle_once", idle):
+            self.worker(connect, stop).run()
+        self.assertEqual(calls, [mi.RENEW_S, mi.RENEW_S])
+        self.assertEqual(self.deb.sources, {"secretname"})       # EXISTS 6 after NOOP > 5 from SELECT
+        self.assertEqual(conns[0].untagged_responses, {})       # consumed, the list does not grow
+
+
+class RenewKeepaliveTests(unittest.TestCase):
+    def test_renew_every_9_minutes(self):
+        self.assertEqual(mi.RENEW_S, 540)
+        w = mi.Worker(mi.Account(name="a", host="h"), None, None, threading.Event())
+        self.assertEqual(w.renew, 540)
+
+    def test_keepalive_applied_on_connect(self):
+        calls = []
+
+        class Sock:
+            def setsockopt(self, level, opt, value):
+                calls.append((level, opt, value))
+
+            def settimeout(self, t):
+                pass
+
+        class FakeSSL:
+            def __init__(self, host, port, ssl_context=None, timeout=None):
+                self.sock, self.capabilities = Sock(), ("IMAP4REV1",)
+
+            def login(self, user, pw):
+                return "OK", [b""]
+
+            def capability(self):
+                return "OK", [b"IMAP4rev1 IDLE"]
+
+        with patch.object(mi.imaplib, "IMAP4_SSL", FakeSSL):
+            conn = mi.connect(mi.Account(name="a", host="h", _secret="pw"))
+        self.assertIn("IDLE", conn.capabilities)
+        self.assertIn((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1), calls)
+        for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 20), ("TCP_KEEPCNT", 3)):
+            if hasattr(socket, name):
+                self.assertIn((socket.IPPROTO_TCP, getattr(socket, name), value), calls)
+
+
+class DrainTests(unittest.TestCase):
+    def test_drain_feeds_counter_and_clears_only_what_it_used(self):
+        conn = SimpleNamespace(untagged_responses={"EXISTS": [b"6"], "RECENT": [b"1"], "EXPUNGE": [b"3"],
+                                                   "FLAGS": [b"(\\Seen)"]})
+        counter, seen = mi.MailCounter(5), []
+        used = mi.drain_untagged(conn, lambda t, n: seen.append((t, n, counter.feed(t, n))))
+        self.assertEqual(used, 3)
+        self.assertEqual(seen, [("EXPUNGE", 3, False), ("EXISTS", 6, True), ("RECENT", 1, True)])
+        self.assertEqual(conn.untagged_responses, {"FLAGS": [b"(\\Seen)"]})
+        self.assertEqual(mi.drain_untagged(SimpleNamespace()), 0)
+
+
+class AuthCmdTests(unittest.TestCase):
+    def test_list_runs_without_shell_and_string_keeps_sh(self):
+        seen = []
+        run = lambda argv, **k: seen.append(argv) or SimpleNamespace(returncode=0, stdout="pw\n")
+        mi.Account(name="a", host="h", auth_kind="cmd", _secret=["pass", "show", "mail box"]).password(run=run)
+        mi.Account(name="a", host="h", auth_kind="cmd", _secret="pass show mail").password(run=run)
+        self.assertEqual(seen, [["pass", "show", "mail box"], ["sh", "-c", "pass show mail"]])
+
+    def test_toml_list_form_is_kept_as_argv(self):
+        tmp = Path(self.enterContext(TemporaryDirectory()))
+        (tmp / "c.toml").write_text('[accounts.l]\nbackend.type = "imap"\nbackend.host = "h"\n'
+                                    'backend.auth.type = "password"\nbackend.auth.cmd = ["pass", "show", "a b"]\n')
+        (acct,), _ = mi.load_accounts(tmp / "c.toml")
+        self.assertEqual(acct._secret, ["pass", "show", "a b"])
+
+    def test_failed_command_is_an_auth_error(self):
+        with self.assertRaises(PermissionError):
+            mi.Account(name="a", host="h", auth_kind="cmd", _secret=["false"]).password(
+                run=lambda *a, **k: SimpleNamespace(returncode=1, stdout=""))
+
+
+class LogFileTests(unittest.TestCase):
+    def setUp(self):
+        self.tearDown()     # a gateway-start test may have attached the real file handler
+
+    def tearDown(self):
+        for h in list(mi.log.handlers):
+            if isinstance(h, mi.logging.FileHandler):
+                mi.log.removeHandler(h)
+                h.close()
+
+    def test_private_rotating_log_with_account_index(self):
+        from logging.handlers import RotatingFileHandler
+        path = Path(self.enterContext(TemporaryDirectory())) / "logs" / "push.log"
+        old = os.umask(0o022)
+        try:
+            mi._setup_file_log(path)
+        finally:
+            os.umask(old)
+        (h,) = [h for h in mi.log.handlers if isinstance(h, mi.logging.FileHandler)]
+        self.assertIsInstance(h, RotatingFileHandler)
+        self.assertEqual((h.maxBytes, h.backupCount), (1_000_000, 3))
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        stop = RecStop(1)
+        w = mi.Worker(mi.Account(name="private-name", host="h"), None,
+                      mi.Status(path=path.parent / "hb.json"), stop, label="acct#2",
+                      connect_fn=lambda a: (_ for _ in ()).throw(socket.timeout("x")))
+        w.run()
+        h.doRollover()
+        mi.log.warning("after rotation")
+        h.flush()
+        text = (path.parent / "push.log.1").read_text()
+        self.assertIn("acct#2", text)
+        self.assertNotIn("private-name", text)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)   # the new file after rotation too
+
+    def test_labels_follow_selected_order(self):
+        self.assertEqual(mi.acct_label("b", ["a", "b"]), "acct#2")
+        self.assertEqual(mi.acct_label("zz", ["a"]), "acct#?")
 
 
 if __name__ == "__main__":

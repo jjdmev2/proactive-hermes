@@ -2,9 +2,15 @@
 """Mail push: IMAP IDLE on the selected mailboxes wakes the mail radar within about a minute.
 
 It only POKES the plugin's own mail radar cron job (the job `hermes proactive setup` registered under
-the key "mail_radar"): the job's next run moves to now and its gate reads mail as usual. It never
-calls a model, never posts, never reads or stores mail content, and never logs addresses or secrets.
-Polling on the radar's schedule stays on as the safety net.
+the key "mail_radar"): the job's next run moves to now and its gate reads mail as usual. A radar the owner
+paused or disabled is never poked (a poke would un-pause it). It never calls a model, never posts, never
+reads or stores mail content, and never logs addresses, account names or secrets: the log names an account
+by its position in mail.himalaya_accounts ("acct#2"). Polling on the radar's schedule stays on as the safety net.
+
+IDLE is renewed every 9 minutes and the socket has TCP keepalive (60 s idle, 20 s interval, 3 probes), so a
+dead NAT path is noticed within minutes. Errors reconnect with jittered backoff (5 s doubling to 5 min, reset
+only after a full IDLE round); a refused login waits 1 h. Log: logs/proactive-hermes-mail-push.log (0600,
+rotated at 1 MB, 3 kept).
 
 Accounts: mail.himalaya_accounts, the himalaya accounts setup selected for the mail radar (names or
 {"account": name}). Empty means none: the desk never opens a mailbox it was not given, the same rule
@@ -27,7 +33,9 @@ import asyncio
 import imaplib
 import json
 import logging
+import logging.handlers
 import os
+import random
 import re
 import shutil
 import socket
@@ -49,8 +57,13 @@ import phconf  # noqa: E402
 
 DEBOUNCE_S = 30
 MIN_GAP_S = 120
-RENEW_S = 25 * 60           # re-IDLE well before the 29 min server limit
+RENEW_S = 9 * 60            # re-IDLE often: NAT/firewalls drop idle flows well before the 29 min server limit
 BACKOFF = (5, 300)
+AUTH_BACKOFF_S = 3600       # a refused login is not retried for an hour (and logged once per hour)
+JITTER = 0.2                # +-20% on every reconnect wait
+KEEPALIVE = {"TCP_KEEPIDLE": 60, "TCP_KEEPINTVL": 20, "TCP_KEEPCNT": 3}
+LOG_MAX_BYTES = 1_000_000
+LOG_BACKUPS = 3
 SOCK_TIMEOUT = 120
 HEARTBEAT_EVERY = 60
 STALE_AFTER_S = 10 * 60
@@ -77,6 +90,12 @@ def log_path() -> Path:
     return phconf.hermes_home() / "logs" / "proactive-hermes-mail-push.log"
 
 
+def acct_label(name: str, names: list[str] | None = None) -> str:
+    """How the log names an account: its 1-based position in mail.himalaya_accounts, never the name."""
+    names = selected_accounts() if names is None else names
+    return f"acct#{names.index(name) + 1}" if name in names else "acct#?"
+
+
 def selected_accounts(cfg: dict | None = None) -> list[str]:
     """The himalaya accounts setup selected for the mail radar. Empty = none (never all)."""
     raw = ((cfg or phconf.CFG).get("mail") or {}).get("himalaya_accounts")
@@ -100,18 +119,23 @@ class Account:
     login: str = ""
     tls: str = "tls"                     # tls | start-tls | none
     auth_kind: str = "raw"               # raw | cmd
-    _secret: str = field(default="", repr=False)
+    _secret: str | list = field(default="", repr=False)   # list = argv run without a shell
 
     def password(self, run=subprocess.run) -> str:
         if self.auth_kind == "raw":
             return self._secret
-        proc = run(["sh", "-c", self._secret], capture_output=True, text=True, timeout=30)
+        argv = [str(x) for x in self._secret] if isinstance(self._secret, list) else ["sh", "-c", self._secret]
+        proc = run(argv, capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
-            raise RuntimeError("auth command failed")
+            raise AuthError("auth command failed")
         line = (proc.stdout or "").splitlines()
         if not line or not line[0].strip():
-            raise RuntimeError("auth command printed nothing")
+            raise AuthError("auth command printed nothing")
         return line[0].strip()
+
+
+class AuthError(PermissionError):
+    """The password could not be obtained or the server refused it: retried only every AUTH_BACKOFF_S."""
 
 
 def load_accounts(path: Path | None = None, only: list[str] | None = None) -> tuple[list[Account], dict[str, str]]:
@@ -145,7 +169,7 @@ def load_accounts(path: Path | None = None, only: list[str] | None = None) -> tu
         elif isinstance(auth.get("cmd"), str) and auth["cmd"].strip():
             auth_kind, secret = "cmd", auth["cmd"]
         elif isinstance(auth.get("cmd"), list) and auth["cmd"]:
-            auth_kind, secret = "cmd", " ".join(str(x) for x in auth["cmd"])
+            auth_kind, secret = "cmd", [str(x) for x in auth["cmd"]]
         elif "keyring" in auth:
             skipped[name] = "keyring auth not supported"
             continue
@@ -320,6 +344,38 @@ def radar_job_id() -> str | None:
     return jid if isinstance(jid, str) and re.fullmatch(r"[0-9a-f]{12}", jid) else None
 
 
+def job_paused(job: dict) -> bool:
+    """A job the owner paused or disabled. trigger_job would set enabled and clear paused_at, so never poke it."""
+    return job.get("enabled") is False or bool(job.get("paused_at")) or str(job.get("state") or "") == "paused"
+
+
+def _job_from_file(job_id: str, path: Path | None = None) -> dict | None:
+    """The job row from <HERMES_HOME>/cron/jobs.json ({"jobs": [...]} or a bare list); None when unreadable."""
+    try:
+        data = json.loads((path or phconf.hermes_home() / "cron" / "jobs.json").read_text())
+    except (OSError, ValueError):
+        return None
+    rows = data.get("jobs") if isinstance(data, dict) else data
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, dict) and row.get("id") == job_id:
+            return row
+    return {}
+
+
+def radar_job_state(job_id: str) -> dict | None:
+    """The radar's cron row: in-process through cron.jobs when inside Hermes, else jobs.json. {} = not found,
+    None = unknown."""
+    try:
+        from cron.jobs import get_job
+    except Exception:
+        return _job_from_file(job_id)
+    try:
+        return get_job(job_id) or {}
+    except Exception as exc:
+        log.warning("reading the radar job failed: %s", type(exc).__name__)
+        return None
+
+
 def _trigger_in_process(job_id: str) -> bool | None:
     """True/False when cron.jobs is importable (inside Hermes), None when it is not."""
     try:
@@ -356,10 +412,20 @@ def _trigger_cli(job_id: str, popen=subprocess.Popen) -> bool | None:
 
 
 def poke_radar(*, dry_run: bool = False, job_id: str | None = None, in_process=_trigger_in_process,
-               cli=_trigger_cli) -> bool | None:
+               cli=_trigger_cli, job_state=None) -> bool | None:
     jid = job_id or radar_job_id()
     if not jid:
         log.warning("no mail radar job registered, nothing to poke")
+        return False
+    job = (job_state or radar_job_state)(jid)
+    if job is None:
+        log.warning("radar state unreadable, poke skipped")
+        return False
+    if not job:
+        log.warning("mail radar job not found, poke skipped")
+        return False
+    if job_paused(job):
+        log.info("radar paused, poke skipped")
         return False
     if dry_run:
         log.info("dry-run: would poke the mail radar")
@@ -399,6 +465,42 @@ class MailCounter:
         return False
 
 
+def drain_untagged(conn, on_resp=None) -> int:
+    """Feed EXISTS/RECENT/EXPUNGE that imaplib queued in conn.untagged_responses (after NOOP) to on_resp and
+    remove them, so the list never grows. EXPUNGE first so a later EXISTS count is compared correctly.
+    Returns how many responses were consumed."""
+    store = getattr(conn, "untagged_responses", None)
+    if not isinstance(store, dict):
+        return 0
+    used = 0
+    for typ in ("EXPUNGE", "EXISTS", "RECENT"):
+        for raw in store.pop(typ, None) or []:
+            used += 1
+            try:
+                num = int(raw.split()[0] if isinstance(raw, (bytes, str)) else raw)
+            except (TypeError, ValueError, IndexError):
+                continue
+            if on_resp is not None:
+                on_resp(typ, num)
+    return used
+
+
+def set_keepalive(sock) -> None:
+    """SO_KEEPALIVE plus Linux-style probe timing where the platform has the options."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except (OSError, AttributeError):
+        return
+    for name, value in KEEPALIVE.items():
+        opt = getattr(socket, name, None)
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except OSError:
+            pass
+
+
 def refresh_capabilities(conn) -> None:
     """Servers may advertise IDLE only after login; imaplib keeps the pre-login list."""
     try:
@@ -425,10 +527,11 @@ def connect(acct: Account) -> imaplib.IMAP4:
             conn.shutdown()
         except Exception:
             pass
-        raise PermissionError("login refused") from None
+        raise AuthError("login refused") from None
     refresh_capabilities(conn)
     if conn.sock:
         conn.sock.settimeout(SOCK_TIMEOUT)
+        set_keepalive(conn.sock)
     return conn
 
 
@@ -523,11 +626,15 @@ def idle_once(conn, seconds: float, on_resp) -> None:
 
 class Worker(threading.Thread):
     def __init__(self, acct: Account, debouncer: Debouncer, status: Status, stop: threading.Event,
-                 connect_fn=connect, renew: float = RENEW_S, backoff=BACKOFF):
-        super().__init__(name=f"mail-push:{acct.name}", daemon=True)
+                 connect_fn=connect, renew: float = RENEW_S, backoff=BACKOFF, *, label: str | None = None,
+                 auth_backoff: float = AUTH_BACKOFF_S, rand=random.uniform, mono=time.monotonic):
+        self.label = label or "acct#?"
+        super().__init__(name=f"mail-push:{self.label}", daemon=True)
         self.acct, self.debouncer, self.status, self.stop = acct, debouncer, status, stop
         self.connect_fn, self.renew, self.backoff = connect_fn, renew, backoff
+        self.auth_backoff, self.rand, self.mono = auth_backoff, rand, mono
         self.conn = None
+        self._auth_logged: float | None = None
 
     def close(self) -> None:
         conn, self.conn = self.conn, None
@@ -537,40 +644,57 @@ class Worker(threading.Thread):
             except Exception:
                 pass
 
+    def jitter(self, delay: float) -> float:
+        return delay * self.rand(1 - JITTER, 1 + JITTER)
+
     def run(self) -> None:
         delay = self.backoff[0]
-        name = self.acct.name
+        name, label = self.acct.name, self.label
         while not self.stop.is_set():
             try:
                 self.status.set(name, "connecting")
                 self.conn = self.connect_fn(self.acct)
                 if "IDLE" not in getattr(self.conn, "capabilities", ()):
                     self.status.set(name, "skipped", "NoIdleCapability")
-                    log.info("%s: server has no IDLE, polling only", name)
+                    log.info("%s: server has no IDLE, polling only", label)
                     self.close()
                     return
                 counter = MailCounter(select_inbox(self.conn))
+                drain_untagged(self.conn)   # what SELECT reported is the baseline, not new mail
                 self.status.set(name, "idle")
-                log.info("%s: idle on INBOX", name)
-                delay = self.backoff[0]
+                log.info("%s: idle on INBOX", label)
+                self._auth_logged = None
 
                 def on_resp(typ, num):
                     if counter.feed(typ, num):
                         self.status.event(name)
                         self.debouncer.event(name)
-                        log.info("%s: new mail event", name)
+                        log.info("%s: new mail event", label)
 
                 while not self.stop.is_set():
                     idle_once(self.conn, self.renew, on_resp)
                     if not self.stop.is_set():
                         self.conn.noop()
+                        drain_untagged(self.conn, on_resp)
+                    delay = self.backoff[0]   # one full IDLE round worked: the next error starts small again
+            except PermissionError as exc:
+                if self.stop.is_set():
+                    break
+                self.status.set(name, "error", type(exc).__name__)
+                now = self.mono()
+                if self._auth_logged is None or now - self._auth_logged >= self.auth_backoff:
+                    log.warning("%s: login refused, retry in %ds", label, int(self.auth_backoff))
+                    self._auth_logged = now
+                self.close()
+                self.stop.wait(self.jitter(self.auth_backoff))
             except Exception as exc:
                 if self.stop.is_set():
                     break
                 self.status.set(name, "error", type(exc).__name__)
-                log.warning("%s: %s, reconnect in %ss", name, type(exc).__name__, delay)
+                wait = self.jitter(delay)
+                log.warning("%s: %s, reconnect in %.0fs", label, type(exc).__name__, wait)
                 self.close()
-                self.stop.wait(delay)
+                self.stop.wait(wait)
                 delay = min(delay * 2, self.backoff[1])
             finally:
                 self.close()
@@ -581,14 +705,18 @@ class Worker(threading.Thread):
 
 class Service:
     def __init__(self, accounts: list[Account], skipped: dict[str, str], poke, *, status: Status | None = None,
-                 connect_fn=connect, window: tuple[int, int] | None = None, tz: ZoneInfo | None = None):
+                 connect_fn=connect, window: tuple[int, int] | None = None, tz: ZoneInfo | None = None,
+                 labels: dict[str, str] | None = None):
         tz = tz or phconf.tz()
         self.status = status or Status(tz=tz)
         self.stop = threading.Event()
         self.debouncer = Debouncer(poke, status=self.status, window=window or poke_window(), tz=tz)
         for name, reason in skipped.items():
             self.status.set(name, "skipped", reason)
-        self.workers = [Worker(a, self.debouncer, self.status, self.stop, connect_fn) for a in accounts]
+        names = [a.name for a in accounts] + [n for n in skipped if n not in {a.name for a in accounts}]
+        labels = labels or {n: f"acct#{i}" for i, n in enumerate(names, 1)}
+        self.workers = [Worker(a, self.debouncer, self.status, self.stop, connect_fn, label=labels.get(a.name))
+                        for a in accounts]
         self._last_hb = 0.0
 
     def start(self) -> None:
@@ -664,10 +792,12 @@ def _gateway_loop():
 
 
 def build_service(*, dry_run: bool = False) -> Service:
-    accounts, skipped = load_accounts(only=selected_accounts())
+    names = selected_accounts()
+    accounts, skipped = load_accounts(only=names)
     for name, reason in skipped.items():
-        log.info("%s: polling only (%s)", name, reason)
-    return Service(accounts, skipped, lambda: poke_radar(dry_run=dry_run))
+        log.info("%s: polling only (%s)", acct_label(name, names), reason)
+    return Service(accounts, skipped, lambda: poke_radar(dry_run=dry_run),
+                   labels={n: acct_label(n, names) for n in names})
 
 
 def stop_service() -> None:
@@ -725,17 +855,28 @@ def start_in_gateway(ctx, *, gateway: bool | None = None, wait_s: float = 600) -
     return "started"
 
 
-def _setup_file_log() -> None:
+class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler whose files are created owner-only (0600) from the first byte, rotations included."""
+
+    def _open(self):
+        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        return os.fdopen(fd, "a", encoding=self.encoding, errors=getattr(self, "errors", None))
+
+
+def _setup_file_log(path: Path | None = None) -> None:
     try:
-        path = log_path()
+        path = path or log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         if any(isinstance(h, logging.FileHandler) for h in log.handlers):
             return
-        handler = logging.FileHandler(path)
+        handler = PrivateRotatingFileHandler(path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         log.addHandler(handler)
         log.setLevel(logging.INFO)
-        os.chmod(path, 0o600)
     except OSError:
         pass
 

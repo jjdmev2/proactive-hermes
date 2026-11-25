@@ -63,6 +63,27 @@ class GateTests(GateBase):
         self.assertTrue(out["wakeAgent"])
         m = out["context"]["meetings"][0]
         self.assertEqual((m["title"], m["external"], m["daily"]), ("Pilot review", ["partner.example"], False))
+        g.done(m["key"], "said")
+        self.assertEqual(self.run_gate(evs, NOW + timedelta(minutes=15)), {"wakeAgent": False})
+
+    def test_unanswered_offer_comes_back_once_after_10_minutes(self):
+        evs = [ev("a", "Client call", 50, [ME, {"email": "sam@partner.example"}])]
+        self.assertTrue(self.run_gate(evs)["wakeAgent"])
+        self.assertEqual(self.run_gate(evs, NOW + timedelta(minutes=9)), {"wakeAgent": False})   # too soon
+        (m,) = self.run_gate(evs, NOW + timedelta(minutes=15))["context"]["meetings"]
+        self.assertTrue(m["reoffer"])
+        self.assertEqual(self.run_gate(evs, NOW + timedelta(minutes=30)), {"wakeAgent": False})  # at most once more
+        row = next(iter(json.loads((self.tmp / "meeting_prep.json").read_text())["offered"].values()))
+        self.assertEqual((row["offers"], row["outcome"]), (2, None))
+
+    def test_unanswered_offer_is_not_repeated_once_the_meeting_left_the_window(self):
+        evs = [ev("a", "Client call", 20, [ME, {"email": "sam@partner.example"}])]
+        self.assertTrue(self.run_gate(evs)["wakeAgent"])
+        self.assertEqual(self.run_gate(evs, NOW + timedelta(minutes=11)), {"wakeAgent": False})  # starts in 9 min
+
+    def test_quiet_outcome_is_never_reoffered(self):
+        evs = [ev("a", "Client call", 50, [ME, {"email": "sam@partner.example"}])]
+        g.done(self.run_gate(evs)["context"]["meetings"][0]["key"], "quiet")
         self.assertEqual(self.run_gate(evs, NOW + timedelta(minutes=15)), {"wakeAgent": False})
 
     def test_window_edges(self):

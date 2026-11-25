@@ -34,7 +34,7 @@ When it does write, small things are already done (the calendar block is in, the
 
 ## What it looks like
 
-One afternoon on our own phone, 25 Nov 2026. The mail, release update, Vinted offer and meeting prep happened live; the train, seat alarm and stock hit replay real watches for the camera. Last names, the map and card details are blurred.
+One afternoon in the Hermes mobile app, 25 Nov 2026. The mail draft, release update, Vinted offer and meeting prep are live. The train, seat alarm and stock messages are real ones we triggered again to capture them. Last names, the map and card details are blurred.
 
 #### Mail and work
 
@@ -50,7 +50,7 @@ One afternoon on our own phone, 25 Nov 2026. The mail, release update, Vinted of
 <table>
 <tr>
 <td width="50%" valign="top"><img src="docs/assets/screens/03-train-uber-leave.png" alt="Train blocked on the calendar, walk time from your phone, an Uber quote, then the reminder to leave." width="100%" /><br /><sub>Train blocked on the calendar, walk time from your phone, an Uber quote, then the reminder to leave.</sub></td>
-<td width="50%" valign="top"><img src="docs/assets/screens/04-quote-in-app.png" alt="Tap it: the quote with Uber's own screen. Nothing is booked until you say yes." width="100%" /><br /><sub>Tap it: the quote with Uber's own screen. Nothing is booked until you say yes.</sub></td>
+<td width="50%" valign="top"><img src="docs/assets/screens/04-quote-in-app.png" alt="Tapping it opens the quote with Uber's own screen. Nothing is booked until you say yes." width="100%" /><br /><sub>Tapping it opens the quote with Uber's own screen. Nothing is booked until you say yes.</sub></td>
 </tr>
 </table>
 
@@ -70,7 +70,7 @@ These all happened on our own desk.
 | Situation | What Hermes did |
 | :--- | :--- |
 | **A train ticket home** | The booking mail arrived. Hermes blocked the trip on the calendar and sent the time to leave, based on your phone's location, with a 10 minute buffer (Hermes mobile app with location access required). |
-| **A conference spot opened** | A watch was checking the registration page every few minutes. When a seat freed up it set a phone alarm that rings through Focus, so it could not be missed, and had the registration ready. |
+| **A conference spot opened** | A watch was checking the registration page every few minutes. When a seat freed up it sent a message, set a phone alarm that rings through Focus, and had the registration ready. |
 | **A buyer made an offer** | A marketplace offer came in below the asking price. Hermes reported it with a suggested counter, and on "yes" answered the buyer in the app. |
 | **A promise to a partner** | The owner had promised a list of questions "over the weekend". A teammate posted the list in Slack on Monday. Hermes connected the two, drafted the email in the right thread, and sent it after "yes". |
 | **A meeting moved** | A client proposed a new time. Hermes checked the calendar, said it was free, and accepted on "yes". |
@@ -187,7 +187,7 @@ To uninstall completely: `hermes proactive remove`, then `hermes plugins remove 
      6. small things done, the rest after your yes
 ```
 
-1. **Wake up.** Each job runs on its schedule. A small script runs first and checks whether anything changed since last time (new mail, call notes posted). Nothing new means no agent run. New mail also wakes the mail radar as soon as your mail server announces it (iCloud right away, Gmail usually within 1 to 3 minutes): the desk keeps an IMAP IDLE connection open to each mailbox you picked, so it needs no public URL. Polling on the schedule stays on as the safety net.
+1. **Wake up.** Each job runs on its schedule. A small script runs first and checks whether anything changed since last time (new mail, call notes posted). Nothing new means no agent run. New mail also wakes the mail radar as soon as your mail server announces it (iCloud right away, Gmail usually within 1 to 3 minutes): Hermes keeps an IMAP IDLE connection open, inside its own gateway, to each mailbox you picked for the radar in setup, so it needs no public URL and no extra step. Gmail connected only through Google's API (no IMAP login) stays on the 15 minute schedule; `doctor` shows which mailboxes have push. Polling on the schedule stays on as the safety net.
 2. **Filter.** With an OpenAI key, the decision model scores each new mail from its sender, subject and the start of the body. Clear noise is dropped and logged, so the agent never spends time on it.
 3. **Read and pick.** The desk agent reads what is left and writes candidate items: a decision you must make, an action you must take, or a digest line. Anything else is left out.
 4. **Resolve.** If an item needs you to send, reply, intro, book or decide, the agent searches mail, Slack, past chats and its own records first. It stores a draft with a source for every fact.
@@ -248,13 +248,13 @@ The cut-off is 0.10, so the filter only removes mail it is close to certain abou
 | **Drafts before questions** | For anything you must send, reply to, book or decide, it searches first and brings a draft with sources. |
 | **Promise tracker** | Records each "I'll send it tomorrow" from your mail, Slack and chat with your exact words, and closes it only on proof. |
 | **Work recap after the daily** | Reads your team's call notes in Slack and checks each point against Linear and Slack: done, not done, Linear and Slack disagreeing, and today's focus. An evening wrap-up covers what shipped and what slipped. |
-| **Mail radar** | Checks new mail every 15 minutes and surfaces only what you must answer, pay or decide. |
+| **Mail radar** | Wakes when new mail arrives (and every 15 minutes as a safety net) and surfaces only what you must answer, pay or decide. |
 | **Briefs and close-out** | Morning brief, an evening close-out you answer by number ("1 yes, 2 tomorrow"), and a weekly review. |
-| **Meeting prep** | About an hour before each meeting, one line: who is in it, your last thread with them, what you owe, what is open, a goal and an ask. External meetings always; your team daily gets "what you owe, what is blocked, what to raise"; internal one-to-ones only when something is open. The evening close-out flags tomorrow's meetings that need a doc or numbers tonight. |
+| **Meeting prep** | About an hour before each meeting, one short message: who is in it, your last thread with them, what you owe, what is open, a goal and an ask. External meetings always get one. Your team daily gets what you owe, what is blocked and what to raise. Internal one-to-ones only when something is open. The evening close-out flags tomorrow's meetings that need a doc or numbers tonight. |
 | **Look-ahead** | Checks your upcoming plans ahead of time. It reads your calendar and the booking, ticket and registration mails in every mailbox you connect, work and personal; a ticket mail means the trip is yours, a marketing mail is ignored. The bigger the stakes, the earlier the first look: flights and longer trips from 30 days out, trains and in-town events from 7 days, ticket sales and bills ahead of their date. More checks as the day gets closer (2 days, the evening before, that morning, leave time). Each check speaks only for a gap, a change or a decision: "If the 09:50 train is yours, it lands 16 min before the start. The 09:09 lands 10:14, €15. Walking or Uber?" Weekly routines get one quiet look; races you watch on TV are skipped. |
 | **Trips and leave times** | A ticket or booking in your mail becomes a calendar block and a "leave now" reminder based on where your phone is, with a buffer. |
 | **Watches** | Your own proactive tasks: marketplaces, shops, drops, event registrations, anything with a page. Tell, remind, alarm, draft or act. |
-| **Phone reminders and alarms** | Reminders for deadlines and promises, alarms that ring through Focus for the few things that cannot wait. Reminders are retried until the phone confirms; urgent ones also get a calendar alert (see [Your phone](#your-phone)). |
+| **Phone reminders and alarms** | Reminders for deadlines and promises, alarms that ring through Focus for the few things that cannot wait. Reminders are retried until the phone confirms. iOS can deliver both minutes late, so urgent items also get a Bot Chat message and a calendar alert (see [Your phone](#your-phone)). |
 | **Private calendar blocks** | Focus blocks on your own calendar for key tasks, a few per day at most, never touching events it did not create. |
 | **Health checks** | A watchdog checks every job, the message outbox and failed deliveries, and only tells you when something needs you. |
 
@@ -264,11 +264,11 @@ Urgent items arrive as a Bot Chat message plus a calendar alert that your phone 
 
 ## Bookings (optional extra)
 
-When the look-ahead asks "walking or Uber?" and you answer "Uber", Hermes books it through the website, never on its own:
+When the look-ahead asks "walking or Uber?" and you answer "Uber", Hermes books it through the website, and only on your yes:
 
 1. It fills in the ride, train or order in its logged-in browser and stops on the price screen.
 2. You get the quote with a screenshot: product, price, pickup time and place, payment method.
-3. It books only after your "yes" to that exact quote. One yes is one booking. If the price rises more than 10% or the time moves, it asks again.
+3. It books only after your "yes" to that exact quote. One yes is one booking. If the price rises at all, or the product, time or payment method changes, it asks again.
 4. Payment approvals (bank app, Face ID) stay on your phone, on purpose.
 
 Works with sites that book on the web: Uber (m.uber.com), most rail operators, Wolt and similar. App-only services (for example Bolt rides) are out of scope; Hermes says so instead of guessing.

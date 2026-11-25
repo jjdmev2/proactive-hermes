@@ -103,6 +103,66 @@ class AddTests(PhoneBase):
         self.assertEqual(self.calls, [])
 
 
+class AcceptedFirstTests(PhoneBase):
+    """The calendar alert exists only for a request the outbox accepted, and no calendar call holds its lock."""
+
+    def test_refused_reminder_makes_no_alert(self):
+        self.configure(reminders={"enabled": True, "per_day": 1}, calendar={"enabled": True},
+                       authority={"auto": ["reminders", "alarms", "calendar_blocks"]})
+        self.assertEqual(self.add(due=self.at(hours=2), key="k1")["status"], "queued")
+        out = self.add(due=self.at(hours=2), key="k2")
+        self.assertEqual(out["status"], "refused")
+        self.assertNotIn("calendar_alert", out)
+        self.assertEqual([a[2] for a in self.alerts()], ["ea:alert:k1"])
+        self.assertEqual(self.add(due=self.at(hours=2), key="k1")["status"], "exists")   # duplicate key: no 2nd
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertNotIn("k2", self.read_json(self.tmp / reminders.OUTBOX))
+
+    def test_alarm_on_a_reminder_key_is_refused_without_alert(self):
+        self.add(due=self.at(days=3), key="k1")                       # not critical: no alert
+        out = json.loads(self.cli(reminders, "alarm", "--key", "k1", "--at", self.at(minutes=40), "--label", "Go"))
+        self.assertEqual(out["status"], "refused")
+        self.assertEqual(self.alerts(), [])
+
+    def test_tick_makes_alerts_outside_the_outbox_lock_then_records_them(self):
+        import fcntl
+        rid = self.add(due=self.at(days=2))["request_id"]
+        self.store.results[rid] = {"status": "expired"}
+        free = []
+        inner = reminders.calendar_cli.side_effect
+
+        def probe(args, texts=None):
+            with (phconf.state_dir() / (reminders.OUTBOX + ".lock")).open("a") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    free.append(True)
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+                except BlockingIOError:
+                    free.append(False)
+            return inner(args, texts)
+
+        with patch.object(reminders, "calendar_cli", side_effect=probe):
+            self.cli(reminders, "tick")
+        self.assertEqual(free, [True])
+        box = self.read_json(self.tmp / reminders.OUTBOX)
+        self.assertEqual(box["k1"]["calendar_alert"]["why"], "bridge expired")
+        self.assertEqual(box["k1"]["attempts"], 2)                     # the retry was recorded too
+
+
+class CalendarAlertsOnTests(OfflineTestCase):
+    def test_needs_calendar_blocks_auto(self):
+        base = {"calendar": {"enabled": True}, "features": {"calendar_alerts": True}}
+        auto = {**base, "authority": {"auto": ["calendar_blocks"]}}
+        ask = {**base, "authority": {"auto": [], "ask_first": ["calendar_blocks"]}}
+        never = {**base, "authority": {"auto": ["calendar_blocks"], "never": ["calendar_blocks"]}}
+        self.assertTrue(phconf.calendar_alerts_on(cfg=auto))
+        self.assertFalse(phconf.calendar_alerts_on(cfg=ask))
+        self.assertFalse(phconf.calendar_alerts_on(cfg=base))         # unlisted = ask
+        self.assertFalse(phconf.calendar_alerts_on(cfg=never))
+        self.assertFalse(phconf.calendar_alerts_on(cfg={**auto, "features": {"calendar_alerts": False}}))
+        self.assertFalse(phconf.calendar_alerts_on(cfg={**auto, "calendar": {"enabled": False}}))
+
+
 class AlarmTests(PhoneBase):
     def alarm(self, at, key="flight"):
         return json.loads(self.cli(reminders, "alarm", "--key", key, "--at", at, "--label", "Leave for the airport"))

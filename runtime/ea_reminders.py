@@ -17,12 +17,15 @@ finished in the promise, goal or action records; the same expiry rules apply to 
   ea_reminders.py status
 
 Time-critical = calendar alert. The bridge delivers only when the phone wakes the Hermes app, which can
-take minutes (an alarm that arrives after its time is refused). With a calendar connected and
-features.calendar_alerts on (the default), a reminder that is priority high or due within 12 h ALSO gets
+take minutes (an alarm that arrives after its time is refused). With a calendar connected, calendar_blocks
+in the automatic authority and features.calendar_alerts on (the default), a reminder that is priority high or due within 12 h ALSO gets
 a calendar alert (key 'ea:alert:<key>', popup at 0 min, ea_calendar_block.py alert) that the phone fires
-by itself; the phone reminder is a bonus. When a queued request expires or fails and the due time is still
-more than 2 min away, the alert is made sure of (idempotent). Alarms always get the alert; an alarm that
-expires or comes back 'already passed' is logged, never retried.
+by itself; the phone reminder is a bonus. The alert is made only after the outbox accepted the request
+(status queued), so a capped or duplicate request never leaves a stray alert. When a queued request expires
+or fails and the due time is still more than 2 min away, the alert is made sure of (idempotent). Alarms always
+get the alert; an alarm that expires or comes back 'already passed' is logged, never retried. The outbox is
+read and written only under its lock, and never held across a calendar call: tick collects the alerts it
+needs, releases the lock, makes them, then re-locks to record their ids.
 """
 from __future__ import annotations
 
@@ -430,14 +433,36 @@ def enqueue(item: dict, *, force: bool = False) -> dict:
         return {"status": "queued", "key": key, "request_id": item["request_id"]}
 
 
-def with_alert(item: dict, why: str) -> None:
-    """The calendar alert goes first: it is the part that does not depend on the phone app waking."""
-    if item["key"] in read_records(OUTBOX, {}):
-        return  # already tracked: enqueue answers 'exists' or 'refused'
-    try:
-        ensure_alert(item, why=why)
-    except Exception as exc:  # the phone path still runs
-        log({"calendar_alert_error": item["key"], "error": f"{type(exc).__name__}: {exc}"[:200]})
+def make_alerts(pending: list[tuple[dict, timedelta, str]]) -> dict[str, dict]:
+    """Create the calendar alerts for (item copy, lead, why) OUTSIDE the outbox lock, then re-lock once to
+    record what was made. Returns {key: calendar_alert} for the alerts created now."""
+    made: dict[str, dict] = {}
+    for item, lead, why in pending:
+        try:
+            res = ensure_alert(item, lead, why=why)
+        except Exception as exc:  # the phone path still runs
+            log({"calendar_alert_error": item.get("key"), "error": f"{type(exc).__name__}: {exc}"[:200]})
+            continue
+        if res is not None and item.get("calendar_alert"):
+            made[item["key"]] = item["calendar_alert"]
+    if made:
+        with state_lock(OUTBOX):
+            box = load(OUTBOX, {})
+            for key, alert in made.items():
+                if isinstance(box.get(key), dict):
+                    box[key]["calendar_alert"] = alert
+            save(OUTBOX, box)
+    return made
+
+
+def with_alert(item: dict, result: dict, why: str) -> dict:
+    """After enqueue: only a request the outbox accepted (queued) gets its calendar alert."""
+    if result.get("status") != "queued":
+        return result
+    made = make_alerts([(dict(item), timedelta(0), why)])
+    if item["key"] in made:
+        result["calendar_alert"] = made[item["key"]]
+    return result
 
 
 def add(key: str, title: str, *, due=None, due_date=None, notes="", priority="medium", force=False,
@@ -452,11 +477,9 @@ def add(key: str, title: str, *, due=None, due_date=None, notes="", priority="me
         item["required_authority"] = list(required_authority)
     if not calendar_alert:
         item["no_calendar_alert"] = True
-    elif time_critical(priority, due):
-        with_alert(item, "time-critical")
     result = enqueue(item, force=force)
-    if item.get("calendar_alert"):
-        result["calendar_alert"] = item["calendar_alert"]
+    if calendar_alert and time_critical(priority, due):
+        with_alert(item, result, "time-critical")
     return result
 
 
@@ -483,10 +506,7 @@ def cmd_alarm(a) -> int:
             result = {"status": "refused", "reason": "alarm time already passed"}
         else:
             item = {"operation": "alarms.create", "key": a.key, "at": a.at, "label": a.label}
-            with_alert(item, "alarm")
-            result = enqueue(item)
-            if item.get("calendar_alert"):
-                result["calendar_alert"] = item["calendar_alert"]
+            result = with_alert(item, enqueue(item), "alarm")
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -512,6 +532,11 @@ def cmd_adopt(a) -> int:
 
 
 def cmd_tick(_a) -> int:
+    alerts: list[tuple[dict, timedelta, str]] = []   # made after the lock is released (calendar calls are slow)
+
+    def need_alert(item: dict, why: str) -> None:
+        alerts.append((json.loads(json.dumps(item)), RESCUE_LEAD, why))
+
     with state_lock(OUTBOX):
         box = load(OUTBOX, {})
         if not any(i.get("status") in {"queued", "closing"} for i in box.values()) and not closable(box):
@@ -544,12 +569,12 @@ def cmd_tick(_a) -> int:
                             error=str(res.get("error") or status)[:200])
                 ledger_set(key, {"alarm_status": item["status"]})
                 log({"alarm_failed": key, "why": item["error"], "no_retry": True})
-                safe_alert(item, f"alarm {item['status']}")
+                need_alert(item, f"alarm {item['status']}")
             elif status == "expired" and int(item.get("attempts", 0)) < MAX_ATTEMPTS:
                 required = item.get("required_authority", ())
                 if not all(map(auto_allowed, required)):
                     continue
-                safe_alert(item, "bridge expired")  # the phone is not waking: make sure of the part that needs no app
+                need_alert(item, "bridge expired")  # the phone is not waking: make sure of the part that needs no app
                 try:
                     submit(store, box, item)
                 except Exception as exc:
@@ -560,16 +585,10 @@ def cmd_tick(_a) -> int:
                 item.update(status="failed", error=str(res.get("error") or status)[:200])
                 ledger_set(key, {f"{kind}_status": "failed"})
                 log({"failed": key, "why": item["error"], "attempts": item.get("attempts")})
-                safe_alert(item, "bridge failed")
+                need_alert(item, "bridge failed")
             save(OUTBOX, box)
+    make_alerts(alerts)
     return 0
-
-
-def safe_alert(item: dict, why: str) -> None:
-    try:
-        ensure_alert(item, RESCUE_LEAD, why=why)
-    except Exception as exc:  # never let the calendar stall the outbox
-        log({"calendar_alert_error": item.get("key"), "error": f"{type(exc).__name__}: {exc}"[:200]})
 
 
 def cmd_close(a) -> int:

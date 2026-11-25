@@ -158,11 +158,12 @@ def allowed(action: str, *, cfg: dict | None = None) -> str:
 
 def calendar_alerts_on(*, cfg: dict | None = None) -> bool:
     """Time-critical reminders and alarms also become calendar alerts the phone fires by itself.
-    On by default whenever a Google calendar is connected; off with features.calendar_alerts or a
-    'never' on calendar_blocks."""
+    On by default whenever a Google calendar is connected AND calendar_blocks is automatic authority
+    (an alert is a calendar write made without asking); off with features.calendar_alerts, or when
+    calendar_blocks is 'ask' or 'never'."""
     c = CFG if cfg is None else cfg
     return bool(c.get("calendar", {}).get("enabled") and c.get("features", {}).get("calendar_alerts", True)
-                and allowed("calendar_blocks", cfg=c) != "never")
+                and allowed("calendar_blocks", cfg=c) == "auto")
 
 
 def tz() -> ZoneInfo:
