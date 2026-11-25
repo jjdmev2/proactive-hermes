@@ -239,7 +239,7 @@ Works with sites that book on the web: Uber (m.uber.com), most rail operators, W
 
 **Connect once:** Hermes opens the site in its browser and you sign in yourself, codes included. Hermes never sees or stores your password.
 
-**Risk, plainly:** Uber's terms forbid automated access. Every ride here has a human approving it and the volume stays human, but the risk to your account is yours. To skip it, just never sign in to those sites; without a login Hermes can only quote, never book.
+**Risk, plainly:** Uber's terms forbid automated access. Every ride here has a human approving it and the volume stays human, but the risk to your account is yours. To skip it, just never sign in to those sites; without a login Hermes cannot book anything.
 
 ## Privacy and safety
 
