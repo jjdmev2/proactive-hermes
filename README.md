@@ -147,7 +147,7 @@ The mail radar checks your mail every 15 minutes. With push, new mail wakes it w
 | Level | Juan's setup | You can change it to |
 | :--- | :--- | :--- |
 | **Without asking** | Private calendar blocks, phone reminders, alarms for urgent things, leave times for trips. | Any of these, or none. Watch actions too, if you want a watch to act on its own. |
-| **Ask first** | Sending email or Slack, replying to offers, registering for events, purchases (Hermes fills the cart, you pay), bookings (Hermes stops at the price and books on your yes to that exact quote), accepting invites. | Everything not allowed above lands here. Hermes prepares it fully and asks in one line; a "yes" approves that one action. |
+| **Ask first** | Sending email or Slack, replying to offers, registering for events, purchases (Hermes fills the cart, you pay), bookings (Hermes stops at the price and books on your yes to that exact quote), accepting invites. | Everything not allowed above lands here. Hermes prepares it fully and asks in one line; a "yes" approves that one action. A block, reminder or alarm in this row is set only after your yes in chat, and that yes is logged; scheduled jobs cannot set one. |
 | **Never** | Entering or changing card details or payment methods, approving a payment in your bank app, passwords, deleting data. | These always stay with you. |
 
 ### Add your own watches

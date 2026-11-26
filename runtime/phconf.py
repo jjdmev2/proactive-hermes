@@ -158,6 +158,34 @@ def allowed(action: str, *, cfg: dict | None = None) -> str:
     return "ask"
 
 
+CRON_ENV = "HERMES_CRON_SESSION"  # Hermes stamps this on every command a scheduled (cron) run starts
+
+
+def scheduled_run() -> bool:
+    """True inside a Hermes cron run, where no owner is present to approve anything."""
+    return os.environ.get(CRON_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def authorize(action: str, approval: str = "", *, cfg: dict | None = None) -> tuple[bool, str]:
+    """The execution-boundary check every write the plugin makes on its own goes through (phone reminders and
+    alarms, calendar blocks and alerts). Returns (ok, basis):
+      (True, "auto")              the action is in the automatic authority and not in never;
+      (True, "owner_approval")    the action is ask first and `approval` carries the owner's own yes to this exact
+                                  action (their words, recorded by the caller), outside a scheduled run;
+      (False, "never" | "ask" | "approval_in_scheduled_run")  otherwise; the caller must not touch the service.
+    Never always wins, and an approval cannot come from a scheduled job."""
+    level = allowed(action, cfg=cfg)
+    if level == "auto":
+        return True, "auto"
+    if level == "never":
+        return False, "never"
+    if not (approval or "").strip():
+        return False, "ask"
+    if scheduled_run():
+        return False, "approval_in_scheduled_run"
+    return True, "owner_approval"
+
+
 def calendar_alerts_on(*, cfg: dict | None = None) -> bool:
     """Time-critical reminders and alarms also become calendar alerts the phone fires by itself.
     On by default whenever a Google calendar is connected AND calendar_blocks is automatic authority

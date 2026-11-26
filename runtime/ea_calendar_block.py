@@ -7,17 +7,22 @@ created by Proactive Hermes may be changed or deleted.
 Usage:
   ea_calendar_block.py free   --date YYYY-MM-DD [--minutes 30] [--from 09:00] [--to 18:00]
   ea_calendar_block.py create --key KEY --title T --start ISO --end ISO
-                              [--notes TEXT] [--alert 10] [--allow-overlap]
-  ea_calendar_block.py alert  --key ea:... --title T --at ISO [--notes TEXT]
+                              [--notes TEXT] [--alert 10] [--allow-overlap] [--approval-file F]
+  ea_calendar_block.py alert  --key ea:... --title T --at ISO [--notes TEXT] [--approval-file F]
                               (5 min private alert, popup at 0 min, may overlap, not in the daily cap)
   ea_calendar_block.py mine   [--days 14]
   ea_calendar_block.py delete --key KEY      (only Proactive Hermes blocks)
+
+Authority: create and alert are calendar writes made under `calendar_blocks`. Before any Google call they need
+it in the automatic authority, or (ask first only) --approval-file with the owner's own yes to that exact
+block, given in chat and never in a scheduled run (phconf.authorize). 'never' refuses every write, delete
+included. A refusal prints {"status": "not_allowed", ...}, exit 5, and creates nothing. free and mine only read.
 
 `alert` is the time-critical path: a phone that syncs this calendar fires the popup on its own,
 so it never waits for the Hermes app to wake (the mobile bridge can lag by minutes).
 
 Times without an offset use the configured timezone. Output is one JSON object on stdout.
-Exit codes: 0 ok, 2 bad input, 3 conflict (overlap), 4 Google error.
+Exit codes: 0 ok, 2 bad input, 3 conflict (overlap), 4 Google error, 5 not allowed by the configured authority.
 """
 from __future__ import annotations
 
@@ -37,6 +42,18 @@ LOG = phconf.state_dir() / "actions_log.jsonl"
 DAILY_CAP = phconf.CFG["calendar"]["blocks_per_day"]  # alerts are not counted
 ALERT_MINUTES = 5
 ALERT_TITLE_CHARS = 60
+ACTION = "calendar_blocks"   # the authority every calendar write here is made under
+
+
+def authorized(key: str, approval: str = "") -> tuple[dict | None, str]:
+    """(refusal, basis): refusal is None when the write may go ahead. Called before the Google service is built."""
+    ok, basis = phconf.authorize(ACTION, approval)
+    if not ok:
+        log({"kind": "calendar_not_allowed", "key": key, "authority": basis})
+        return {"status": "not_allowed", "action": ACTION, "authority": basis, "key": key}, basis
+    if basis == "owner_approval":
+        log({"kind": "owner_approval", "action": ACTION, "key": key, "approval": approval.strip()[:300]})
+    return None, basis
 
 
 def out(obj: dict, code: int = 0) -> None:
@@ -127,6 +144,9 @@ def cmd_create(a) -> None:
         out({"status": "error", "error": "end must be after start"}, 2)
     if not a.key.startswith("ea:"):
         out({"status": "error", "error": "key must start with 'ea:'"}, 2)
+    denied, basis = authorized(a.key, getattr(a, "approval", None) or "")
+    if denied:
+        out(denied, 5)
     svc = service()
     existing = find_mine(svc, a.key)
     if not existing and not a.force:
@@ -170,7 +190,7 @@ def cmd_create(a) -> None:
               "title": back.get("summary"), "start": back["start"].get("dateTime"),
               "end": back["end"].get("dateTime"), "visibility": back.get("visibility"),
               "calendar": back.get("organizer", {}).get("email")}
-    log({"kind": "calendar_block", **result})
+    log({"kind": "calendar_block", **result, **({"approved_by": "owner"} if basis == "owner_approval" else {})})
     out(result, 0 if ok else 4)
 
 
@@ -201,12 +221,16 @@ def alert_ok(back: dict, key: str) -> bool:
             and {"method": "popup", "minutes": 0} in (rem.get("overrides") or []))
 
 
-def make_alert(svc, key: str, title: str, at: datetime, notes: str = "") -> tuple[dict, int]:
-    """Create or update (idempotent by key) and read back. Returns (result, exit code)."""
+def make_alert(svc, key: str, title: str, at: datetime, notes: str = "", *, approval: str = "") -> tuple[dict, int]:
+    """Create or update (idempotent by key) and read back. Returns (result, exit code). Refuses (exit 5) without
+    calendar_blocks authority, before touching `svc`."""
     if not key.startswith("ea:"):
         return {"status": "error", "error": "key must start with 'ea:'"}, 2
     if not (title or "").strip():
         return {"status": "error", "error": "title is empty"}, 2
+    denied, basis = authorized(key, approval)
+    if denied:
+        return denied, 5
     body = alert_body(key, title, at, notes)
     existing = find_mine(svc, key)  # only events this plugin created
     if existing:
@@ -221,7 +245,7 @@ def make_alert(svc, key: str, title: str, at: datetime, notes: str = "") -> tupl
               "title": back.get("summary"), "start": back["start"].get("dateTime"),
               "end": back["end"].get("dateTime"), "visibility": back.get("visibility"),
               "reminders": back.get("reminders"), "calendar": back.get("organizer", {}).get("email")}
-    log({"kind": "calendar_alert", **result})
+    log({"kind": "calendar_alert", **result, **({"approved_by": "owner"} if basis == "owner_approval" else {})})
     return result, (0 if ok else 4)
 
 
@@ -232,7 +256,10 @@ def cmd_alert(a) -> None:
         out({"status": "error", "error": "--at must be an ISO date and time"}, 2)
     if not a.key.startswith("ea:"):
         out({"status": "error", "error": "key must start with 'ea:'"}, 2)
-    result, code = make_alert(service(), a.key, a.title, at, a.notes or "")
+    approval = getattr(a, "approval", None) or ""
+    if not phconf.authorize(ACTION, approval)[0]:   # before service(): a refusal never builds a Google client
+        out(authorized(a.key, approval)[0], 5)       # (make_alert checks again and logs an approval once)
+    result, code = make_alert(service(), a.key, a.title, at, a.notes or "", approval=approval)
     out(result, code)
 
 
@@ -251,6 +278,9 @@ def cmd_mine(a) -> None:
 
 
 def cmd_delete(a) -> None:
+    if phconf.allowed(ACTION) == "never":  # like ticking off a phone reminder: cleanup still honours never
+        log({"kind": "calendar_not_allowed", "key": a.key, "authority": "never"})
+        out({"status": "not_allowed", "action": ACTION, "authority": "never", "key": a.key}, 5)
     svc = service()
     ev = find_mine(svc, a.key)
     if not ev:
@@ -317,11 +347,13 @@ def main() -> None:
     c.add_argument("--alert", type=int, default=5)
     c.add_argument("--allow-overlap", action="store_true")
     c.add_argument("--force", action="store_true", help="ignore the daily cap")
+    _text_option(c, "approval", default="", help="the owner's own yes to this exact block (ask first only)")
     al = sub.add_parser("alert")
     al.add_argument("--key", required=True)
     _text_option(al, "title", required=True)
     al.add_argument("--at", required=True)
     _text_option(al, "notes", default="")
+    _text_option(al, "approval", default="", help="the owner's own yes to this exact alert (ask first only)")
     m = sub.add_parser("mine")
     m.add_argument("--days", type=int, default=14)
     d = sub.add_parser("delete")

@@ -18,6 +18,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import ea_reminders as reminders
+import ph_jobs
 import phconf
 
 PROFILE = phconf.hermes_home()
@@ -159,7 +160,9 @@ def check_jobs(jobs: list[dict]) -> None:
     except Exception:
         croniter = None
     desk = [j for j in jobs if (j.get("name") or "").startswith(DESK_PREFIXES)]
-    expected_jobs = sum(bool(enabled) for enabled in phconf.CFG["features"].values())
+    # The installer's own rule (ph_jobs, shared with jobs.apply): only flags that are jobs, and only when the
+    # connection each job needs is there, plus one job per watch.
+    expected_jobs = len(ph_jobs.expected(phconf.CFG))
     if len(desk) < expected_jobs:
         fault("desk", f"only {len(desk)} desk jobs exist, expected {expected_jobs}")
     for job in desk:

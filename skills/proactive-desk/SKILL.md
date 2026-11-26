@@ -28,6 +28,8 @@ Never send on a number alone.
 
 Desk messages often end with a ready action: "Send as is?", "Reply 1 to accept the 380 offer", "Register now?". A clear yes approves that one action exactly as shown, once. Do it with the account or app named in the item, then confirm in one line with the proof ("Sent, thread here", "Registered, confirmation mail arrived"). Anything in the owner's "never" list (payments, passwords, card details) stays with the owner: open the page or give the link instead.
 
+A phone reminder, alarm or private calendar block that is not in the owner's without asking list is ask first too, and the scripts refuse it (`not_allowed`) on their own. After the owner's yes to that exact one, write their words to a file with the write_file tool and add `--approval-file <file>` to `ea_reminders.py add|alarm` or `ea_calendar_block.py create|alert`. Only here, in a chat reply: the yes is logged, a scheduled run is refused, and it never overrides "never".
+
 ## Watches (proactive tasks)
 
 When the owner says "watch X and tell me / remind me / wake me / do Y when Z", turn it into a watch:
@@ -42,7 +44,7 @@ Pick the schedule from how fast it moves: a conference seat or a ticket drop eve
 
 ## Numbered close-out answers
 
-When the owner answers a numbered message ("1 yes, 2 tomorrow, 3 skip"), map each number to that message's item, act within the standing authority (drafts, private blocks, reminders), close what is done (`ea_desk.py ledger --key K --set '{"status":"done"}'`) and reply in one short bubble: what you set or drafted, what still needs their OK.
+When the owner answers a numbered message ("1 yes, 2 tomorrow, 3 skip"), map each number to that message's item, act within the standing authority (drafts, private blocks, reminders; an ask first block or reminder the owner just said yes to goes through `--approval-file`, see Approvals), close what is done (`ea_desk.py ledger --key K --set '{"status":"done"}'`) and reply in one short bubble: what you set or drafted, what still needs their OK.
 
 ## Resolve before you ask, in chat too
 

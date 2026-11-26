@@ -63,13 +63,14 @@ class AlarmTests(OfflineTestCase):
     def test_no_authority_or_revoked_authority(self):
         rid = self.alarm()["request_id"]
         self.configure(reminders={"enabled": True}, authority={"auto": ["reminders"], "ask": ["alarms"]})
-        self.assertEqual(self.alarm("new"), {"status": "not_allowed"})
+        self.assertEqual(self.alarm("new"), {"status": "not_allowed", "action": "alarms", "authority": "ask"})
         self.store.results[rid] = {"status": "expired"}
         self.cli(reminders, "tick")
         self.assertEqual(len(self.store.requests), 1)
 
     def test_daily_cap_is_separate_from_reminders_and_resets_locally(self):
-        self.configure(reminders={"enabled": True, "per_day": 1, "alarms_per_day": 2}, authority={"auto": ["alarms"]})
+        self.configure(reminders={"enabled": True, "per_day": 1, "alarms_per_day": 2},
+                       authority={"auto": ["alarms", "reminders"]})
         self.assertEqual(self.alarm("one")["status"], "queued")
         result = self.cli(reminders, "add", "--key", "normal", "--title", "Regular reminder")
         self.assertEqual(json.loads(result)["status"], "queued")

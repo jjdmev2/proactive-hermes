@@ -137,7 +137,8 @@ class TextFileRoundTrip(unittest.TestCase):
             self.assertNotIn("CAPTURE", proc.stdout)
 
 
-TEXT_FLAGS = "title|notes|why|note|quote|reply|input|place|evidence|what|text|label|to|who|terms|ref|source|sent|dropped"
+TEXT_FLAGS = ("title|notes|why|note|quote|reply|input|place|evidence|what|text|label|to|who|terms|ref|source|sent|dropped"
+              "|approval")
 INLINE = re.compile(r"--(?:" + TEXT_FLAGS + r")(?:=|\s+)(?:\\?\"|'|<|\.\.\.|[A-Z]{2,}\b)")
 HERE = Path(__file__).resolve().parent.parent
 

@@ -240,7 +240,7 @@ class FakeEvents:
 class CalendarAlertTests(OfflineTestCase):
     def setUp(self):
         super().setUp()
-        self.configure(calendar={"enabled": True}, timezone="Europe/Berlin")
+        self.configure(calendar={"enabled": True}, timezone="Europe/Berlin", authority={"auto": ["calendar_blocks"]})
         import ea_calendar_block as calendar
         self.cal = calendar
         self.enterContext(patch.object(calendar, "LOG", self.tmp / "actions_log.jsonl"))

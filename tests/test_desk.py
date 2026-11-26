@@ -629,7 +629,7 @@ class FakeStore:
 class ReminderTests(OfflineTestCase):
     def setUp(self):
         super().setUp()
-        self.configure(reminders={"enabled": True, "per_day": 2})
+        self.configure(reminders={"enabled": True, "per_day": 2}, authority={"auto": ["reminders"]})
         self.enterContext(patch.object(reminders, "PLUGIN", self.tmp))
         (self.tmp / "bridge.py").touch()  # Presence check only; the bridge itself is mocked below.
         self.freeze_datetime(reminders)

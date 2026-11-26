@@ -9,12 +9,20 @@ A reminder the desk created (it has the id) is ticked off on the phone once its 
 finished in the promise, goal or action records; the same expiry rules apply to that request.
 
   ea_reminders.py add --key KEY --title T [--due ISO | --due-date D] [--notes N] [--priority P]
-                      [--no-calendar-alert]
-  ea_reminders.py alarm --key KEY --at ISO --label TEXT  # urgent only, requires automatic alarm authority
+                      [--no-calendar-alert] [--approval-file F]
+  ea_reminders.py alarm --key KEY --at ISO --label TEXT [--approval-file F]  # urgent only
   ea_reminders.py adopt --key KEY --request-id RID       # track a reminder made via the tool
   ea_reminders.py close --key KEY [--evidence E]        # item is done: tick the phone reminder off
   ea_reminders.py tick                                  # check / re-queue / close finished items (silent)
   ea_reminders.py status
+
+Authority is enforced here, at the execution boundary (enqueue), never only in a prompt or the CLI: a reminder
+needs `reminders` and an alarm `alarms` in the automatic authority (phconf.authorize). 'never' always refuses.
+An ask-first action goes through only with --approval-file: the owner's own yes to that exact reminder or alarm,
+in their words, given in chat (never from a scheduled run, where Hermes sets HERMES_CRON_SESSION). The approval is
+kept on the outbox item and logged as kind owner_approval in actions_log.jsonl. A refusal returns
+{"status": "not_allowed", ...} and nothing reaches the bridge. Retries of an expired request are held to the same
+rule (an approved item may retry while the action is still ask first, never once it is 'never').
 
 Phone access goes through the Hermes mobile device plugin's bridge (see bridge() below: the only code here that
 touches that plugin's files). The desk never wakes the phone itself.
@@ -104,6 +112,32 @@ def log(row: dict) -> None:
 def auto_allowed(action: str) -> bool:
     """Same rule as everywhere else: 'never' wins, then the automatic list."""
     return phconf.allowed(action) == "auto"
+
+
+def item_action(item: dict) -> str:
+    """The authority an outbox item is created under."""
+    return "alarms" if item_kind(item) == "alarm" else "reminders"
+
+
+def audit_approval(action: str, key: str, approval: str) -> dict:
+    """Record the owner's yes that let an ask-first action through (actions_log.jsonl, next to calendar writes)."""
+    row = {"at": now_iso(), "kind": "owner_approval", "action": action, "key": key, "approval": approval.strip()[:300]}
+    with (phconf.state_dir() / "actions_log.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return {"text": row["approval"], "at": row["at"]}
+
+
+def refusal(action: str, basis: str) -> dict:
+    return {"status": "not_allowed", "action": action, "authority": basis}
+
+
+def retry_allowed(item: dict) -> bool:
+    """A re-request is still a creation: automatic authority, or the owner's recorded yes while the action is
+    ask first. 'never' and a revoked required authority (leave_time for trips) stop it."""
+    level = phconf.allowed(item_action(item))
+    if level == "never" or not all(map(auto_allowed, item.get("required_authority", ()))):
+        return False
+    return level == "auto" or bool(item.get("approval"))
 
 
 def enabled() -> bool:
@@ -403,8 +437,17 @@ def close_reminder(key: str, evidence: str = "") -> dict:
         return {"status": "closing", "key": key, "request_id": item["close_request_id"]}
 
 
-def enqueue(item: dict, *, force: bool = False) -> dict:
-    key, kind = item["key"], item_kind(item)
+def enqueue(item: dict, *, force: bool = False, approval: str = "") -> dict:
+    """THE creation boundary: every reminder and alarm reaches the bridge through here, after its authority."""
+    key, kind, action = item["key"], item_kind(item), item_action(item)
+    ok, basis = phconf.authorize(action, approval)
+    if not ok:
+        log({"not_allowed": key, "action": action, "authority": basis})
+        return refusal(action, basis)
+    for extra in item.get("required_authority", ()):
+        if not auto_allowed(extra):
+            log({"not_allowed": key, "action": extra, "authority": phconf.allowed(extra)})
+            return refusal(extra, phconf.allowed(extra))
     with state_lock(OUTBOX):
         box = load(OUTBOX, {})
         if key in box:
@@ -420,6 +463,8 @@ def enqueue(item: dict, *, force: bool = False) -> dict:
         if made_today >= cap and not force:
             return {"status": "refused", "reason": f"daily cap {cap} {kind}s reached"}
         item.update(attempts=0, created=created)
+        if basis == "owner_approval":
+            item["approval"] = audit_approval(action, key, approval)
         _, store = bridge()
         submit(store, box, item)
         ledger_set(key, {f"{kind}_status": "queued"})
@@ -459,47 +504,52 @@ def with_alert(item: dict, result: dict, why: str) -> dict:
 
 
 def add(key: str, title: str, *, due=None, due_date=None, notes="", priority="medium", force=False,
-        required_authority=(), calendar_alert: bool = True) -> dict:
-    """Queue a reminder and return its receipt without a CLI round trip."""
+        required_authority=(), calendar_alert: bool = True, approval: str = "") -> dict:
+    """Queue a reminder and return its receipt without a CLI round trip. Needs `reminders` (and every
+    required_authority) automatic; `approval` = the owner's own yes to this exact reminder when it is ask first."""
     if not enabled():
         return {"status": "disabled"}
-    if not all(map(auto_allowed, required_authority)):
-        return {"status": "not_allowed"}
     item = {"key": key, "title": title, "due": due, "due_date": due_date, "notes": notes, "priority": priority}
     if required_authority:
         item["required_authority"] = list(required_authority)
     if not calendar_alert:
         item["no_calendar_alert"] = True
-    result = enqueue(item, force=force)
+    result = enqueue(item, force=force, approval=approval)
     if calendar_alert and time_critical(priority, due):
         with_alert(item, result, "time-critical")
     return result
 
 
+def alarm(key: str, at_iso: str, label: str, *, approval: str = "") -> dict:
+    """Queue an urgent one-time alarm (plus its calendar alert). Needs `alarms` automatic, or the owner's yes."""
+    if not enabled():
+        return {"status": "disabled"}
+    ok, basis = phconf.authorize("alarms", approval)
+    if not ok:  # checked again in enqueue; refusing first keeps the input checks from leaking past a deny
+        return refusal("alarms", basis)
+    try:
+        at = datetime.fromisoformat(at_iso.replace("Z", "+00:00"))
+    except ValueError:
+        at = None
+    if at is None or at.utcoffset() is None:
+        return {"status": "error", "error": "--at must be an ISO date and time with timezone"}
+    if len(label) > 100:
+        return {"status": "error", "error": "--label must be at most 100 characters"}
+    if at <= datetime.now(phconf.tz()):
+        return {"status": "refused", "reason": "alarm time already passed"}
+    item = {"operation": "alarms.create", "key": key, "at": at_iso, "label": label}
+    return with_alert(item, enqueue(item, approval=approval), "alarm")
+
+
 def cmd_add(a) -> int:
     result = add(a.key, a.title, due=a.due, due_date=a.due_date, notes=a.notes, priority=a.priority, force=a.force,
-                 calendar_alert=not a.no_calendar_alert)
+                 calendar_alert=not a.no_calendar_alert, approval=getattr(a, "approval", None) or "")
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
 
 def cmd_alarm(a) -> int:
-    if not auto_allowed("alarms"):
-        result = {"status": "not_allowed"}
-    else:
-        try:
-            at = datetime.fromisoformat(a.at.replace("Z", "+00:00"))
-        except ValueError:
-            at = None
-        if at is None or at.utcoffset() is None:
-            result = {"status": "error", "error": "--at must be an ISO date and time with timezone"}
-        elif len(a.label) > 100:
-            result = {"status": "error", "error": "--label must be at most 100 characters"}
-        elif at <= datetime.now(phconf.tz()):
-            result = {"status": "refused", "reason": "alarm time already passed"}
-        else:
-            item = {"operation": "alarms.create", "key": a.key, "at": a.at, "label": a.label}
-            result = with_alert(item, enqueue(item), "alarm")
+    result = alarm(a.key, a.at, a.label, approval=getattr(a, "approval", None) or "")
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -564,8 +614,7 @@ def cmd_tick(_a) -> int:
                 log({"alarm_failed": key, "why": item["error"], "no_retry": True})
                 need_alert(item, f"alarm {item['status']}")
             elif status == "expired" and int(item.get("attempts", 0)) < MAX_ATTEMPTS:
-                required = item.get("required_authority", ())
-                if not all(map(auto_allowed, required)):
+                if not retry_allowed(item):
                     continue
                 need_alert(item, "bridge expired")  # the phone is not waking: make sure of the part that needs no app
                 try:
@@ -645,10 +694,14 @@ def main() -> int:
     ad.add_argument("--force", action="store_true", help="ignore the reminder daily cap")
     ad.add_argument("--no-calendar-alert", action="store_true",
                     help="do not add the calendar alert even when the reminder is time-critical")
+    _text_option(ad, "approval", default="",
+                 help="the owner's own yes to this exact reminder (ask first only; refused in a scheduled run)")
     alarm = sub.add_parser("alarm", help="queue an urgent, one-time alarm")
     alarm.add_argument("--key", required=True)
     alarm.add_argument("--at", required=True)
     _text_option(alarm, "label", required=True)
+    _text_option(alarm, "approval", default="",
+                 help="the owner's own yes to this exact alarm (ask first only; refused in a scheduled run)")
     ap = sub.add_parser("adopt")
     ap.add_argument("--key", required=True)
     ap.add_argument("--request-id", required=True)
