@@ -62,11 +62,24 @@ class AlarmTests(OfflineTestCase):
 
     def test_no_authority_or_revoked_authority(self):
         rid = self.alarm()["request_id"]
-        self.configure(reminders={"enabled": True}, authority={"auto": ["reminders"], "ask": ["alarms"]})
-        self.assertEqual(self.alarm("new"), {"status": "not_allowed", "action": "alarms", "authority": "ask"})
+        self.configure(reminders={"enabled": True}, authority={"auto": ["reminders"], "ask_first": ["alarms"]})
+        refused = json.loads(self.cli(reminders, "alarm", "--key", "new", "--at", self.at, "--label", "L", code=5))
+        self.assertEqual(refused, {"status": "not_allowed", "action": "alarms", "authority": "ask"})
         self.store.results[rid] = {"status": "expired"}
         self.cli(reminders, "tick")
         self.assertEqual(len(self.store.requests), 1)
+
+    def test_alarm_refusal_is_logged_like_a_reminder_refusal(self):
+        for level in ("ask_first", "never"):
+            self.configure(reminders={"enabled": True}, authority={level: ["alarms"]})
+            self.assertEqual(reminders.alarm(f"k-{level}", self.at, "L")["status"], "not_allowed")
+        self.configure(reminders={"enabled": True}, authority={"auto": [], "never": ["reminders"]})
+        self.assertEqual(reminders.add("r", "T")["status"], "not_allowed")
+        rows = [r for r in self.rows(self.tmp / reminders.RUN_LOG) if "not_allowed" in r]
+        self.assertEqual([(r["not_allowed"], r["action"], r["authority"]) for r in rows],
+                         [("k-ask_first", "alarms", "ask"), ("k-never", "alarms", "never"),
+                          ("r", "reminders", "never")])
+        self.assertEqual(self.store.requests, [])
 
     def test_daily_cap_is_separate_from_reminders_and_resets_locally(self):
         self.configure(reminders={"enabled": True, "per_day": 1, "alarms_per_day": 2},

@@ -7,16 +7,17 @@ created by Proactive Hermes may be changed or deleted.
 Usage:
   ea_calendar_block.py free   --date YYYY-MM-DD [--minutes 30] [--from 09:00] [--to 18:00]
   ea_calendar_block.py create --key KEY --title T --start ISO --end ISO
-                              [--notes TEXT] [--alert 10] [--allow-overlap] [--approval-file F]
-  ea_calendar_block.py alert  --key ea:... --title T --at ISO [--notes TEXT] [--approval-file F]
+                              [--notes TEXT] [--alert 10] [--allow-overlap]
+  ea_calendar_block.py alert  --key ea:... --title T --at ISO [--notes TEXT]
                               (5 min private alert, popup at 0 min, may overlap, not in the daily cap)
   ea_calendar_block.py mine   [--days 14]
   ea_calendar_block.py delete --key KEY      (only Proactive Hermes blocks)
 
 Authority: create and alert are calendar writes made under `calendar_blocks`. Before any Google call they need
-it in the automatic authority, or (ask first only) --approval-file with the owner's own yes to that exact
-block, given in chat and never in a scheduled run (phconf.authorize). 'never' refuses every write, delete
-included. A refusal prints {"status": "not_allowed", ...}, exit 5, and creates nothing. free and mine only read.
+it in the automatic authority (phconf.authorize); 'ask' and 'never' always refuse, and 'never' refuses delete
+too. When the owner says yes in chat to an ask-first block, the chat agent uses Hermes's own calendar tools,
+never this script. A refusal prints {"status": "not_allowed", ...}, is logged, exits 5 and creates nothing.
+free and mine only read.
 
 `alert` is the time-critical path: a phone that syncs this calendar fires the popup on its own,
 so it never waits for the Hermes app to wake (the mobile bridge can lag by minutes).
@@ -45,15 +46,13 @@ ALERT_TITLE_CHARS = 60
 ACTION = "calendar_blocks"   # the authority every calendar write here is made under
 
 
-def authorized(key: str, approval: str = "") -> tuple[dict | None, str]:
-    """(refusal, basis): refusal is None when the write may go ahead. Called before the Google service is built."""
-    ok, basis = phconf.authorize(ACTION, approval)
-    if not ok:
-        log({"kind": "calendar_not_allowed", "key": key, "authority": basis})
-        return {"status": "not_allowed", "action": ACTION, "authority": basis, "key": key}, basis
-    if basis == "owner_approval":
-        log({"kind": "owner_approval", "action": ACTION, "key": key, "approval": approval.strip()[:300]})
-    return None, basis
+def refused(key: str) -> dict | None:
+    """The logged refusal when the write may not go ahead, else None. Called before the Google service is built."""
+    ok, basis = phconf.authorize(ACTION)
+    if ok:
+        return None
+    log({"kind": "calendar_not_allowed", "key": key, "authority": basis})
+    return {"status": "not_allowed", "action": ACTION, "authority": basis, "key": key}
 
 
 def out(obj: dict, code: int = 0) -> None:
@@ -144,7 +143,7 @@ def cmd_create(a) -> None:
         out({"status": "error", "error": "end must be after start"}, 2)
     if not a.key.startswith("ea:"):
         out({"status": "error", "error": "key must start with 'ea:'"}, 2)
-    denied, basis = authorized(a.key, getattr(a, "approval", None) or "")
+    denied = refused(a.key)
     if denied:
         out(denied, 5)
     svc = service()
@@ -190,7 +189,7 @@ def cmd_create(a) -> None:
               "title": back.get("summary"), "start": back["start"].get("dateTime"),
               "end": back["end"].get("dateTime"), "visibility": back.get("visibility"),
               "calendar": back.get("organizer", {}).get("email")}
-    log({"kind": "calendar_block", **result, **({"approved_by": "owner"} if basis == "owner_approval" else {})})
+    log({"kind": "calendar_block", **result})
     out(result, 0 if ok else 4)
 
 
@@ -221,14 +220,14 @@ def alert_ok(back: dict, key: str) -> bool:
             and {"method": "popup", "minutes": 0} in (rem.get("overrides") or []))
 
 
-def make_alert(svc, key: str, title: str, at: datetime, notes: str = "", *, approval: str = "") -> tuple[dict, int]:
+def make_alert(svc, key: str, title: str, at: datetime, notes: str = "") -> tuple[dict, int]:
     """Create or update (idempotent by key) and read back. Returns (result, exit code). Refuses (exit 5) without
     calendar_blocks authority, before touching `svc`."""
     if not key.startswith("ea:"):
         return {"status": "error", "error": "key must start with 'ea:'"}, 2
     if not (title or "").strip():
         return {"status": "error", "error": "title is empty"}, 2
-    denied, basis = authorized(key, approval)
+    denied = refused(key)
     if denied:
         return denied, 5
     body = alert_body(key, title, at, notes)
@@ -245,7 +244,7 @@ def make_alert(svc, key: str, title: str, at: datetime, notes: str = "", *, appr
               "title": back.get("summary"), "start": back["start"].get("dateTime"),
               "end": back["end"].get("dateTime"), "visibility": back.get("visibility"),
               "reminders": back.get("reminders"), "calendar": back.get("organizer", {}).get("email")}
-    log({"kind": "calendar_alert", **result, **({"approved_by": "owner"} if basis == "owner_approval" else {})})
+    log({"kind": "calendar_alert", **result})
     return result, (0 if ok else 4)
 
 
@@ -256,10 +255,10 @@ def cmd_alert(a) -> None:
         out({"status": "error", "error": "--at must be an ISO date and time"}, 2)
     if not a.key.startswith("ea:"):
         out({"status": "error", "error": "key must start with 'ea:'"}, 2)
-    approval = getattr(a, "approval", None) or ""
-    if not phconf.authorize(ACTION, approval)[0]:   # before service(): a refusal never builds a Google client
-        out(authorized(a.key, approval)[0], 5)       # (make_alert checks again and logs an approval once)
-    result, code = make_alert(service(), a.key, a.title, at, a.notes or "", approval=approval)
+    denied = refused(a.key)   # before service(): a refusal never builds a Google client
+    if denied:
+        out(denied, 5)
+    result, code = make_alert(service(), a.key, a.title, at, a.notes or "")
     out(result, code)
 
 
@@ -347,13 +346,11 @@ def main() -> None:
     c.add_argument("--alert", type=int, default=5)
     c.add_argument("--allow-overlap", action="store_true")
     c.add_argument("--force", action="store_true", help="ignore the daily cap")
-    _text_option(c, "approval", default="", help="the owner's own yes to this exact block (ask first only)")
     al = sub.add_parser("alert")
     al.add_argument("--key", required=True)
     _text_option(al, "title", required=True)
     al.add_argument("--at", required=True)
     _text_option(al, "notes", default="")
-    _text_option(al, "approval", default="", help="the owner's own yes to this exact alert (ask first only)")
     m = sub.add_parser("mine")
     m.add_argument("--days", type=int, default=14)
     d = sub.add_parser("delete")

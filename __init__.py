@@ -3,8 +3,9 @@
 Registers the `hermes proactive` CLI (setup, status, remove, questions), the `/proactive` slash command,
 and three bundled skills: `proactive-setup` (the guided interview), `proactive-desk` (how to work
 the desk in chat: drafts, close-outs, promises) and `browser-bookings` (approval-gated rides, tickets,
-food). The scheduled jobs and runtime scripts are installed by `hermes proactive setup`; this module
-only registers.
+food). The scheduled jobs and runtime scripts are installed by `hermes proactive setup`. On load this module
+registers, and if setup already installed the runtime and the plugin has since been upgraded, it copies the new
+runtime scripts over the stale ones (jobs.install_runtime; never the first install, never the cron jobs).
 """
 from __future__ import annotations
 
@@ -68,6 +69,29 @@ def _start_mail_push(ctx) -> None:
         logger.warning("proactive-hermes: mail push not started (%s)", type(exc).__name__)
 
 
+def _refresh_runtime() -> str:
+    """After a plugin upgrade, bring an installed runtime up to date (the scheduled jobs run the copy in
+    <HERMES_HOME>/scripts/proactive-hermes, not this checkout). Only when setup already ran (config and an installed
+    runtime exist) and the installed stamp differs from this plugin's runtime. Copies are atomic (one rename per
+    file). Job prompts change only with `hermes proactive setup`. Returns what it did, never raises."""
+    try:
+        import sys
+        sys.path.insert(0, str(HERE / "runtime"))
+        import phconf
+        if not phconf.config_path().is_file():
+            return "not set up"
+        state, _note = phconf.runtime_status(HERE)
+        if state != "stale":
+            return state
+        from . import jobs
+        jobs.install_runtime(phconf.load())
+        logger.info("proactive-hermes: runtime scripts updated after a plugin upgrade")
+        return "updated"
+    except Exception as exc:
+        logger.warning("proactive-hermes: runtime not refreshed (%s); run `hermes proactive setup`", type(exc).__name__)
+        return "error"
+
+
 def register(ctx) -> None:
     from . import cli
     ctx.register_cli_command(
@@ -77,6 +101,7 @@ def register(ctx) -> None:
     ctx.register_command("proactive", _slash, description="Set up or check Proactive Hermes",
                          args_hint="[setup|status]")
     ctx.register_hook("pre_llm_call", _offer_setup)
+    _refresh_runtime()
     _start_mail_push(ctx)
     for name, desc in SKILLS.items():
         try:

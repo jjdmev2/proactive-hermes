@@ -225,7 +225,15 @@ def apply_answers(cfg: dict, answers: dict) -> dict:
     return finish_setup(phconf.merge(cfg, nested))
 
 
+def check_authority(cfg: dict) -> None:
+    """Refuse a malformed approval policy (e.g. "never": "calendar_blocks") instead of writing it."""
+    problem = phconf.authority_problem(cfg)
+    if problem:
+        raise ValueError(f"authority config malformed: {problem}")
+
+
 def finish_setup(cfg: dict) -> dict:
+    check_authority(cfg)
     auto = parse_answer("authority.auto", "list", _get(cfg, "authority.auto"))
     mobile = parse_answer("mobile.enabled", "bool", _get(cfg, "mobile.enabled"))
     cfg["authority"]["auto"] = auto if mobile else [action for action in auto if action not in phconf.MOBILE_ACTIONS]
@@ -254,6 +262,7 @@ def decisions_note(cfg: dict) -> str:
 
 
 def write_config(cfg: dict) -> Path:
+    check_authority(cfg)
     p = phconf.config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(cfg, indent=1, ensure_ascii=False)
@@ -327,10 +336,10 @@ def handle_watch(args, jobs) -> int:
                 watches.append(watch)
         elif existing is not None:
             watches.remove(existing)
+        write_config(cfg)
     except ValueError as exc:
         print(f"Watch: {exc}", file=sys.stderr)
         return 2
-    write_config(cfg)
     try:
         jobs.apply(cfg)
     except (OSError, RuntimeError) as exc:

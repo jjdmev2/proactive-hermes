@@ -8,6 +8,7 @@ and private state lives next to it in .../state (override with EA_STATE_DIR for 
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -144,46 +145,46 @@ def load(path: Path | None = None) -> dict:
 CFG = load()
 
 
-def allowed(action: str, *, cfg: dict | None = None) -> str:
-    """Resolve standing authority. A deny overrides any automatic grant."""
+AUTHORITY_LISTS = ("auto", "ask_first", "never")
+
+
+def authority_problem(cfg: dict | None = None) -> str:
+    """Why the configured authority cannot be trusted, or "" when it is well formed: an object whose auto,
+    ask_first and never are lists of strings. A malformed policy (e.g. "never": "calendar_blocks") is never
+    guessed at: allowed() then denies every action, `hermes proactive doctor` reports it and setup refuses to
+    write it."""
     authority = (CFG if cfg is None else cfg).get("authority", {})
     if not isinstance(authority, dict):
-        return "ask"
-    never = authority.get("never")
-    if isinstance(never, list) and action in never:
+        return "authority must be an object with auto, ask_first and never lists"
+    for name in AUTHORITY_LISTS:
+        value = authority.get(name, [])
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            return f"authority.{name} must be a list of action names"
+    return ""
+
+
+def allowed(action: str, *, cfg: dict | None = None) -> str:
+    """Resolve standing authority: "auto", "ask" or "never". A deny overrides any automatic grant, and a
+    malformed authority (see authority_problem) is "never" for every action: it fails closed."""
+    c = CFG if cfg is None else cfg
+    if authority_problem(c):
         return "never"
-    auto = authority.get("auto")
-    if action in AUTO_ACTIONS and isinstance(auto, list) and action in auto:
+    authority = c.get("authority", {})
+    if action in authority.get("never", []):
+        return "never"
+    if action in AUTO_ACTIONS and action in authority.get("auto", []):
         return "auto"
     return "ask"
 
 
-CRON_ENV = "HERMES_CRON_SESSION"  # Hermes stamps this on every command a scheduled (cron) run starts
-
-
-def scheduled_run() -> bool:
-    """True inside a Hermes cron run, where no owner is present to approve anything."""
-    return os.environ.get(CRON_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def authorize(action: str, approval: str = "", *, cfg: dict | None = None) -> tuple[bool, str]:
+def authorize(action: str, *, cfg: dict | None = None) -> tuple[bool, str]:
     """The execution-boundary check every write the plugin makes on its own goes through (phone reminders and
-    alarms, calendar blocks and alerts). Returns (ok, basis):
-      (True, "auto")              the action is in the automatic authority and not in never;
-      (True, "owner_approval")    the action is ask first and `approval` carries the owner's own yes to this exact
-                                  action (their words, recorded by the caller), outside a scheduled run;
-      (False, "never" | "ask" | "approval_in_scheduled_run")  otherwise; the caller must not touch the service.
-    Never always wins, and an approval cannot come from a scheduled job."""
+    alarms, calendar blocks and alerts): (True, "auto") only when the action is automatic, else (False, "ask" or
+    "never") and the caller must not touch the service. Ask first is never done by a script: after the owner's yes
+    in chat, the chat agent uses Hermes's own tools (mobile reminders and alarms, calendar), with Hermes's own
+    approvals."""
     level = allowed(action, cfg=cfg)
-    if level == "auto":
-        return True, "auto"
-    if level == "never":
-        return False, "never"
-    if not (approval or "").strip():
-        return False, "ask"
-    if scheduled_run():
-        return False, "approval_in_scheduled_run"
-    return True, "owner_approval"
+    return level == "auto", level
 
 
 def calendar_alerts_on(*, cfg: dict | None = None) -> bool:
@@ -220,6 +221,48 @@ def quiet_hours() -> tuple[int, int]:
 def scripts_dir() -> Path:
     """Where `setup apply` installs the runtime (cron gate scripts must live under HERMES_HOME/scripts)."""
     return hermes_home() / "scripts" / PLUGIN
+
+
+RUNTIME_STAMP = ".runtime-stamp.json"   # written by jobs.install_runtime next to the installed scripts
+CONTRACT = Path("skills") / "proactive-desk" / "references" / "desk-contract.md"
+STALE = "runtime out of date: run hermes proactive setup"
+
+
+def runtime_digest(plugin_root: Path) -> str:
+    """Fingerprint of what install_runtime copies from a plugin checkout: runtime/*.py and the desk contract."""
+    h = hashlib.sha256()
+    for f in sorted(Path(plugin_root, "runtime").glob("*.py")) + [Path(plugin_root, CONTRACT)]:
+        h.update(f.name.encode() + b"\0" + (f.read_bytes() if f.is_file() else b"") + b"\0")
+    return h.hexdigest()
+
+
+def runtime_stamp() -> dict:
+    try:
+        data = json.loads((scripts_dir() / RUNTIME_STAMP).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def runtime_status(plugin_root: Path | None = None) -> tuple[str, str]:
+    """Is the installed runtime (scripts_dir) the one this plugin ships? (state, note), state one of:
+    "missing" (setup never installed it), "ok", "stale" (an older copy: setup was not re-run after an upgrade),
+    "unknown" (no plugin checkout to compare with). plugin_root defaults to the source the stamp names."""
+    dest = scripts_dir()
+    if not (dest / "phconf.py").is_file():
+        return "missing", "runtime not installed yet: run hermes proactive setup"
+    stamp = runtime_stamp()
+    source = plugin_root or stamp.get("source")
+    root = Path(source) if source else None
+    if root is None or not (root / "runtime").is_dir():
+        return "unknown", "plugin source not found, cannot compare the installed runtime"
+    if stamp.get("digest") != runtime_digest(root):
+        return "stale", STALE
+    for f in (root / "runtime").glob("*.py"):
+        target = dest / f.name
+        if not target.is_file() or target.read_bytes() != f.read_bytes():
+            return "stale", STALE
+    return "ok", "installed runtime matches the plugin"
 
 
 def agent_root() -> Path:

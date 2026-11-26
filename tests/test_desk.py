@@ -118,11 +118,11 @@ class OfflineTestCase(unittest.TestCase):
         fake_datetime = self.enterContext(patch.object(module, "datetime", wraps=datetime))
         fake_datetime.now.side_effect = lambda tz: self.clock.astimezone(tz)
 
-    def cli(self, module, *args, stdin=""):
+    def cli(self, module, *args, stdin="", code=0):
         output = io.StringIO()
         with patch.object(sys, "argv", [module.__file__, *args]), \
                 patch.object(sys, "stdin", io.StringIO(stdin)), redirect_stdout(output):
-            self.assertEqual(module.main(), 0)
+            self.assertEqual(module.main(), code)
         return output.getvalue()
 
     @staticmethod

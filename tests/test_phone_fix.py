@@ -70,12 +70,13 @@ class AddTests(PhoneBase):
         self.assertNotIn("calendar_alert", out)
 
     def test_opt_out_and_feature_off(self):
-        self.add("--no-calendar-alert", due=self.at(hours=1), priority="high")
+        auto = {"auto": ["reminders", "calendar_blocks"]}   # allowed, so only the opt-out or the switch stops it
+        self.assertEqual(self.add("--no-calendar-alert", due=self.at(hours=1), priority="high")["status"], "queued")
         self.configure(reminders={"enabled": True}, calendar={"enabled": True},
-                       features={"calendar_alerts": False})
-        self.add(due=self.at(hours=1), key="k2")
-        self.configure(reminders={"enabled": True}, calendar={"enabled": False})
-        self.add(due=self.at(hours=1), key="k3")
+                       features={"calendar_alerts": False}, authority=auto)
+        self.assertEqual(self.add(due=self.at(hours=1), key="k2")["status"], "queued")
+        self.configure(reminders={"enabled": True}, calendar={"enabled": False}, authority=auto)
+        self.assertEqual(self.add(due=self.at(hours=1), key="k3")["status"], "queued")
         self.assertEqual(self.calls, [])
 
     def test_past_due_gets_no_alert(self):

@@ -154,17 +154,40 @@ def check_resolve() -> None:
         fault("desk", "resolve wait queue stuck")
 
 
+def registry_ids() -> dict[str, str]:
+    """{job key: cron job id} as the installer recorded them (<plugin-data>/jobs.json); {} when unreadable."""
+    try:
+        reg = json.loads((phconf.data_dir() / "jobs.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for key, entry in (reg.items() if isinstance(reg, dict) else ()):
+        jid = entry.get("id") if isinstance(entry, dict) else entry
+        if isinstance(jid, str) and jid:
+            out[key] = jid
+    return out
+
+
+def missing_jobs(desk: list[dict]) -> list[str]:
+    """Names of the managed jobs the installer keeps for this config (ph_jobs.expected, the installer's own rule:
+    only flags that are jobs, only when the connection is there, one per watch) that no live job carries, matched
+    by identity: the installed name, or the id the installer recorded. A duplicate never stands in for another."""
+    names = {(j.get("name") or "").strip() for j in desk}
+    ids = {j.get("id") for j in desk if j.get("id")}
+    recorded = registry_ids()
+    return [ph_jobs.job_name(key) for key in ph_jobs.expected(phconf.CFG)
+            if ph_jobs.job_name(key) not in names and recorded.get(key) not in ids]
+
+
 def check_jobs(jobs: list[dict]) -> None:
     try:
         from croniter import croniter
     except Exception:
         croniter = None
     desk = [j for j in jobs if (j.get("name") or "").startswith(DESK_PREFIXES)]
-    # The installer's own rule (ph_jobs, shared with jobs.apply): only flags that are jobs, and only when the
-    # connection each job needs is there, plus one job per watch.
-    expected_jobs = len(ph_jobs.expected(phconf.CFG))
-    if len(desk) < expected_jobs:
-        fault("desk", f"only {len(desk)} desk jobs exist, expected {expected_jobs}")
+    missing = missing_jobs(desk)
+    if missing:
+        fault("desk", "desk job missing: " + ", ".join(missing))
     for job in desk:
         name = job.get("name") or job["id"]
         if not job.get("enabled", True) or job.get("state") == "paused":

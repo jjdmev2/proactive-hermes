@@ -28,7 +28,7 @@ Never send on a number alone.
 
 Desk messages often end with a ready action: "Send as is?", "Reply 1 to accept the 380 offer", "Register now?". A clear yes approves that one action exactly as shown, once. Do it with the account or app named in the item, then confirm in one line with the proof ("Sent, thread here", "Registered, confirmation mail arrived"). Anything in the owner's "never" list (payments, passwords, card details) stays with the owner: open the page or give the link instead.
 
-A phone reminder, alarm or private calendar block that is not in the owner's without asking list is ask first too, and the scripts refuse it (`not_allowed`) on their own. After the owner's yes to that exact one, write their words to a file with the write_file tool and add `--approval-file <file>` to `ea_reminders.py add|alarm` or `ea_calendar_block.py create|alert`. Only here, in a chat reply: the yes is logged, a scheduled run is refused, and it never overrides "never".
+A phone reminder, alarm or private calendar block that is not in the owner's without asking list is ask first too. The desk scripts (`ea_reminders.py add|alarm`, `ea_calendar_block.py create|alert`) only act on what is allowed without asking: anything else they refuse with `not_allowed` and exit 5, even after a yes. After the owner's yes to that exact one, set it with Hermes's own tools instead: the mobile reminder or alarm tools, or the calendar tools. They carry Hermes's own approvals. Never for anything on the "never" list.
 
 ## Watches (proactive tasks)
 
@@ -44,7 +44,7 @@ Pick the schedule from how fast it moves: a conference seat or a ticket drop eve
 
 ## Numbered close-out answers
 
-When the owner answers a numbered message ("1 yes, 2 tomorrow, 3 skip"), map each number to that message's item, act within the standing authority (drafts, private blocks, reminders; an ask first block or reminder the owner just said yes to goes through `--approval-file`, see Approvals), close what is done (`ea_desk.py ledger --key K --set '{"status":"done"}'`) and reply in one short bubble: what you set or drafted, what still needs their OK.
+When the owner answers a numbered message ("1 yes, 2 tomorrow, 3 skip"), map each number to that message's item, act within the standing authority (drafts, private blocks, reminders; an ask first block, reminder or alarm the owner just said yes to goes through Hermes's own tools, see Approvals), close what is done (`ea_desk.py ledger --key K --set '{"status":"done"}'`) and reply in one short bubble: what you set or drafted, what still needs their OK.
 
 ## Resolve before you ask, in chat too
 

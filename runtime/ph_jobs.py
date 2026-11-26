@@ -1,7 +1,7 @@
 """Which Proactive Hermes jobs a config installs: the one source of truth.
 
 The installer (jobs.py, `hermes proactive setup`) decides from `enabled()` which managed jobs to create or remove,
-and the health watchdog (ea_health.py) compares the live jobs with `expected()`. Both import this module, so the
+and the health watchdog (ea_health.py) compares the live jobs' identities (name or recorded id) with `expected()`. Both import this module, so the
 watchdog can never expect a job the installer would not create (a feature flag that is not a job, like
 resolve_first or mail_push, or a job whose connection is missing, like the Slack sweep without Slack).
 It lives in runtime/ because the watchdog runs from the installed scripts directory, where jobs.py is not copied.
@@ -14,8 +14,26 @@ MANAGED_KEYS: tuple[str, ...] = (
     "evening_brief", "weekly_review", "lookahead", "meeting_prep", "health", "tick",
 )
 
+PREFIX = "Proactive \u00b7 "   # every managed job's name starts with it
+
+# The name each managed job is installed under (PREFIX + name). jobs.JOBS takes its names from here, and the
+# watchdog matches installed jobs to expected keys by this name (or by the job id the installer recorded).
+NAMES: dict[str, str] = {
+    "morning_brief": "morning brief", "mail_radar": "mail radar", "slack_sweep": "Slack and calendar sweep",
+    "promises": "promise tracker", "work_recap_after_daily": "work recap after the daily",
+    "work_recap_evening": "work wrap-up", "evening_brief": "evening brief", "weekly_review": "weekly review",
+    "lookahead": "look-ahead", "meeting_prep": "meeting prep", "health": "health", "tick": "tick",
+}
+
 # Jobs switched by a feature flag with another name.
 FEATURE = {"work_recap_after_daily": "work_recap", "work_recap_evening": "work_recap", "tick": "health"}
+
+
+def job_name(key: str) -> str:
+    """The full installed name of the managed job KEY ("watch:<name>" for a watch)."""
+    if key.startswith("watch:"):
+        return PREFIX + "watch: " + key.removeprefix("watch:")
+    return PREFIX + NAMES[key]
 
 
 def has_calendar(cfg: dict) -> bool:

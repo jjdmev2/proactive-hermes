@@ -88,7 +88,9 @@ hermes plugins install jjdmev2/proactive-hermes --enable
 hermes proactive doctor
 ```
 
-`hermes proactive doctor` checks the gateway, the Bot Chat, the phone, the OpenAI key and your mail, and tells you how to fix anything missing. `hermes proactive doctor --send-test` posts one test message into your Bot Chat, so you can see it land on your phone. If `hermes proactive` is not found (plugins running with `plugins.isolation: host`), use `python3 ~/.hermes/plugins/proactive-hermes/cli.py doctor` and the same flags.
+`hermes proactive doctor` checks the gateway, the Bot Chat, the phone, the OpenAI key, your mail, your approval levels and the installed scripts, and tells you how to fix anything missing. `hermes proactive doctor --send-test` posts one test message into your Bot Chat, so you can see it land on your phone. If `hermes proactive` is not found (plugins running with `plugins.isolation: host`), use `python3 ~/.hermes/plugins/proactive-hermes/cli.py doctor` and the same flags.
+
+After you update the plugin, Hermes copies the new scripts into place the next time it loads the plugin. The scheduled jobs change only when you run `hermes proactive setup` again. If `doctor` says `runtime out of date: run hermes proactive setup`, do that.
 
 ### Give Hermes access
 
@@ -147,8 +149,10 @@ The mail radar checks your mail every 15 minutes. With push, new mail wakes it w
 | Level | Juan's setup | You can change it to |
 | :--- | :--- | :--- |
 | **Without asking** | Private calendar blocks, phone reminders, alarms for urgent things, leave times for trips. | Any of these, or none. Watch actions too, if you want a watch to act on its own. |
-| **Ask first** | Sending email or Slack, replying to offers, registering for events, purchases (Hermes fills the cart, you pay), bookings (Hermes stops at the price and books on your yes to that exact quote), accepting invites. | Everything not allowed above lands here. Hermes prepares it fully and asks in one line; a "yes" approves that one action. A block, reminder or alarm in this row is set only after your yes in chat, and that yes is logged; scheduled jobs cannot set one. |
+| **Ask first** | Sending email or Slack, replying to offers, registering for events, purchases (Hermes fills the cart, you pay), bookings (Hermes stops at the price and books on your yes to that exact quote), accepting invites. | Everything not allowed above lands here. Hermes prepares it fully and asks in one line; a "yes" approves that one action. The desk scripts never set a block, reminder or alarm in this row. After your yes in chat, Hermes sets it with its own phone and calendar tools, under Hermes's own approvals. |
 | **Never** | Entering or changing card details or payment methods, approving a payment in your bank app, passwords, deleting data. | These always stay with you. |
+
+The scripts check these levels themselves each time they act. If the approval setting in the config is broken, they refuse every block, reminder and alarm, setup will not save it, and `hermes proactive doctor` says `authority config malformed`.
 
 ### Add your own watches
 

@@ -89,12 +89,14 @@ class ResolveHealthTests(unittest.TestCase):
             "resolve wait queue stuck": ("desk", "resolve wait queue stuck"),
         })
 
-    def test_expected_job_count_uses_installed_jobs_and_plugin_prefix(self):
+    def test_expected_jobs_use_installed_jobs_and_plugin_prefix(self):
         # Custom defaults install 7 jobs (no calendar: no meeting prep; resolve_first and mail_push are not jobs).
-        health.check_jobs([{"name": "Proactive · one"}, {"name": "Other job"}])
-        self.assertEqual(health.faults, {
-            "only n desk jobs exist, expected n": ("desk", "only 1 desk jobs exist, expected 7"),
-        })
+        # An unknown "Proactive ·" job stands in for none of them; a job without the prefix is not a desk job.
+        health.check_jobs([{"name": "Proactive · one"}, {"name": "Proactive · morning brief"}, {"name": "health"}])
+        missing = ("mail radar", "promise tracker", "evening brief", "weekly review", "health", "tick")
+        self.assertEqual(list(health.faults.values()), [
+            ("desk", "desk job missing: " + ", ".join("Proactive · " + name for name in missing)),
+        ])
 
     def test_reminders_disabled_skips_bridge_database(self):
         with patch.object(health.reminders, "bridge") as bridge:

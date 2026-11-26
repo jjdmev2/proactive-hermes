@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pre-flight checks: can the desk reach the owner's Bot Chat, and is the phone set up?
 
-    ph_doctor.py            JSON report: gateway, bot_chat, mobile, decisions, mail, calendar, and
+    ph_doctor.py            JSON report: gateway, bot_chat, mobile, decisions, mail, authority, runtime, and
                             mail_push (per mailbox: "instant push", or "15 min checks" with the reason
                             and the next step; never an address or a password)
     ph_doctor.py --send-test   also posts one test message into Bot Chat (proves live delivery)
@@ -32,7 +32,27 @@ FIX = {
                  "filter, or `hermes plugins config proactive-hermes`. It can be the same key as OPENAI_API_KEY; "
                  "Hermes hides OPENAI_API_KEY from scheduled scripts. Put a few dollars of credit on platform.openai.com.",
     "mail": "Set up the google-workspace skill (Gmail) or a himalaya mail account.",
+    "authority": "authority config malformed: run `hermes proactive setup` to write the approval levels again. "
+                 "Until then every reminder, alarm and calendar block is refused.",
+    "runtime": "Run `hermes proactive setup`: it installs or updates the runtime scripts.",
 }
+
+
+def check_authority() -> tuple[bool, str]:
+    problem = phconf.authority_problem()
+    return (False, f"authority config malformed: {problem}") if problem else (True, "")
+
+
+def plugin_root() -> Path | None:
+    """The plugin checkout this doctor runs from; None when it runs from the installed copy."""
+    root = HERE.parent
+    return root if (root / "plugin.yaml").is_file() and HERE.resolve() != phconf.scripts_dir().resolve() else None
+
+
+def check_runtime() -> tuple[bool, str]:
+    """Is the installed runtime the one this plugin ships? An upgrade without a new setup leaves old scripts."""
+    state, note = phconf.runtime_status(plugin_root())
+    return state in ("ok", "unknown"), note
 
 
 def _agent_path() -> None:
@@ -91,7 +111,9 @@ def report(send_test: bool = False) -> dict:
     except Exception:
         dec = (False, "unavailable")
     mail = (phconf.google_api().exists() or bool(phconf.CFG["mail"].get("himalaya_accounts")), "")
-    for name, (ok, note) in {"gateway": gw, "bot_chat": bc, "mobile": mob, "decisions": dec, "mail": mail}.items():
+    checks = {"gateway": gw, "bot_chat": bc, "mobile": mob, "decisions": dec, "mail": mail,
+              "authority": check_authority(), "runtime": check_runtime()}
+    for name, (ok, note) in checks.items():
         row = {"ok": ok}
         if note:
             row["note"] = note
