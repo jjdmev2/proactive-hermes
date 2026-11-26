@@ -1,11 +1,11 @@
 """Hermetic tests for runtime/mail_idle.py: fake clocks, fake IMAP, no network, no cron, no gateway."""
-import asyncio
 import json
 import os
 import socket
 import stat
 import sys
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -209,21 +209,19 @@ class PokeTests(Base):
         self.write_registry("0123456789ab")              # older bare-id registry
         self.assertEqual(mi.radar_job_id(), "0123456789ab")
 
-    def test_in_process_first_then_cli_fallback(self):
+    def test_pokes_only_through_the_public_cron_run(self):
         self.write_registry({"id": "abcdef012345"})
         seen = []
-        live = lambda j: {"id": j, "enabled": True, "paused_at": None}
-        self.assertTrue(mi.poke_radar(in_process=lambda j: seen.append(("in", j)) or True,
-                                      cli=lambda j: self.fail("cli used"), job_state=live))
-        self.assertTrue(mi.poke_radar(in_process=lambda j: None, cli=lambda j: seen.append(("cli", j)) or True,
-                                      job_state=live))
-        self.assertEqual(seen, [("in", "abcdef012345"), ("cli", "abcdef012345")])
+        live = lambda j: {"id": j, "state": "active"}  # noqa: E731
+        self.assertTrue(mi.poke_radar(cli=lambda j: seen.append(j) or True, job_state=live))
+        self.assertIsNone(mi.poke_radar(cli=lambda j: None, job_state=live))   # busy: the debouncer retries
+        self.assertEqual(seen, ["abcdef012345"])
 
     def test_no_job_no_poke_and_dry_run(self):
-        self.assertFalse(mi.poke_radar(in_process=lambda j: self.fail("poked"), cli=lambda j: self.fail("poked")))
+        self.assertFalse(mi.poke_radar(cli=lambda j: self.fail("poked")))
         self.write_registry({"id": "abcdef012345"})
-        self.assertTrue(mi.poke_radar(dry_run=True, in_process=lambda j: self.fail("dry"), cli=lambda j: self.fail("dry"),
-                                      job_state=lambda j: {"id": j, "enabled": True}))
+        self.assertTrue(mi.poke_radar(dry_run=True, cli=lambda j: self.fail("dry"),
+                                      job_state=lambda j: {"id": j, "state": "active"}))
 
     def test_cli_detached_uses_profile_home_and_defers_while_running(self):
         calls = []
@@ -341,11 +339,7 @@ class WorkerTests(unittest.TestCase):
 
 class FakeCtx:
     def __init__(self):
-        self.spawned, self.unload = [], []
-
-    def spawn_task(self, coro, *, name=None):
-        self.spawned.append(name)
-        coro.close()
+        self.unload = []
 
     def on_unload(self, cb):
         self.unload.append(cb)
@@ -358,7 +352,7 @@ class GatewayStartTests(Base):
     def test_cli_load_never_starts(self):
         ctx = FakeCtx()
         self.assertEqual(mi.start_in_gateway(ctx, gateway=False), "not the gateway")
-        self.assertEqual(ctx.spawned, [])
+        self.assertIsNone(mi._SERVICE)
 
     def test_not_set_up_or_disabled_never_starts(self):
         ctx = FakeCtx()
@@ -371,15 +365,12 @@ class GatewayStartTests(Base):
         cfg["features"]["mail_push"] = False
         with patch.object(phconf, "CFG", cfg):
             self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "disabled")
-        self.assertEqual(ctx.spawned, [])
+        self.assertIsNone(mi._SERVICE)
 
     def test_passwords_are_read_at_start_not_in_the_imap_threads(self):
         ctx = FakeCtx()
-
-        async def go():
-            return mi.start_in_gateway(ctx, gateway=True)
-
-        self.assertEqual(asyncio.run(go()), "started")
+        with patch.object(mi.Service, "run_forever"):
+            self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "started")
         reads = phconf.secret.call_count
         self.assertEqual(reads, 3)                     # slots 1, 2 and 4 (3 has no server)
         svc = mi._SERVICE
@@ -387,16 +378,38 @@ class GatewayStartTests(Base):
         self.assertEqual([w.label for w in svc.workers], ["acct#1", "acct#2"])
         self.assertEqual(svc.status.accounts["acct#3"]["last_error_class"], "unknown_host")
 
-    def test_gateway_with_loop_spawns_once(self):
+    def test_runs_on_its_own_daemon_thread_in_the_loading_context_once(self):
+        import contextvars
+        ctx = FakeCtx()
+        marker = contextvars.ContextVar("marker", default="lost")
+        seen = []
+        marker.set("profile scope")
+        with patch.object(mi.Service, "run_forever", lambda svc: seen.append((marker.get(), threading.current_thread()))):
+            first = mi.start_in_gateway(ctx, gateway=True)
+            second = mi.start_in_gateway(ctx, gateway=True)
+            mi._SERVICE.thread.join(5)
+        self.assertEqual((first, second), ("started", "already running"))
+        self.assertEqual(ctx.unload, [mi.stop_service])
+        (value, thread), = seen
+        self.assertEqual(value, "profile scope")            # contextvars.copy_context().run
+        self.assertEqual(thread.name, mi.TASK_NAME)
+        self.assertTrue(thread.daemon)
+        self.assertNotIn("_gateway_runner_ref", Path(mi.__file__).read_text())
+
+    def test_unload_stops_the_service_thread(self):
         ctx = FakeCtx()
 
-        async def go():
-            return mi.start_in_gateway(ctx, gateway=True), mi.start_in_gateway(ctx, gateway=True)
+        def blocking_idle(conn, seconds, on_resp):
+            mi._SERVICE.stop.wait(5) if mi._SERVICE else None
 
-        first, second = asyncio.run(go())
-        self.assertEqual((first, second), ("started", "already running"))
-        self.assertEqual(ctx.spawned, [mi.TASK_NAME])
-        self.assertEqual(ctx.unload, [mi.stop_service])
+        with patch.object(mi, "connect", lambda a: FakeConn()), patch.object(mi, "idle_once", blocking_idle):
+            self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "started")
+            svc = mi._SERVICE
+            time.sleep(0.2)
+            ctx.unload[0]()
+            svc.thread.join(10)
+        self.assertFalse(svc.thread.is_alive())
+        self.assertTrue(svc.stop.is_set())
 
     def test_is_gateway_process_reads_argv(self):
         with patch.object(sys, "argv", ["hermes", "-p", "x", "gateway", "run", "--replace"]), \
@@ -410,27 +423,6 @@ class GatewayStartTests(Base):
         self.assertIs(phconf.DEFAULTS["features"]["mail_push"], True)
         preset = json.loads((Path(__file__).resolve().parent.parent / "presets" / "juan.json").read_text())
         self.assertIs(preset["features"]["mail_push"], True)
-
-    def test_run_async_cancels_cleanly(self):
-        svc = mi.Service([mi.Account(name="a", host="h")], {}, lambda: True,
-                         status=mi.Status(path=self.tmp / "hb.json"), connect_fn=lambda a: FakeConn(),
-                         window=(7, 23), tz=TZ)
-
-        def blocking_idle(conn, seconds, on_resp):
-            svc.stop.wait(5)
-
-        async def go():
-            task = asyncio.create_task(svc.run_async())
-            await asyncio.sleep(0.2)
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
-
-        with patch.object(mi, "idle_once", blocking_idle):
-            asyncio.run(go())
-        self.assertTrue(svc.stop.is_set())
-        self.assertFalse(any(w.is_alive() for w in svc.workers))
-        self.assertEqual(json.loads((self.tmp / "hb.json").read_text())["accounts"]["a"]["state"], "stopped")
 
 
 class DoctorTests(Base):
@@ -533,34 +525,43 @@ class PausedRadarTests(Base):
 
     def test_paused_disabled_or_state_paused_skips_with_log(self):
         for job in ({"id": self.JID, "enabled": False}, {"id": self.JID, "enabled": True, "paused_at": "2026-11-25T10:00"},
-                    {"id": self.JID, "enabled": True, "state": "paused"}):
+                    {"id": self.JID, "state": "paused"}, {"id": self.JID, "state": "disabled"},
+                    {"id": self.JID, "state": "completed"}):
             with self.assertLogs(mi.log, "INFO") as cm:
-                self.assertFalse(mi.poke_radar(job_state=lambda j, job=job: job, in_process=self.fail_poke,
-                                               cli=self.fail_poke))
+                self.assertFalse(mi.poke_radar(job_state=lambda j, job=job: job, cli=self.fail_poke))
             self.assertIn("radar paused, poke skipped", "\n".join(cm.output))
 
     def test_unknown_or_missing_job_is_not_poked(self):
-        self.assertFalse(mi.poke_radar(job_state=lambda j: None, in_process=self.fail_poke, cli=self.fail_poke))
-        self.assertFalse(mi.poke_radar(job_state=lambda j: {}, in_process=self.fail_poke, cli=self.fail_poke))
+        self.assertFalse(mi.poke_radar(job_state=lambda j: None, cli=self.fail_poke))
+        self.assertFalse(mi.poke_radar(job_state=lambda j: {}, cli=self.fail_poke))
 
-    def test_outside_hermes_reads_profile_jobs_file(self):
-        with patch.dict(sys.modules, {"cron.jobs": None}):
-            self.assertIsNone(mi.radar_job_state(self.JID))                       # no file: unknown
-            self.jobs.write_text(json.dumps({"jobs": [{"id": self.JID, "enabled": True, "paused_at": "x"}]}))
-            self.assertTrue(mi.job_paused(mi.radar_job_state(self.JID)))
-            self.assertFalse(mi.poke_radar(in_process=self.fail_poke, cli=self.fail_poke))
-            self.jobs.write_text(json.dumps([{"id": self.JID, "enabled": True, "paused_at": None}]))
-            self.assertTrue(mi.poke_radar(in_process=lambda j: True, cli=self.fail_poke))
-            self.assertEqual(mi.radar_job_state("0" * 12), {})
+    def list_output(self, badge):
+        out = f"Scheduled Jobs (profile: x)\n\n  {self.JID} [{badge}]\n    Name:      Proactive · mail radar\n"
+        return lambda argv, **k: SimpleNamespace(returncode=0, stdout=out, stderr="")
 
-    def test_inside_hermes_reads_job_through_cron_jobs(self):
-        import types
-        mod = types.ModuleType("cron.jobs")
-        mod.get_job = lambda j: {"id": j, "enabled": True, "paused_at": "2026-11-25T10:00"}
-        with patch.dict(sys.modules, {"cron": types.ModuleType("cron"), "cron.jobs": mod}):
-            self.assertFalse(mi.poke_radar(in_process=self.fail_poke, cli=self.fail_poke))
-            mod.get_job = lambda j: {"id": j, "enabled": True, "paused_at": None}
-            self.assertTrue(mi.poke_radar(in_process=lambda j: True, cli=self.fail_poke))
+    def test_reads_the_radar_state_from_the_public_cron_list(self):
+        calls = []
+
+        def run(argv, **k):
+            calls.append((argv[1:], k["env"]["HERMES_HOME"]))
+            return self.list_output("paused")(argv, **k)
+
+        self.assertEqual(mi.radar_job_state(self.JID, run=run), {"id": self.JID, "state": "paused"})
+        self.assertEqual(calls, [(["cron", "list", "--all"], str(phconf.hermes_home()))])
+        self.assertTrue(mi.job_paused(mi.radar_job_state(self.JID, run=self.list_output("paused"))))
+        self.assertFalse(mi.job_paused(mi.radar_job_state(self.JID, run=self.list_output("active"))))
+        self.assertEqual(mi.radar_job_state("0" * 12, run=self.list_output("active")), {})
+        none = lambda argv, **k: SimpleNamespace(returncode=0, stdout="No scheduled jobs in profile 'x'.\n", stderr="")  # noqa: E731
+        self.assertEqual(mi.radar_job_state(self.JID, run=none), {})
+        broken = lambda argv, **k: SimpleNamespace(returncode=1, stdout="", stderr="boom")  # noqa: E731
+        self.assertIsNone(mi.radar_job_state(self.JID, run=broken))
+        garbled = lambda argv, **k: SimpleNamespace(returncode=0, stdout="??", stderr="")  # noqa: E731
+        self.assertIsNone(mi.radar_job_state(self.JID, run=garbled))
+
+    def test_never_imports_private_cron_functions(self):
+        source = Path(mi.__file__).read_text()
+        for name in ("get_job", "trigger_job", "cron.jobs"):
+            self.assertNotIn(name, source)
 
 
 class RecStop(threading.Event):

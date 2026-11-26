@@ -232,6 +232,7 @@ class JobTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {"HERMES_HOME": home}, clear=True))
         self.home = Path(home)
         self.run = FakeCron()
+        self.enterContext(patch.object(jobs, "_plugin_ensure", self.run.ensure))
         self.cfg = cli.base_config("custom")
         self.cfg["owner"]["name"] = "Alex"
         self.cfg["timezone"] = "Europe/Berlin"
@@ -254,14 +255,16 @@ class JobTests(unittest.TestCase):
     def test_job_runs_the_gate_every_15_minutes_and_installs_both_scripts(self):
         self.cfg["calendar"]["enabled"] = True
         jobs.apply(self.cfg, run=self.run)
-        (argv,) = self.created()
+        jid = self.run.job("Proactive · meeting prep")
+        argv = self.run.live[jid]
         opt = lambda flag: argv[argv.index(flag) + 1]  # noqa: E731
         self.assertEqual(opt("--script"), "proactive-hermes/meeting_prep_gate.py")
         self.assertEqual(opt("--name"), "Proactive · meeting prep")
-        self.assertEqual(argv[argv.index("--") + 1], "*/15 7-21 * * *")
+        self.assertEqual(self.run.toolsets[jid], ["terminal", "file", "skills"])
+        self.assertEqual(self.run.schedule_of(jid), "*/15 7-21 * * *")
         self.assertIn("proactive-hermes:proactive-desk", [argv[i + 1] for i, a in enumerate(argv) if a == "--skill"])
         self.assertNotIn("--no-agent", argv)
-        prompt = argv[-1]
+        prompt = self.run.prompt_of(jid)
         for text in ("compose --job meeting-prep", "meeting_prep_gate.py done --key <key> --outcome said|quiet",
                      "Never email, message, RSVP", "Final answer = [SILENT]", "380 characters", "`item_key`",
                      str(self.home / "scripts" / "proactive-hermes")):

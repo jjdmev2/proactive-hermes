@@ -2,7 +2,7 @@
 
 **First, check delivery:** `hermes proactive doctor`
 
-Desk messages are real replies in this profile's **Bot Chat** (Bot Mode, on by default in the Hermes desktop app: open the Bots tab and click your Bot once). Keep the desktop app or `hermes gateway start` running, or nothing reaches you. `hermes proactive doctor --send-test` posts a test message so you can see it on your phone.
+Desk messages are real replies in this profile's **Bot Chat** (Bot Mode, on by default in the Hermes desktop app: open the Bots tab and click your Bot once). The job "Proactive · say" hands each one to your Bot through Hermes's own scheduled Bot Chat delivery. Keep the desktop app or `hermes gateway start` running, or nothing reaches you. After setup, `hermes proactive doctor --send-test` sends a test message so you can see it on your phone.
 
 **Next step: set up your desk.** Pick one:
 
@@ -15,7 +15,7 @@ You choose **Juan's setup** (proven defaults, you only fill in your details) or 
 
 **Optional, instant mail push:** by default mail is checked every 15 minutes. To get new mail within 1 to 3 minutes, make an app password for a mailbox (Gmail: open myaccount.google.com/apppasswords, with 2-Step Verification on; iCloud: account.apple.com > Sign-In and Security > App-Specific Passwords), then fill **Mailbox 1 address** and **Mailbox 1 app password** in Settings → Plugins → Proactive Hermes, or with `hermes plugins config proactive-hermes`. Never paste it into a chat. Restart Hermes, then `hermes proactive doctor` shows which mailboxes have instant push.
 
-Optional: `pip install holidays` to skip public holidays.
+Public holidays: the plugin declares the `holidays` package, which Hermes installs with it after your yes. Without it the work recap simply does not skip holidays.
 
 **Get the most out of it:** install the Hermes mobile app and share Reminders, Alarms, Location and Calendar, and sign in once (in the browser Hermes uses) to the shops, marketplaces and event sites you want watched.
 

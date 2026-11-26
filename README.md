@@ -77,7 +77,7 @@ Things you can set up the same way: a new card set or sneaker drop ("alarm me wh
 | :--- | :--- | :--- |
 | **Hermes Agent 0.23.4 or newer** | The plugin uses Bot Mode delivery and the cron scheduler. | `hermes update` |
 | **Bot Mode** | Desk messages arrive as normal replies in your Bot's **Bot Chat**, with the app's normal notification. | Bot Mode is on by default in the Hermes desktop app. Open the **Bots** tab and click your Bot once so its Bot Chat exists. You read it in the desktop app or the Hermes mobile app. |
-| **The gateway running** | Messages are delivered through your profile's running gateway. If it is off, nothing reaches you. | Keep the Hermes desktop app open, or run `hermes gateway start`. |
+| **The gateway running** | Messages go to your Bot through Hermes's own scheduled Bot Chat delivery, which needs your profile's running gateway. If it is off, messages wait and nothing reaches you until it is back. | Keep the Hermes desktop app open, or run `hermes gateway start`. |
 | **The right profile** | The desk talks in the Bot Chat of the profile (Bot) you install it into. | Use your main assistant Bot. If that is not your default profile, add `-p <profile name>` to every command below, for example `hermes -p assistant plugins install ...`. `hermes profile list` shows the names. |
 | **Hermes mobile app** (recommended) | Desk messages buzz your phone like a text; reminders, alarms and leave times need it. Tested on iPhone. | See [Give Hermes access](#give-hermes-access). The plugin works without it, and `doctor` tells you it is missing. |
 
@@ -88,7 +88,7 @@ hermes plugins install jjdmev2/proactive-hermes --enable
 hermes proactive doctor
 ```
 
-`hermes proactive doctor` checks the gateway, the Bot Chat, the phone, the OpenAI key, your mail, your approval levels and the installed scripts, and tells you how to fix anything missing. `hermes proactive doctor --send-test` posts one test message into your Bot Chat, so you can see it land on your phone. If `hermes proactive` is not found (plugins running with `plugins.isolation: host`), use `python3 ~/.hermes/plugins/proactive-hermes/cli.py doctor` and the same flags.
+`hermes proactive doctor` checks the gateway, the Bot Chat, the say job that delivers desk messages, the phone, the OpenAI key, your mail, your approval levels and the installed scripts, and tells you how to fix anything missing. After setup, `hermes proactive doctor --send-test` sends one test message to your Bot Chat and waits for your Bot's reply, so you can see it land on your phone. If `hermes proactive` is not found (plugins running with `plugins.isolation: host`), use `python3 ~/.hermes/plugins/proactive-hermes/cli.py doctor` and the same flags.
 
 After you update the plugin, run `hermes proactive setup` once: it installs the new scripts and updates the jobs. Loading the plugin never changes them. Until then `doctor` says `runtime out of date: run hermes proactive setup`.
 
@@ -105,7 +105,7 @@ The desk only sees what you connect. All of it is optional, but connect at least
 | **Slack and Linear** | Asks waiting on you, the work recap, promises made in Slack. | Hermes connectors (Nous Portal). |
 | **Rides, trains and food** (optional extra) | Bookings from the look-ahead: "Uber to the station at 08:40?" on your yes. | Sign in once to Uber's site (m.uber.com), your rail operator and your food delivery site in Hermes's browser. See [Bookings](#bookings-optional-extra). |
 | **Your apps and sites** | Watches on marketplaces (Vinted, eBay), shops (Amazon, your local hardware store), event pages (Luma, Eventbrite, conferences), ticket drops. | Sign in once in Hermes's browser (the browser tool; with `local` it uses a copy of your own Chrome profile). Never paste passwords into chat. |
-| **Public holidays** | Skip holidays in the countries you pick. | `~/.hermes/hermes-agent/venv/bin/pip install holidays` (the Python Hermes runs on) |
+| **Public holidays** | Skip holidays in the countries you pick. | Nothing to do. The plugin declares the `holidays` package and Hermes installs it with the plugin after your yes. Without it the work recap simply does not skip holidays. |
 
 ## Set it up
 
@@ -202,12 +202,14 @@ To uninstall completely: `hermes proactive remove`, then `hermes plugins remove 
 2. **Filter.** With an OpenAI key, the decision model scores each new mail from its sender, subject and the start of the body. Clear noise is dropped and logged, so the agent never spends time on it.
 3. **Read and pick.** The desk agent reads what is left and writes candidate items: a decision you must make, an action you must take, or a digest line.
 4. **Resolve.** If an item needs you to send, reply, intro, book or decide, the agent searches mail, Slack, past chats and its own records first. It stores a draft with a source for every fact.
-5. **Gate.** The gate ranks the items, removes anything you heard recently, caps the message at 3 items (5 in a brief) and holds non-urgent items during quiet hours. It sends one short numbered message as a normal chat reply.
+5. **Gate.** The gate ranks the items, removes anything you heard recently, caps the message at 3 items (5 in a brief) and holds non-urgent items during quiet hours. It queues one short numbered message and runs the job `Proactive · say` right away. That job prints the message, Hermes's scheduled Bot Chat delivery hands it to your Bot, and your Bot posts it word for word as a normal reply, with the app's normal notification. It takes a few seconds. If that run fails, the job's own schedule (every 2 minutes outside quiet hours) sends it.
 6. **Act.** What your approval levels allow happens right away (a block, a reminder, an alarm, a leave time) and the message says so. Everything else waits for you: reply "1" and Hermes shows the draft or action with its sources and asks "Send as is?". A yes does it.
 
 **What it costs to run.** The desk jobs are ordinary agent runs on the model of your Bot's profile. A cheap, fast model is enough: on our desk they use about 1% of the daily usage included in a Nous Portal plan, because most runs stop at step 1 or 2.
 
 The plugin installs plain Python scripts under `scripts/proactive-hermes/` in your Hermes home and ordinary Hermes cron jobs named `Proactive · ...`. Your settings and history stay in `plugin-data/proactive-hermes/` there.
+
+Each agent job gets only the tools it needs, because it reads text from other people: terminal (its scripts and the mail and calendar commands), file and skills for every job, past chats for the promise tracker, web search for the look-ahead, and web plus the browser only for your watches. Your Slack and Linear connectors stay available to every job. Every 10 minutes the tick archives the desk's own finished scheduled runs (`Proactive · ...`) so they stay out of the app sidebar. Nothing else is archived, and nothing is deleted.
 
 ## The decision model (highly recommended)
 
@@ -275,7 +277,15 @@ The cut-off is 0.10, so the filter only removes mail it is close to certain abou
 
 Proactive Hermes is a starting point. Swap sources, add your own, and wire it to the tools you already use.
 
-An example from my own setup (Juan here). I built REUS, a meeting recorder like Granola. It files each call on its own in my company second brain or my personal one. REUS is a separate tool and is not part of this plugin. When a call is transcribed, REUS notifies Hermes. Hermes reads the notes and decides if anything is critical. If I said I would do something on the call, it comes back with that task, text, email or document ready for me to review and share. My daily standup is read twice: the Slack huddle transcript and the REUS recording, so the recap catches what one of them missed.
+An example from my own setup (Juan here). REUS is our own AI meeting minutes app. It sorts every call by person and by department, posts the minutes to Slack, and notifies Hermes by webhook as soon as a call is ready. Hermes applies the desk rules and reaches out on its own. After an internal infrastructure call, it reminded me of something I had promised and not done yet:
+
+> Infra call: you said you'd mount your Mac public SSH key before they deploy tomorrow.
+
+![A Proactive Hermes follow-up from a REUS call, on the phone's lock screen](docs/assets/screens/08-reus-call-followup.png)
+
+*A follow-up from a REUS call, on the lock screen.*
+
+REUS is a separate tool and is not part of this plugin. My daily standup is read twice: the Slack huddle transcript and the REUS recording, so the recap catches what one of them missed.
 
 To add a source like this, give Hermes one way to read it (a CLI, an API or a script), then ask it in chat to add it to the desk: what to watch, what counts as important, and what it should prepare for you.
 
@@ -308,6 +318,8 @@ Works with sites that book on the web: Uber (m.uber.com), most rail operators, W
 
 - **Approval first.** The desk only does on its own what you allowed in setup (in Juan's setup: blocks, reminders, alarms, leave times and cleanup of its own items). Sending, replying, registering, buying and booking wait for your yes to that exact action, unless you let a specific watch act on its own. Hermes never enters card details or passwords, and nothing is paid without your yes to an exact quote.
 - **Local.** Settings, drafts, promises and logs stay in your Hermes home, in a folder only your user can read. We run no server and collect no telemetry.
+- **Least tools.** Each scheduled job runs with only the toolsets it needs (see [How it works](#how-it-works)). Only watches get the browser, and no scheduled job can book or pay.
+- **Public Hermes surfaces only.** Desk messages go out through Hermes's documented scheduled Bot Chat delivery, jobs are run with `hermes cron run`, and the plugin never writes Hermes's chat database.
 - **Your Bot's model sees what the desk reads.** Mail, Slack and calendar text go to the model provider of your Bot's profile, as in any Hermes chat.
 - **What goes to OpenAI** (only with a key, only to the Decisions API): for mail, the sender, subject and first 600 characters of the body; for Slack, the message being judged; for promises and the work recap, the message or call item and the Linear title it is matched against; for your replies, the reply and the numbered list it answers; and the text of anything checked for prompt injection. Nothing else, and no files. OpenAI offers zero data retention for eligible accounts.
 - **Keys come only through Hermes.** The plugin never opens `.env` files, Hermes's sign-in files, another tool's config or login, or a keychain. Your OpenAI key and mail push app passwords are read through Hermes, for your profile only.
@@ -321,16 +333,16 @@ Works with sites that book on the web: Uber (m.uber.com), most rail operators, W
 
 Everything the plugin touches outside its own folder:
 
-- **Background IMAP connections** to the mailboxes you set up for [instant mail push](#instant-mail-push-optional), and only those, from inside the Hermes gateway.
+- **Background IMAP connections** to the mailboxes you set up for [instant mail push](#instant-mail-push-optional), and only those, from the plugin's own background thread inside the Hermes gateway. New mail runs the mail radar with `hermes cron run`; a radar you paused is never run.
 - **OpenAI Decisions API calls**, only if you add a key (see "What goes to OpenAI" above).
 - **Your Bot's model provider** sees the mail, Slack, calendar and page text the desk reads, as in any Hermes chat.
-- **Messages in your Bot Chat.** The desk posts through Hermes's own Bot Chat delivery code (`tools.bot_live_delivery`), not a public plugin API. Each message enters as an internal turn and your Bot repeats it word for word.
-- **Hermes's chat database** (`state.db` in your Hermes home). The desk searches your past chats there, read only, to resolve items. It writes one thing: a display flag that hides its own relay input from the chat view. It never changes or deletes message text.
+- **Messages in your Bot Chat.** The no-agent job `Proactive · say` prints one desk message under one short line ("Reply with exactly the message below, word for word, nothing before or after, no tools.") and Hermes's public scheduled Bot Chat delivery (`--deliver bot-chat`) hands it to your Bot, which posts the message word for word. You see that scheduled turn in the chat above the reply. No private notes ride along: if you answer "2" to a draft, your Bot looks the draft up with the desk's own script.
+- **Hermes's chat database** (`state.db` in your Hermes home), read only. The desk searches your past chats there to resolve items, and checks through Hermes's public persistence reader that your Bot's reply to each desk message arrived. It never writes to it.
 - **One chat hook** (`pre_llm_call`). Once per profile, before setup, it adds one line asking your Bot to offer setup.
 - **The Hermes mobile bridge database.** It creates, completes and checks reminders and alarms, and reads your phone's last sync time and last shared location, as described above.
 - **Other Hermes files, read only:** the cron job list and job output (health checks), your `USER.md` memory (your name, at setup) and `config.yaml` (plugin settings).
 - **Files it writes outside the plugin folder:** `scripts/proactive-hermes/`, `plugin-data/proactive-hermes/` and `logs/proactive-hermes-mail-push.log`, all in your Hermes home.
-- **Shell commands:** `himalaya` (reading the mailboxes you picked), the google-workspace skill's scripts (reading Gmail and Google Calendar, and creating and removing its own calendar blocks and alerts), `hermes cron` (creating, editing and running its own jobs) and `hermes sessions archive` (hiding finished scheduled runs, and finished sessions with source `push`, from the app sidebar; archive only, never delete). The archive covers every scheduled run in the profile, not only the desk's.
+- **Shell commands:** `himalaya` (reading the mailboxes you picked), the google-workspace skill's scripts (reading Gmail and Google Calendar, and creating and removing its own calendar blocks and alerts), `hermes cron` (creating, editing, listing and running its own jobs; agent jobs are created through Hermes's public `cron.plugin_api.ensure_named_job` so they get their toolsets), `hermes gateway status` (doctor) and `hermes sessions archive` (hiding the desk's own finished scheduled runs, titled `Proactive · ...`, from the app sidebar; archive only, never delete). Your other sessions are never archived.
 - **Slack and Linear** through your Hermes connectors. Sending waits for your yes.
 - **A logged-in browser** for watches on the sites you signed in to yourself, and for bookings you approve. Scheduled jobs never book or pay.
 

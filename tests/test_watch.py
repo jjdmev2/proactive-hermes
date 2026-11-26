@@ -45,6 +45,7 @@ class WatchTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {"HERMES_HOME": home}, clear=True))
         self.home = Path(home)
         self.run = FakeCron()
+        self.enterContext(patch.object(jobs, "_plugin_ensure", self.run.ensure))
         cfg = cli.base_config("custom")
         cfg["features"] = dict.fromkeys(cfg["features"], False)
         self.config = cli.write_config(cfg)
@@ -68,10 +69,13 @@ class WatchTests(unittest.TestCase):
 
     def test_add_list_reapply_and_remove_only_the_watch(self):
         self.assertEqual(self.command(ADD + ["--then", "alarm", "--urgent"])[0], 0)
-        self.assertEqual([a[2] for a in self.run.calls], ["create"])
-        jid, argv = next(iter(self.run.live.items()))
+        # The say job (plain create) and the watch (ensure_named_job with toolsets, then edit).
+        self.assertEqual([a[2] for a in self.run.calls], ["create", "edit"])
+        jid = self.run.job("Proactive · watch: Card drop")
+        argv = self.run.live[jid]
         self.assertEqual(argv[argv.index("--name") + 1], "Proactive · watch: Card drop")
-        self.assertEqual(argv[-2], "*/30 * * * *")
+        self.assertEqual(self.run.schedule_of(jid), "*/30 * * * *")
+        self.assertEqual(self.run.toolsets[jid], ["terminal", "file", "skills", "web", "browser"])
         self.assertEqual(json.loads(self.registry.read_text())["watch:Card drop"]["id"], jid)
         self.assertTrue(json.loads(self.config.read_text())["watches"][0]["urgent"])
         self.assertIn("Card drop", self.command(["watch", "list"])[1])
@@ -82,7 +86,7 @@ class WatchTests(unittest.TestCase):
         self.assertEqual([a[2] for a in self.run.calls], ["list"])
         self.run.live["abcdef123456"] = ["unrelated job"]
         self.assertEqual(self.command(["watch", "remove", "--name", "Card drop"])[0], 0)
-        self.assertEqual(set(self.run.live), {"abcdef123456"})
+        self.assertEqual(set(self.run.live), {"abcdef123456"})   # no watch and nothing else: no say job either
         self.assertEqual(json.loads(self.registry.read_text()), {})
         self.assertEqual(json.loads(self.config.read_text())["watches"], [])
 
@@ -91,15 +95,15 @@ class WatchTests(unittest.TestCase):
         cfg = cli.apply_answers(cfg, {"mobile.enabled": True, "authority.auto": ["alarms", "reminders"]})
         cli.write_config(cfg)
         self.assertEqual(self.command(ADD + ["--then", "alarm", "--urgent"])[0], 0)
-        [jid] = self.run.live
-        self.assertIn("ea_reminders.py alarm", self.run.live[jid][-1])
+        jid = self.run.job("Proactive · watch: Card drop")
+        self.assertIn("ea_reminders.py alarm", self.run.prompt_of(jid))
 
         cfg = cli.phconf.load()
         cfg["authority"]["never"].append("alarms")
         self.run.calls.clear()
         jobs.apply(cfg, run=self.run)
         self.assertEqual([a[2] for a in self.run.calls], ["list", "edit"])
-        self.assertEqual(list(self.run.live), [jid])
+        self.assertEqual(self.run.job("Proactive · watch: Card drop"), jid)
         argv = self.run.live[jid]
         updated = argv[argv.index("--prompt") + 1]
         self.assertNotIn("ea_reminders.py alarm", updated)

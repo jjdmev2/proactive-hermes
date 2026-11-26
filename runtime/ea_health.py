@@ -78,12 +78,19 @@ def load_jobs() -> list[dict]:
     return [r for r in rows if isinstance(r, dict)]
 
 
+SAY_JOB = ph_jobs.job_name("say")
+
+
 def check_local_delivery(jobs: list[dict]) -> None:
-    """Keep cron responses in the local lane; desk messages use the delivery helper."""
+    """Keep cron responses in the local lane; desk messages go out only through the say job, whose output (one
+    desk message) is the one thing delivered to Bot Chat."""
     for job in jobs:
+        say = job.get("name") == SAY_JOB
         for field, flag in (("deliver", "--deliver"), ("failure_deliver", "--failure-deliver")):
             value = str(job.get(field) or "").strip()
             if value == "local" or (not value and field == "failure_deliver"):
+                continue
+            if say and field == "deliver" and value == "bot-chat":
                 continue
             proc = subprocess.run(["hermes", "-p", phconf.profile_name(), "cron", "edit", job["id"], flag, "local"],
                                   capture_output=True, text=True, timeout=60)
@@ -103,8 +110,9 @@ def check_say_outbox() -> None:
 
 
 def check_say_receipts() -> None:
-    """desk_say fails closed: a post whose outcome is unclear is never retried. Surface those so
-    a message for the owner cannot vanish quietly (last status 'unverified', or 'posting' > 10 min)."""
+    """desk_say fails closed: a message handed to the say job is never printed again. Surface the ones whose Bot
+    reply was not seen in Bot Chat, so a message for the owner cannot vanish quietly (last status 'unverified',
+    or 'handed' or 'posting' for over 15 min)."""
     path = STATE_DIR / "say_log.jsonl"
     last: dict[str, dict] = {}
     try:
@@ -117,8 +125,16 @@ def check_say_receipts() -> None:
                 last[row["id"]] = row
     except FileNotFoundError:
         return
+    try:
+        sys.path.insert(0, str(HERE))
+        import desk_say
+        if any(r.get("status") == "handed" for r in last.values()) and desk_say.confirm():
+            return check_say_receipts()   # some were confirmed just now: read the log again
+    except Exception:
+        pass
     stuck = [r for r in last.values() if r.get("status") == "unverified"
-             or (r.get("status") == "posting" and (t := parse_ts(r.get("at"))) and now() - t > timedelta(minutes=10))]
+             or (r.get("status") in ("posting", "handed") and (t := parse_ts(r.get("at")))
+                 and now() - t > timedelta(minutes=15))]
     if stuck:
         fault("desk", f"{len(stuck)} desk message(s) with an unclear post, check say_log")
 
@@ -435,7 +451,7 @@ def main() -> int:
         text = (f"{phconf.owner()}, the desk has a fault and may miss things until it's fixed: "
                 + "; ".join(lines[:2]))
         # No push: internal faults don't require the owner's intervention.
-        desk_say.deliver(text, key="health:" + "|".join(sorted(lines))[:200], job="health", push_enabled=False)
+        desk_say.deliver(text, key="health:" + "|".join(sorted(lines))[:200], job="health")
     return 0
 
 

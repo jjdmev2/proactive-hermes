@@ -93,10 +93,10 @@ class ResolveHealthTests(unittest.TestCase):
         })
 
     def test_expected_jobs_use_installed_jobs_and_plugin_prefix(self):
-        # Custom defaults install 7 jobs (no calendar: no meeting prep; resolve_first and mail_push are not jobs).
+        # Custom defaults install 8 jobs (no calendar: no meeting prep; resolve_first and mail_push are not jobs).
         # An unknown "Proactive ·" job stands in for none of them; a job without the prefix is not a desk job.
         health.check_jobs([{"name": "Proactive · one"}, {"name": "Proactive · morning brief"}, {"name": "health"}])
-        missing = ("mail radar", "promise tracker", "evening brief", "weekly review", "health", "tick")
+        missing = ("mail radar", "promise tracker", "evening brief", "weekly review", "health", "tick", "say")
         self.assertEqual(list(health.faults.values()), [
             ("desk", "desk job missing: " + ", ".join("Proactive · " + name for name in missing)),
         ])
@@ -119,6 +119,27 @@ class ResolveHealthTests(unittest.TestCase):
             health.check_local_delivery([{"id": "example-job", "deliver": "origin"}])
         run.assert_called_once_with(["hermes", "-p", "example", "cron", "edit", "example-job",
                                      "--deliver", "local"], capture_output=True, text=True, timeout=60)
+
+    def test_only_the_say_job_keeps_its_bot_chat_delivery(self):
+        jobs = [{"id": "say-job", "name": "Proactive · say", "deliver": "bot-chat", "failure_deliver": "local"},
+                {"id": "radar", "name": "Proactive · mail radar", "deliver": "bot-chat"},
+                {"id": "say-fail", "name": "Proactive · say", "deliver": "bot-chat", "failure_deliver": "origin"}]
+        with patch.object(health.subprocess, "run") as run, patch.object(health, "log"):
+            health.check_local_delivery(jobs)
+        healed = [call.args[0][5:] for call in run.call_args_list]
+        self.assertEqual(healed, [["radar", "--deliver", "local"], ["say-fail", "--failure-deliver", "local"]])
+
+    def test_handed_message_without_a_seen_reply_is_reported_after_15_minutes(self):
+        log = health.STATE_DIR / "say_log.jsonl"
+        health.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.append(log, {"id": "old", "status": "handed", "text": "x", "at": (self.clock - timedelta(minutes=16)).isoformat()})
+        self.append(log, {"id": "new", "status": "handed", "text": "y", "at": (self.clock - timedelta(minutes=2)).isoformat()})
+        self.append(log, {"id": "ok", "status": "handed", "text": "z", "at": (self.clock - timedelta(hours=1)).isoformat()})
+        self.append(log, {"id": "ok", "status": "delivered", "at": self.clock.isoformat()})
+        import desk_say
+        with patch.object(desk_say, "confirm", return_value=0):
+            health.check_say_receipts()
+        self.assertEqual(list(health.faults.values()), [("desk", "1 desk message(s) with an unclear post, check say_log")])
 
     def test_main_runs_resolve_step_without_other_health_effects(self):
         self.run_row("a", "b", "c")

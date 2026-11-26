@@ -93,6 +93,9 @@ DEFAULTS: dict = {
         "lookahead": "*/30 7-22 * * *",
         "meeting_prep": "*/15 7-21 * * *",
         "tick": "*/10 7-23 * * *",
+        # Safety net only: every desk message kicks the say job at once (`hermes cron run`); quiet hours are
+        # enforced by the job itself, so urgent messages still go at night.
+        "say": "*/2 7-22 * * *",
     },
 }
 

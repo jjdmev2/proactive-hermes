@@ -9,8 +9,8 @@ when the gateway loads the plugin. Nothing is read from another tool's config, a
 other mailbox stays on the radar's schedule (15 minutes by default).
 
 It only POKES the plugin's own mail radar cron job (the job `hermes proactive setup` registered under
-the key "mail_radar"): the job's next run moves to now and its gate reads mail as usual. A radar the owner
-paused or disabled is never poked (a poke would un-pause it). It never calls a model, never posts, never
+the key "mail_radar") with the public `hermes cron run <id>`: the job runs now and its gate reads mail as usual.
+A radar the owner paused or disabled (its `hermes cron list --all` badge is not [active]) is never poked. It never calls a model, never posts, never
 reads or stores mail content, and never logs addresses or secrets: the log names a mailbox by its slot
 ("acct#2"). Polling on the radar's schedule stays on as the safety net.
 
@@ -19,7 +19,8 @@ dead NAT path is noticed within minutes. Errors reconnect with jittered backoff 
 only after a full IDLE round); a refused login waits 1 h. Log: logs/proactive-hermes-mail-push.log (0600,
 rotated at 1 MB, 3 kept).
 
-Inside the gateway, `start_in_gateway(ctx)` runs it as a supervised task (`ctx.spawn_task`); blocking
+Inside the gateway, `start_in_gateway(ctx)` runs the service loop on the plugin's own daemon thread, started in a
+copy of the plugin-loading context (so it keeps the profile scope) and stopped by `ctx.on_unload`; blocking
 IMAP lives in one thread per mailbox. CLI loads never start it. Feature flag: features.mail_push.
 With `plugins.isolation: host` the plugin host cannot tell a gateway from a CLI parent, so push stays off
 there and `hermes proactive doctor` reports 15 min checks only.
@@ -31,7 +32,6 @@ there and `hermes proactive doctor` reports 15 min checks only.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import contextvars
 import imaplib
 import json
@@ -415,48 +415,35 @@ def radar_job_id() -> str | None:
 
 
 def job_paused(job: dict) -> bool:
-    """A job the owner paused or disabled. trigger_job would set enabled and clear paused_at, so never poke it."""
-    return job.get("enabled") is False or bool(job.get("paused_at")) or str(job.get("state") or "") == "paused"
+    """A job the owner paused or disabled: never poke it."""
+    return job.get("enabled") is False or bool(job.get("paused_at")) or str(job.get("state") or "active") != "active"
 
 
-def _job_from_file(job_id: str, path: Path | None = None) -> dict | None:
-    """The job row from <HERMES_HOME>/cron/jobs.json ({"jobs": [...]} or a bare list); None when unreadable."""
+def _hermes() -> str:
+    return shutil.which("hermes") or str(Path.home() / ".local" / "bin" / "hermes")
+
+
+def _cron_list(run=subprocess.run) -> str | None:
     try:
-        data = json.loads((path or phconf.hermes_home() / "cron" / "jobs.json").read_text())
-    except (OSError, ValueError):
-        return None
-    rows = data.get("jobs") if isinstance(data, dict) else data
-    for row in rows if isinstance(rows, list) else []:
-        if isinstance(row, dict) and row.get("id") == job_id:
-            return row
-    return {}
-
-
-def radar_job_state(job_id: str) -> dict | None:
-    """The radar's cron row: in-process through cron.jobs when inside Hermes, else jobs.json. {} = not found,
-    None = unknown."""
-    try:
-        from cron.jobs import get_job
-    except Exception:
-        return _job_from_file(job_id)
-    try:
-        return get_job(job_id) or {}
+        proc = run([_hermes(), "cron", "list", "--all"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                   timeout=60, env={**os.environ, "HERMES_HOME": str(phconf.hermes_home()), "NO_COLOR": "1"})
     except Exception as exc:
-        log.warning("reading the radar job failed: %s", type(exc).__name__)
+        log.warning("hermes cron list failed: %s", type(exc).__name__)
         return None
+    return proc.stdout if proc.returncode == 0 else None
 
 
-def _trigger_in_process(job_id: str) -> bool | None:
-    """True/False when cron.jobs is importable (inside Hermes), None when it is not."""
-    try:
-        from cron.jobs import trigger_job
-    except Exception:
+def radar_job_state(job_id: str, run=subprocess.run) -> dict | None:
+    """The radar's state from the public `hermes cron list --all` ("  <id> [active|paused|disabled|completed]").
+    {} = not found, None = unknown."""
+    out = _cron_list(run)
+    if out is None:
         return None
-    try:
-        return trigger_job(job_id) is not None
-    except Exception as exc:
-        log.warning("trigger_job failed: %s", type(exc).__name__)
-        return False
+    m = re.search(rf"^[ \t]+{re.escape(job_id)} \[([^\]\n]+)\]", out, re.MULTILINE)
+    if not m:
+        return {} if re.search(r"^No scheduled jobs\b", out, re.MULTILINE) or re.search(
+            r"^[ \t]+[0-9a-f]{12} \[", out, re.MULTILINE) else None
+    return {"id": job_id, "state": m.group(1)}
 
 
 _INFLIGHT: list = []   # the detached `hermes cron run` process, if any
@@ -481,8 +468,8 @@ def _trigger_cli(job_id: str, popen=subprocess.Popen) -> bool | None:
     return True
 
 
-def poke_radar(*, dry_run: bool = False, job_id: str | None = None, in_process=_trigger_in_process,
-               cli=_trigger_cli, job_state=None) -> bool | None:
+def poke_radar(*, dry_run: bool = False, job_id: str | None = None, cli=_trigger_cli,
+               job_state=None) -> bool | None:
     jid = job_id or radar_job_id()
     if not jid:
         log.warning("no mail radar job registered, nothing to poke")
@@ -500,9 +487,7 @@ def poke_radar(*, dry_run: bool = False, job_id: str | None = None, in_process=_
     if dry_run:
         log.info("dry-run: would poke the mail radar")
         return True
-    ok = in_process(jid)
-    if ok is None:
-        ok = cli(jid)
+    ok = cli(jid)
     if ok is None:
         return None  # busy: the debouncer retries
     log.info("poked the mail radar: %s", "ok" if ok else "failed")
@@ -787,6 +772,7 @@ class Service:
         self.workers = [Worker(a, self.debouncer, self.status, self.stop, connect_fn, label=labels.get(a.name, a.name))
                         for a in accounts]
         self._last_hb = 0.0
+        self.thread: threading.Thread | None = None   # the service loop's own thread (start_in_gateway)
 
     def start(self) -> None:
         for w in self.workers:
@@ -817,20 +803,6 @@ class Service:
         finally:
             self.shutdown()
 
-    async def run_async(self) -> None:
-        """Supervised by ctx.spawn_task: blocking IMAP stays in threads; cancel stops them cleanly."""
-        self.start()
-        try:
-            while not self.stop.is_set():
-                if self.debouncer.is_due():
-                    await asyncio.to_thread(self.debouncer.tick)
-                if self.status.changed or time.monotonic() - self._last_hb >= HEARTBEAT_EVERY:
-                    await asyncio.to_thread(self.status.write)
-                    self._last_hb = time.monotonic()
-                await asyncio.sleep(1)
-        finally:
-            await asyncio.to_thread(self.shutdown)
-
 
 # ---------------------------------------------------------------- gateway start
 
@@ -850,15 +822,6 @@ def is_gateway_process() -> bool:
         return True
     argv = [a for a in sys.argv[1:] if not a.startswith("-")]
     return "gateway" in argv and "run" in argv[argv.index("gateway") + 1:]
-
-
-def _gateway_loop():
-    try:
-        from gateway.run import _gateway_runner_ref
-        loop = getattr(_gateway_runner_ref(), "_gateway_loop", None)
-    except Exception:
-        return None
-    return loop if loop is not None and loop.is_running() and not loop.is_closed() else None
 
 
 def build_service(ctx=None, *, dry_run: bool = False, secret=None) -> Service:
@@ -881,7 +844,7 @@ def stop_service() -> None:
             w.close()
 
 
-def start_in_gateway(ctx, *, gateway: bool | None = None, wait_s: float = 600, secret=None) -> str:
+def start_in_gateway(ctx, *, gateway: bool | None = None, secret=None) -> str:
     """Start mail push once per process, only inside the gateway. Returns what happened (for logs/tests)."""
     global _SERVICE
     if not phconf.config_path().exists():
@@ -906,28 +869,11 @@ def start_in_gateway(ctx, *, gateway: bool | None = None, wait_s: float = 600, s
         ctx.on_unload(stop_service)
     except Exception:
         pass
-
-    def spawn():
-        ctx.spawn_task(svc.run_async(), name=TASK_NAME)
-
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        # Plugins can load on a discovery thread before the gateway loop runs: hand off once it is up. The thread
-        # runs in a copy of this context, so it keeps the profile scope plugin loading had.
-        def handoff():
-            deadline = time.monotonic() + wait_s
-            while time.monotonic() < deadline and _SERVICE is svc:
-                loop = _gateway_loop()
-                if loop is not None:
-                    loop.call_soon_threadsafe(spawn)
-                    return
-                time.sleep(1)
-            log.warning("mail push not started: no gateway loop")
-        threading.Thread(target=contextvars.copy_context().run, args=(handoff,), name="mail-push-handoff",
-                         daemon=True).start()
-        return "waiting for the gateway loop"
-    spawn()
+    # The plugin's own daemon thread, in a copy of this context: it keeps the profile scope plugin loading had.
+    thread = threading.Thread(target=contextvars.copy_context().run, args=(svc.run_forever,), name=TASK_NAME,
+                              daemon=True)
+    svc.thread = thread
+    thread.start()
     return "started"
 
 

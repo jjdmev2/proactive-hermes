@@ -11,7 +11,7 @@ from __future__ import annotations
 # Every managed job key, in install order. jobs.JOBS holds one template per key (a test keeps them equal).
 MANAGED_KEYS: tuple[str, ...] = (
     "morning_brief", "mail_radar", "slack_sweep", "promises", "work_recap_after_daily", "work_recap_evening",
-    "evening_brief", "weekly_review", "lookahead", "meeting_prep", "health", "tick",
+    "evening_brief", "weekly_review", "lookahead", "meeting_prep", "health", "tick", "say",
 )
 
 PREFIX = "Proactive \u00b7 "   # every managed job's name starts with it
@@ -22,7 +22,7 @@ NAMES: dict[str, str] = {
     "morning_brief": "morning brief", "mail_radar": "mail radar", "slack_sweep": "Slack and calendar sweep",
     "promises": "promise tracker", "work_recap_after_daily": "work recap after the daily",
     "work_recap_evening": "work wrap-up", "evening_brief": "evening brief", "weekly_review": "weekly review",
-    "lookahead": "look-ahead", "meeting_prep": "meeting prep", "health": "health", "tick": "tick",
+    "lookahead": "look-ahead", "meeting_prep": "meeting prep", "health": "health", "tick": "tick", "say": "say",
 }
 
 # Jobs switched by a feature flag with another name.
@@ -44,6 +44,8 @@ def enabled(cfg: dict, key: str) -> bool:
     """Is the managed job KEY installed for this config? Feature flag plus the connection it needs."""
     if key.startswith("watch:"):
         return True
+    if key == "say":   # how every desk message reaches Bot Chat: installed whenever anything can speak
+        return bool(cfg.get("watches")) or any(enabled(cfg, k) for k in MANAGED_KEYS if k != "say")
     feats = cfg.get("features", {})
     if key == "slack_sweep":
         return bool(feats.get("slack_sweep") and cfg["slack"].get("enabled"))

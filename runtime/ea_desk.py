@@ -46,7 +46,6 @@ import fcntl
 import hashlib
 import json
 import re
-import shlex
 import sys
 import threading
 from contextlib import contextmanager
@@ -378,13 +377,6 @@ def write_resolve_wait(rows) -> None:
             tmp.unlink(missing_ok=True)
 
 
-def draft_note(n: int, key: str) -> str:
-    script = shlex.quote(str(phconf.scripts_dir() / "ea_resolve.py"))
-    return (f'{n} = {key}: draft stored. If {phconf.owner()} replies {n}, "draft" or "show me", run '
-            f'`python3 {script} show --key {shlex.quote(key)}` '
-            'and paste its output exactly, then ask "Send as is?". Send nothing without their yes to that exact text.')
-
-
 def cmd_compose(a, raw: str | None = None) -> int:
     if raw is None:
         raw = Path(a.file).read_text() if a.file else sys.stdin.read()
@@ -402,7 +394,7 @@ def compose(a, items: list[dict], *, flush=False) -> int:
     print_only = getattr(a, "print_only", False)
     STATE.mkdir(parents=True, exist_ok=True)
     # The tick and producers share these queues. Serialize selection and state changes,
-    # but release the lock before the Bot Chat door can wait on a turn lease.
+    # but release the lock before desk_say runs the say job.
     with (STATE / "compose.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         t = now()
@@ -427,15 +419,14 @@ def compose(a, items: list[dict], *, flush=False) -> int:
         print("[SILENT]")
         return 0
 
-    ping, urgent, notes = prepared
+    ping, urgent = prepared
     message = ping["text"]
     receipt = {"status": "printed"}
     if not print_only:
-        # The desk posts in Bot Chat as an assistant message. The cron run stays private.
+        # The desk posts in Bot Chat as a Bot reply (the say job). The cron run stays private.
         sys.path.insert(0, str(HERE))
         import desk_say
-        note_arg = {"notes": notes} if notes else {}
-        receipt = desk_say.deliver(message, key=f"{a.job}:{','.join(ping['keys'])}", job=a.job, urgent=urgent, **note_arg)
+        receipt = desk_say.deliver(message, key=f"{a.job}:{','.join(ping['keys'])}", job=a.job, urgent=urgent)
     append(PING_LOG, {**ping, "delivery": receipt.get("status"), "row_id": receipt.get("row_id")})
     print(message if print_only else "[SILENT]")
     return 0
@@ -662,10 +653,9 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
                            "kind": it["kind"], "text": it["text"], "job": a.job}
     save_json(SAID, said)
     drafts = {key: rec["status"] for key, rec in zip(keys_said, draft_rows) if rec is not None}
-    notes = "\n".join(draft_note(n, key) for n, (key, rec) in enumerate(zip(keys_said, draft_rows), 1) if rec is not None)
     ping = {"at": at, "kind": "desk_message", "job": a.job, "keys": keys_said,
             "refs": [i.get("ref") for i in speak], "text": message, "drafts": drafts}
-    return ping, any(i.get("urgent") for i in speak), notes
+    return ping, any(i.get("urgent") for i in speak)
 
 
 def cmd_flush(a) -> int:

@@ -632,7 +632,8 @@ class ManagedJobIdentity(OfflineTestCase):
         connected["features"].update(slack_sweep=True, lookahead=True, work_recap=True)  # daily_call stays off
         connected["watches"] = [{"name": "Card drop", "schedule": "*/15 * * * *", "check": "c", "when": "w",
                                  "then": "tell"}]
-        return {"custom defaults": (custom, 7), "juan preset": (juan, 12), "custom connected": (connected, 11)}
+        # Each count includes the say job, which hands every desk message to Bot Chat.
+        return {"custom defaults": (custom, 8), "juan preset": (juan, 13), "custom connected": (connected, 12)}
 
     def test_job_registry_and_names_match_templates(self):
         import jobs

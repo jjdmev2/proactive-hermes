@@ -13,6 +13,10 @@ description: >
   sending, buying and registering wait for your yes. Set up with /proactive setup.
 requires_hermes: ">=0.23.4"
 provides_tools: []
+# Optional at runtime: the work recap skips public holidays only when `holidays` imports (guarded import in
+# runtime/work_recap_gate.py). Declared so Hermes installs it with the plugin, after your consent.
+python_dependencies:
+  - "holidays>=0.40,<1"
 provides_hooks: [pre_llm_call]
 optional_env:
   - name: OPENAI_API_KEY

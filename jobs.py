@@ -100,7 +100,31 @@ JOBS: list[dict] = [
      "body": "Proactive Hermes health watchdog (no-agent script)."},
     {"key": "tick", "name": ph_jobs.NAMES["tick"], "script": "desk_tick.py", "no_agent": True,
      "body": "Proactive Hermes outbox and reminder retry (no-agent script)."},
+    # Every desk message reaches Bot Chat through this job: desk_say queues it and runs the job at once; the
+    # script prints one due message and cron's public bot-chat delivery hands it to the Bot as a real reply.
+    {"key": "say", "name": ph_jobs.NAMES["say"], "script": "say_job.py", "no_agent": True, "deliver": "bot-chat",
+     "body": "Proactive Hermes desk messages to Bot Chat (no-agent script)."},
 ]
+
+# Agent jobs read untrusted mail, Slack, calendar and web text, so each runs with only the toolsets it needs
+# (cron.plugin_api.ensure_named_job enabled_toolsets; `hermes cron edit` keeps them). terminal runs the desk scripts
+# and the mail and calendar commands, file writes untrusted text to files, skills reads the desk contract and the
+# connector skills. Enabled MCP servers (Slack, Linear) are added by Hermes on top of any per-job list.
+BASE_TOOLSETS = ["terminal", "file", "skills"]
+TOOLSETS: dict[str, list[str]] = {
+    "promises": BASE_TOOLSETS + ["session_search"],   # "what they told you in chat" reads past chats
+    "lookahead": BASE_TOOLSETS + ["web"],             # operator timetables, organiser pages, weather; never books
+}
+WATCH_TOOLSETS = BASE_TOOLSETS + ["web", "browser"]  # watches check pages: shops, marketplaces, event sites
+
+
+def toolsets_for(job: dict) -> list[str] | None:
+    """The job's enabled_toolsets; None for no-agent jobs (they run a script and no model)."""
+    if job.get("no_agent"):
+        return None
+    if "watch" in job:
+        return list(WATCH_TOOLSETS)
+    return list(TOOLSETS.get(job["key"], BASE_TOOLSETS))
 
 # Appended to the evening brief when meeting prep is on and a calendar is connected (see variables()).
 TOMORROW_MEETINGS = (
@@ -528,12 +552,46 @@ def _options(fields: dict, *, edit: bool) -> list[str]:
     return argv
 
 
+def _edit(run, jid: str, fields: dict) -> None:
+    output = _cron(run, "edit", jid, "--schedule", fields["schedule"], "--prompt", fields["prompt"],
+                   *_options(fields, edit=True))
+    if not re.search(rf"^Updated job: {re.escape(jid)}[ \t]*$", output, re.MULTILINE):
+        raise RuntimeError(f"`hermes cron edit` did not confirm updating {jid}.")
+
+
+def _plugin_ensure(name: str, **kwargs) -> dict:
+    from cron.plugin_api import ensure_named_job   # public cron API for plugins; create only
+    return ensure_named_job(name, **kwargs)
+
+
+def _create(run, ensure, fields: dict) -> str:
+    """Create one job. A job with toolsets is created through cron.plugin_api.ensure_named_job (the only public way
+    to set enabled_toolsets), then `hermes cron edit` sets everything else; the edit keeps the toolsets."""
+    toolsets = fields.get("enabled_toolsets")
+    if toolsets is None:
+        output = _cron(run, "create", *_options(fields, edit=False), "--", fields["schedule"], fields["prompt"])
+        return _created_job_id(output)
+    job = (ensure or _plugin_ensure)(fields["name"], prompt=fields["prompt"], schedule=fields["schedule"],
+                                     deliver=fields["deliver"], enabled_toolsets=list(toolsets),
+                                     home=str(phconf.hermes_home()))
+    jid = job.get("id") if isinstance(job, dict) else None
+    if not isinstance(jid, str) or not re.fullmatch(_JOB_ID, jid):
+        raise RuntimeError(f"cron.plugin_api.ensure_named_job returned no job ID for {fields['name']!r}.")
+    if list(job.get("enabled_toolsets") or []) != list(toolsets):
+        # ensure_named_job returns an existing job of the same name unchanged; never adopt or remove one setup
+        # did not record.
+        raise RuntimeError(f"A job named {fields['name']!r} already exists ({jid}) and is not recorded by setup. "
+                           f"Remove it with `hermes cron remove {jid}`, then run `hermes proactive setup` again.")
+    _edit(run, jid, fields)
+    return jid
+
+
 def _job_id(entry) -> str | None:
     # Earlier releases stored bare IDs. Reconcile once to learn their spec.
     return entry.get("id") if isinstance(entry, dict) else entry
 
 
-def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run) -> list[dict]:
+def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None) -> list[dict]:
     reg = _load_registry()
     live = _list_job_ids(run) if reg else set()
     out = []
@@ -549,7 +607,7 @@ def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run) -> list[dict]
             "prompt": prompt_for(job, cfg),
             "schedule": job["schedule"] if "watch" in job else cfg["schedule"][key],
             "name": PREFIX + job["name"],
-            "deliver": "local",
+            "deliver": job.get("deliver", "local"),
             "failure_deliver": "local",
             "script": f"proactive-hermes/{job['script']}" if job.get("script") else None,
             "no_agent": bool(job.get("no_agent")),
@@ -559,27 +617,36 @@ def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run) -> list[dict]
         }
         if job.get("skills"):  # only jobs with skills carry the key, so other jobs' specs stay unchanged
             fields["skills"] = job["skills"]
+        toolsets = toolsets_for(job)
+        if toolsets is not None:  # agent jobs only, so the no-agent jobs' specs stay unchanged
+            fields["enabled_toolsets"] = toolsets
         # The CLI list omits settings like prompt and catch-up. Cache the last
         # applied spec (not the private prompt text) for no-op reapplication.
         spec = sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
         if enabled(cfg, job):
+            record = {"toolsets": toolsets} if toolsets is not None else {}
+            same_toolsets = toolsets is None or (isinstance(entry, dict) and entry.get("toolsets") == toolsets)
             if jid not in live:
                 action = "create"
                 if not dry_run:
-                    output = _cron(run, "create", *_options(fields, edit=False), "--",
-                                   fields["schedule"], fields["prompt"])
-                    reg[key] = {"id": _created_job_id(output), "spec": spec}
+                    reg[key] = {"id": _create(run, ensure, fields), "spec": spec, **record}
                     _save_registry(reg)
-            elif isinstance(entry, dict) and entry.get("spec") == spec:
+            elif isinstance(entry, dict) and entry.get("spec") == spec and same_toolsets:
                 action = "keep"
-            else:
+            elif same_toolsets:
                 action = "update"
                 if not dry_run:
-                    output = _cron(run, "edit", jid, "--schedule", fields["schedule"], "--prompt",
-                                   fields["prompt"], *_options(fields, edit=True))
-                    if not re.search(rf"^Updated job: {re.escape(jid)}[ \t]*$", output, re.MULTILINE):
-                        raise RuntimeError(f"`hermes cron edit` did not confirm updating {jid}.")
-                    reg[key] = {"id": jid, "spec": spec}
+                    _edit(run, jid, fields)
+                    reg[key] = {"id": jid, "spec": spec, **record}
+                    _save_registry(reg)
+            else:
+                # `hermes cron edit` cannot change toolsets: replace the job (new id, same name and settings).
+                action = "replace"
+                if not dry_run:
+                    _remove(run, jid)
+                    del reg[key]
+                    _save_registry(reg)
+                    reg[key] = {"id": _create(run, ensure, fields), "spec": spec, **record}
                     _save_registry(reg)
         else:
             action = "remove" if jid in live else "skip"

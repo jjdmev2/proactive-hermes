@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """Pre-flight checks: can the desk reach the owner's Bot Chat, and is the phone set up?
 
-    ph_doctor.py            JSON report: gateway, bot_chat, mobile, decisions, mail, authority, runtime, and
+    ph_doctor.py            JSON report: gateway, bot_chat, say_job, mobile, decisions, mail, authority, runtime, and
                             mail_push (per mailbox: "instant push", or "15 min checks" with the reason
                             and the next step; never an address or a password)
-    ph_doctor.py --send-test   also posts one test message into Bot Chat (proves live delivery)
+    ph_doctor.py --send-test   also sends one test message to Bot Chat through the say job and waits up to a
+                               minute for the Bot's reply (proves live delivery)
 
-Every desk message is delivered as a real reply in this profile's Bot Chat (Hermes Bot Mode),
-through this profile's running gateway. No gateway or no Bot Mode means no messages.
+Every desk message is delivered as a real Bot reply in this profile's Bot Chat (Hermes Bot Mode): the plugin's
+no-agent job "Proactive · say" hands it over with Hermes's public cron Bot Chat delivery (`--deliver bot-chat`),
+which needs this profile's running gateway. Only public Hermes surfaces are used: `hermes gateway status`,
+`hermes cron list` and the read-only persistence reader.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -25,6 +33,8 @@ FIX = {
                "Desk messages are delivered through the running gateway.",
     "bot_chat": "Turn on Bot Mode: in the Hermes desktop app open the Bots tab (on by default) and click this "
                 "profile's Bot once. Its Bot Chat is where every desk message lands. It is also created on the first delivery.",
+    "say_job": "Run `hermes proactive setup`: it installs the \"Proactive · say\" job that hands desk messages to Bot Chat. "
+               "If it is paused, resume it with `hermes cron resume <id>`.",
     "mobile": "Install the Hermes mobile app, sign in to the same Hermes, open this Bot's chat once, and share "
               "Reminders, Alarms, Location and Calendar in the app settings. Notifications for desk messages come from the app.",
     "decisions": "Set PROACTIVE_OPENAI_API_KEY: Settings -> Plugins -> Proactive Hermes -> OpenAI key for the decision "
@@ -61,31 +71,55 @@ def check_runtime() -> tuple[bool, str]:
 def _agent_path() -> None:
     root = phconf.agent_root()   # derived from the active Hermes home, never from an environment variable
     if root.exists() and str(root) not in sys.path:
-        sys.path.insert(0, str(root))
+        sys.path.append(str(root))
+
+
+def _hermes(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    exe = shutil.which("hermes") or str(Path.home() / ".local" / "bin" / "hermes")
+    return subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                          env={**os.environ, "HERMES_HOME": str(phconf.hermes_home()), "NO_COLOR": "1"})
 
 
 def check_gateway(home: Path) -> tuple[bool, str]:
-    _agent_path()
+    """`hermes gateway status` (public CLI): its first line says whether this profile's gateway runs."""
     try:
-        from tools.bot_live_delivery import find_canonical_live_owner
-        owner = find_canonical_live_owner(home)
-    except ValueError as exc:
-        return False, str(exc)
-    except Exception as exc:  # older core or no store
-        return False, f"{type(exc).__name__}: {exc}"[:160]
-    if owner is None:
-        return False, "this profile has no session store yet"
-    return True, "running"
+        proc = _hermes("gateway", "status")
+    except Exception as exc:
+        return False, f"{type(exc).__name__}"[:80]
+    first = next((line.strip() for line in (proc.stdout or "").splitlines() if line.strip()), "")
+    if "Gateway is running" in first:
+        return True, "running"
+    return False, (first or (proc.stderr or "").strip() or "gateway status unreadable")[:160]
 
 
 def check_bot_chat(home: Path) -> tuple[bool, str]:
+    """Read only, through Hermes's public persistence reader."""
     _agent_path()
     try:
-        from tools.bot_live_delivery import _bot_chat_tip
-        tip = _bot_chat_tip(home)
+        from persistence_assembly import open_persistence_reader, profile_scope, store_exists
+        if not store_exists(profile_scope(home=home)):
+            return False, "this profile has no session store yet"
+        with open_persistence_reader(home) as store:
+            row = store.sessions.get_by_title("Bot Chat")
     except Exception as exc:
         return False, f"{type(exc).__name__}"[:80]
-    return (True, "found") if tip else (False, "not created yet (it is created on the first delivery)")
+    return (True, "found") if row else (False, "not created yet (it is created on the first delivery)")
+
+
+def check_say_job() -> tuple[bool, str]:
+    """The say job is recorded by setup and listed by `hermes cron list --all` as active."""
+    import desk_say
+    jid = desk_say.say_job_id()
+    if not jid:
+        return False, "not installed"
+    try:
+        out = _hermes("cron", "list", "--all").stdout or ""
+    except Exception as exc:
+        return False, f"{type(exc).__name__}"[:80]
+    m = re.search(rf"^[ \t]+{re.escape(jid)} \[([^\]\n]+)\]", out, re.MULTILINE)
+    if not m:
+        return False, f"job {jid} not found"
+    return (True, jid) if m.group(1) == "active" else (False, f"job {jid} is {m.group(1)}")
 
 
 def check_mobile(home: Path) -> tuple[bool, str]:
@@ -114,7 +148,11 @@ def report(send_test: bool = False) -> dict:
     except Exception:
         dec = (False, "unavailable")
     mail = (phconf.google_api().exists() or bool(phconf.CFG["mail"].get("himalaya_accounts")), "")
-    checks = {"gateway": gw, "bot_chat": bc, "mobile": mob, "decisions": dec, "mail": mail,
+    try:
+        say = check_say_job()
+    except Exception as exc:
+        say = (False, f"{type(exc).__name__}"[:80])
+    checks = {"gateway": gw, "bot_chat": bc, "say_job": say, "mobile": mob, "decisions": dec, "mail": mail,
               "authority": check_authority(), "runtime": check_runtime()}
     for name, (ok, note) in checks.items():
         row = {"ok": ok}
@@ -130,18 +168,36 @@ def report(send_test: bool = False) -> dict:
     except Exception as exc:
         out["mail_push"] = {"all": {"mode": "15 min checks", "reason": f"push status unreadable ({type(exc).__name__})",
                                     "next": "Run `hermes proactive doctor` again; if it stays, report it."}}
-    # Bot Chat may be missing until the first delivery; the gateway is the hard requirement.
-    out["ready"] = gw[0]
+    # Bot Chat may be missing until the first delivery; the gateway and the say job are the hard requirements.
+    out["ready"] = gw[0] and say[0]
     if send_test:
-        if not gw[0]:
-            out["test_message"] = {"status": "skipped", "reason": "gateway not running"}
+        if not out["ready"]:
+            out["test_message"] = {"status": "skipped",
+                                   "reason": "gateway not running" if not gw[0] else "say job not ready"}
         else:
-            import desk_say
-            owner = phconf.owner()
-            res = desk_say.deliver(f"Proactive Hermes is connected, {owner}. Desk messages will land here, like this one.",
-                                   key="proactive-hermes-test", job="setup", urgent=True)
-            out["test_message"] = {"status": res.get("status"), "id": res.get("id")}
+            out["test_message"] = send_test_message()
     return out
+
+
+def send_test_message(wait_s: float = 60) -> dict:
+    """Queue one test message, kick the say job, then wait for the Bot's reply in Bot Chat (read only)."""
+    import desk_say
+    owner = phconf.owner()
+    text = (f"Proactive Hermes is connected, {owner}. Desk messages will land here, like this one. "
+            f"({time.strftime('%H:%M')})")   # a new text each run, so a second test is not a duplicate
+    res = desk_say.deliver(text, key="proactive-hermes-test", job="setup", urgent=True)
+    row = {"status": res.get("status"), "id": res.get("id")}
+    if res.get("status") != "handed":
+        row["reason"] = res.get("kick") or res.get("reason") or ""
+        return row
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        if desk_say.confirm() and res.get("id") in desk_say.delivered_ids():
+            row["status"] = "delivered"
+            return row
+        time.sleep(3)
+    row["reason"] = "handed to Bot Chat; the Bot's reply did not appear within a minute"
+    return row
 
 
 def main(argv=None) -> int:

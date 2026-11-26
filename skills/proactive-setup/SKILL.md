@@ -15,7 +15,7 @@ You are setting up the proactive desk for the person you are chatting with. Keep
 
 ## 0. Check delivery first
 
-Every desk message is a real reply in this profile's **Bot Chat** (Hermes Bot Mode, on by default in the desktop app), delivered through this profile's running gateway. Run:
+Every desk message is a real reply in this profile's **Bot Chat** (Hermes Bot Mode, on by default in the desktop app). The job "Proactive · say" hands it to the Bot through Hermes's own scheduled Bot Chat delivery, so this profile's gateway must be running. Run:
 
 ```
 hermes proactive doctor

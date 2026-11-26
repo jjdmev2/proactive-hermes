@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Post desk updates in Bot Chat as real messages, through the gateway's canonical Bot Chat door.
+"""Desk messages reach the owner's Bot Chat as real Bot replies, through Hermes's public cron Bot Chat delivery.
 
-The text is admitted as an internal turn ("DESK RELAY <id>"); the Bot Chat agent replies with it
-verbatim. The owner sees a normal assistant message, live in the app and in the agent's context, and
-gets the app's own reply notification. There is no separate push. The relay input card is hidden
-afterwards (display_metadata.model_only, display-only). Never insert chat messages into state.db
-directly: the live app and the gateway's cached agent would not see them.
+`deliver()` queues the message in say_outbox.jsonl (deduplicated by id) and kicks the plugin's no-agent cron job
+"Proactive · say" with `hermes cron run <id>`. That job runs `desk_say.py next`, which prints exactly one due
+message under one short instruction line; cron delivers the output with `--deliver bot-chat`, the Bot replies with
+the message word for word, and the owner gets the app's normal reply notification. The job's own schedule (every
+2 minutes outside quiet hours) and desk_tick's flush are the safety net when a kick fails. Non-urgent messages
+wait in the outbox during quiet hours; urgent ones go at once.
 
-If the owner is mid-turn in Bot Chat (turn lease held) or the door fails before admission, the message
-is queued in say_outbox.jsonl and `flush` retries it (desk_tick.py, every 10 minutes). The door is
-idempotent on the delivery id (sha256 of the message id), so a retry cannot double-post.
-Tests set DESK_SAY_DISABLE_DOOR=1, which makes any real door call raise.
+Nothing here writes Hermes's state.db. The only read is `confirm`, which looks for the Bot's reply through
+Hermes's public persistence reader (persistence_assembly.open_persistence_reader) to mark a message delivered.
+Delivery is at most once: a message is marked "handed" before it is printed, so it is never posted twice; a
+handed message whose reply is not seen within 15 minutes is reported by the health watchdog.
+Tests set DESK_SAY_DISABLE_DOOR=1, which makes every kick refuse.
 
-  desk_say.py say --key KEY [--job JOB] [--no-push] [--notes TEXT] [--file F | TEXT]   # JSON receipt
-  desk_say.py flush                                         # retry queued messages, silent
+  desk_say.py say --key KEY [--job JOB] [--urgent] [--file F | TEXT]   # JSON receipt
+  desk_say.py next                                                      # the say job: print one due message
+  desk_say.py flush                                                     # kick the say job if anything is due, silent
+  desk_say.py confirm                                                   # mark replies seen in Bot Chat as delivered
   desk_say.py status
 """
 from __future__ import annotations
@@ -23,7 +27,9 @@ import fcntl
 import hashlib
 import json
 import os
-import sqlite3
+import re
+import shutil
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -32,14 +38,15 @@ from pathlib import Path
 
 import phconf
 
-PROFILE = phconf.hermes_home()
-INSTALL_HOME = PROFILE.parent.parent if PROFILE.parent.name == "profiles" else PROFILE
-AGENT = INSTALL_HOME / "hermes-agent"
 STATE = phconf.state_dir()
 OUTBOX = STATE / "say_outbox.jsonl"
 SAY_LOG = STATE / "say_log.jsonl"
-STATE_DB = PROFILE / "state.db"
-LEASE_WAIT_S = 90
+SAY_JOB_KEY = "say"
+# What the Bot reads above the message. Live-tested: the Bot Chat reply equals the message word for word.
+INSTRUCTION = "Reply with exactly the message below, word for word, nothing before or after, no tools."
+KICK_TIMEOUT_S = 120
+MAX_KICKS = 5          # one message per run; a burst drains in a few runs, the schedule takes the rest
+CONFIRM_AFTER_S = 15 * 60
 
 
 def quiet_now() -> bool:
@@ -47,8 +54,6 @@ def quiet_now() -> bool:
     hour = datetime.now(phconf.tz()).hour
     start, end = phconf.quiet_hours()
     return start <= hour < end if start <= end else hour >= start or hour < end
-
-MAX_ATTEMPTS = 30
 
 
 def now_iso() -> str:
@@ -79,137 +84,35 @@ def _append(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        if row.get("status") == "posting":
-            fh.flush()
-            os.fsync(fh.fileno())
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 @contextmanager
 def _delivery_lock():
-    # Lock an inode that flush never replaces; a producer must not race its outbox rewrite.
+    # Lock an inode that the outbox rewrite never replaces; producers and the say job serialize on it.
     STATE.mkdir(parents=True, exist_ok=True)
     with (STATE / "say.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
 
+def _last_status() -> dict[str, dict]:
+    last: dict[str, dict] = {}
+    for row in _lines(SAY_LOG):
+        if isinstance(row.get("id"), str):
+            last[row["id"]] = row
+    return last
+
+
 def delivered_ids() -> set[str]:
-    return {r.get("id") for r in _lines(SAY_LOG) if r.get("status") == "delivered"}
+    return {mid for mid, row in _last_status().items() if row.get("status") == "delivered"}
 
 
 def _settled_ids() -> set[str]:
-    ids = set()
-    for row in _lines(SAY_LOG):
-        mid, status = row.get("id"), row.get("status")
-        if not isinstance(mid, str):
-            continue
-        if status in ("posting", "delivered", "unverified"):
-            ids.add(mid)
-        elif status == "retryable":
-            ids.discard(mid)
-    return ids
-
-
-def _agent_env() -> None:
-    os.environ["HERMES_HOME"] = str(PROFILE)
-    if str(AGENT) not in sys.path:
-        sys.path.insert(0, str(AGENT))
-
-
-def bot_chat_tip() -> str | None:
-    """The live Bot Chat session id (the compression-lineage tip of the chat titled 'Bot Chat')."""
-    _agent_env()
-    from tools.bot_live_delivery import _bot_chat_tip
-    return _bot_chat_tip(PROFILE)
-
-
-def _lineage(db: sqlite3.Connection, sid: str) -> set[str]:
-    seen, cur = set(), sid
-    while cur and cur not in seen:
-        seen.add(cur)
-        row = db.execute("SELECT parent_session_id FROM sessions WHERE id=?", (cur,)).fetchone()
-        cur = row[0] if row else None
-    return seen
-
-
-def turn_active(sid: str) -> bool:
-    db = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=10)
-    try:
-        ids = _lineage(db, sid)
-        q = "SELECT 1 FROM session_turn_leases WHERE expires_at > ? AND conversation_id IN (%s) LIMIT 1"
-        return db.execute(q % ",".join("?" * len(ids)), (time.time(), *ids)).fetchone() is not None
-    finally:
-        db.close()
-
-
-RELAY_PREFIX = "DESK RELAY"
-
-
-def relay_message(mid: str, text: str, notes: str = "") -> str:
-    """The internal input the Bot Chat agent receives; its verbatim reply is what the owner sees."""
-    owner = phconf.owner()
-    context = f"NOTES FOR YOU, never shown to {owner} and never repeated:\n{notes}\n" if notes else ""
-    return (f"{RELAY_PREFIX} {mid[:8]}. Reply to {owner} with exactly the text between the markers, word for "
-            f"word, nothing before or after, no tools.\n{context}<<<\n{text}\n>>>")
-
-
-def door_deliver(mid: str, text: str, notes: str = "") -> dict:
-    """Admit the message as a real Bot Chat turn through the profile's gateway (canonical door).
-    The agent's reply is a normal assistant message: live in the app, in context, and notified by
-    the app's own reply notification. No separate push."""
-    if os.environ.get("DESK_SAY_DISABLE_DOOR") == "1":
-        raise RuntimeError("door disabled (tests)")
-    import hashlib as _h
-    _agent_env()
-    from tools.bot_live_delivery import authority_delivery
-    did = _h.sha256(mid.encode()).hexdigest()[:32]
-    return authority_delivery(PROFILE, {"id": did, "message": relay_message(mid, text, notes), "profile": phconf.profile_name(PROFILE)})
-
-
-def hide_relay_cards(wait_s: float = 0) -> int:
-    """Hide DESK RELAY input cards in Bot Chat once their reply exists (display_metadata.model_only:
-    display-only, stripped before the provider call, so the agent's context is unchanged)."""
-    if os.environ.get("DESK_SAY_DISABLE_DOOR") == "1":
-        return 0
-    return _hide_relay_cards(wait_s)
-
-
-def _hide_relay_cards(wait_s: float) -> int:
-    deadline = time.time() + wait_s
-    hidden = 0
-    while True:
-        db = sqlite3.connect(STATE_DB, timeout=10)
-        try:
-            sid = bot_chat_tip()
-            ids = _lineage(db, sid) if sid else set()
-            if ids:
-                q = ("SELECT m.id, m.display_metadata FROM messages m WHERE m.session_id IN (%s) AND m.role='user' "
-                     "AND m.content LIKE ? AND COALESCE(json_extract(m.display_metadata,'$.model_only'),0)=0 "
-                     "AND EXISTS (SELECT 1 FROM messages r WHERE r.session_id=m.session_id AND r.id>m.id "
-                     "AND r.role='assistant' AND TRIM(COALESCE(r.content,''))<>'')")
-                rows = db.execute(q % ",".join("?" * len(ids)), (*ids, RELAY_PREFIX + "%")).fetchall()
-                for rid, meta in rows:
-                    try:
-                        m = json.loads(meta) if meta else {}
-                    except ValueError:
-                        m = {}
-                    m["model_only"] = True
-                    db.execute("UPDATE messages SET display_metadata=? WHERE id=?", (json.dumps(m), rid))
-                    hidden += 1
-                db.commit()
-        finally:
-            db.close()
-        if hidden or time.time() >= deadline:
-            return hidden
-        time.sleep(5)
-
-
-def _queue(mid: str, key: str, job: str, text: str, reason: str, attempts: int = 0,
-           push_enabled: bool = True, urgent: bool = False, notes: str = "") -> dict:
-    row = {"id": mid, "key": key, "job": job, "text": text, "notes": notes, "queued_at": now_iso(),
-           "reason": reason[:200], "attempts": attempts, "push": push_enabled, "urgent": urgent}
-    _append(OUTBOX, row)
-    return {"status": "queued", "id": mid, "reason": reason[:200]}
+    """Ids that must never be printed again: handed to cron (and maybe delivered) or given up."""
+    return {mid for mid, row in _last_status().items()
+            if row.get("status") in ("handed", "delivered", "unverified", "posting", "abandoned")}
 
 
 def _pending(rows: list[dict]) -> dict[str, dict]:
@@ -219,142 +122,199 @@ def _pending(rows: list[dict]) -> dict[str, dict]:
         if not isinstance(mid, str) or not mid or not isinstance(row.get("text"), str):
             continue
         previous = pending.get(mid, {})
-        attempts = row.get("attempts", 0)
-        pending[mid] = {
-            **row,
-            "attempts": max(previous.get("attempts", 0), attempts if isinstance(attempts, int) else 0),
-            "push": previous.get("push") is not False and row.get("push") is not False,
-        }
+        pending[mid] = {**row, "urgent": bool(previous.get("urgent") or row.get("urgent"))}
     return pending
 
 
-def _chat_tip() -> str:
-    sid = bot_chat_tip()
-    if not sid:
-        raise RuntimeError("Bot Chat session not found")
-    return sid
+def _due(rows: dict[str, dict], settled: set[str], quiet: bool) -> list[dict]:
+    """Due messages, urgent first, then in queue order. Non-urgent ones wait during quiet hours."""
+    due = [r for mid, r in rows.items() if mid not in settled and (r.get("urgent") or not quiet)]
+    return sorted(due, key=lambda r: not r.get("urgent"))
 
 
-def _send(mid: str, key: str, job: str, text: str, sid: str, push_enabled: bool, notes: str) -> dict:
-    receipt = {"status": "posting", "id": mid, "key": key, "job": job, "session_id": sid,
-               "at": now_iso()}
-    # A process may die between the chat append and the final receipt. Fail closed in that gap.
-    _append(SAY_LOG, receipt)
+def _write_outbox(rows: list[dict]) -> None:
+    tmp = OUTBOX.with_suffix(".tmp")
+    tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+    tmp.replace(OUTBOX)
+
+
+def pending_due() -> int:
+    with _delivery_lock():
+        return len(_due(_pending(_lines(OUTBOX)), _settled_ids(), quiet_now()))
+
+
+# ---------------------------------------------------------------- the say job
+
+def say_job_id() -> str | None:
+    """The plugin's own say job: jobs.json key "say" written by `hermes proactive setup`."""
     try:
-        answer = door_deliver(mid, text, notes)
+        reg = json.loads((phconf.data_dir() / "jobs.json").read_text())
+    except (OSError, ValueError):
+        return None
+    entry = reg.get(SAY_JOB_KEY) if isinstance(reg, dict) else None
+    jid = entry.get("id") if isinstance(entry, dict) else entry
+    return jid if isinstance(jid, str) and re.fullmatch(r"[0-9a-f]{12}", jid) else None
+
+
+def _hermes() -> str:
+    return shutil.which("hermes") or str(Path.home() / ".local" / "bin" / "hermes")
+
+
+def run_say_job(jid: str) -> bool:
+    """`hermes cron run <id>`: the public way to run a job now. It runs to completion in the CLI (a no-agent script
+    and the Bot Chat hand-off take a few seconds) and never un-pauses anything."""
+    if os.environ.get("DESK_SAY_DISABLE_DOOR") == "1":
+        raise RuntimeError("say job disabled (tests)")
+    proc = subprocess.run([_hermes(), "cron", "run", jid], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          timeout=KICK_TIMEOUT_S,
+                          env={**os.environ, "HERMES_HOME": str(phconf.hermes_home()), "NO_COLOR": "1"})
+    return proc.returncode == 0
+
+
+def kick() -> dict:
+    """Run the say job until nothing is due (at most MAX_KICKS runs). Never raises."""
+    jid = say_job_id()
+    if not jid:
+        return {"kick": "no say job (run `hermes proactive setup`)"}
+    runs = 0
+    try:
+        while runs < MAX_KICKS and pending_due():
+            before = len(_settled_ids())
+            runs += 1
+            run_say_job(jid)
+            if len(_settled_ids()) == before:
+                break   # the run took nothing (the scheduler holds it, or it failed): the schedule retries
     except Exception as exc:
-        # PreDialError (nothing admitted) is safe to retry; anything after the dial may be admitted,
-        # and the door is idempotent on the delivery id, so a retry cannot double-post.
-        _append(SAY_LOG, {**receipt, "status": "retryable"})
-        raise
-    status = str((answer or {}).get("status") or "")
-    if status in ("refused", "failed", "cancelled") or (answer or {}).get("refused"):
-        receipt.update(status="unverified", push="door", reason=f"door {status}: {(answer or {}).get('reason')}"[:200])
-    else:
-        receipt.update(status="delivered", row_id=None, push="door", admission_id=(answer or {}).get("admission_id"),
-                       door_status=status, session_id=(answer or {}).get("session_id") or sid)
-        try:
-            hide_relay_cards(wait_s=90)
-        except Exception:
-            pass  # desk_tick hides it on its next run
-    try:
-        _append(SAY_LOG, receipt)
-    except OSError as exc:
-        # The reservation still blocks retries; report the missing receipt without queueing.
-        receipt["log_error"] = f"{type(exc).__name__}: {exc}"[:200]
-    return receipt
+        return {"kick": f"{type(exc).__name__}: {exc}"[:200], "runs": runs}
+    return {"kick": "ok", "runs": runs}
 
 
-def deliver(text: str, key: str, job: str = "", wait_s: int = LEASE_WAIT_S, push_enabled: bool = True,
-            urgent: bool = False, notes: str = "") -> dict:
-    """Post in Bot Chat. Non-urgent messages during quiet hours wait in the outbox."""
+def take_next() -> str | None:
+    """The say job's step: mark the first due message handed and return it, else None."""
+    with _delivery_lock():
+        rows = _lines(OUTBOX)
+        if not rows:
+            return None
+        pending = _pending(rows)
+        settled = _settled_ids()
+        due = _due(pending, settled, quiet_now())
+        keep = [r for mid, r in pending.items() if mid not in settled]
+        if not due:
+            if len(keep) != len(pending):
+                _write_outbox(keep)
+            return None
+        row = due[0]
+        # Fail closed: once handed, never printed again, even if this process dies before printing.
+        _append(SAY_LOG, {"status": "handed", "id": row["id"], "key": row.get("key"), "job": row.get("job"),
+                          "text": row["text"], "at": now_iso(), "epoch": time.time()})
+        _write_outbox([r for r in keep if r["id"] != row["id"]])
+        return row["text"]
+
+
+def job_output(text: str) -> str:
+    return f"{INSTRUCTION}\n\n{text}"
+
+
+# ---------------------------------------------------------------- producers
+
+def deliver(text: str, key: str, job: str = "", urgent: bool = False, kick_now: bool = True) -> dict:
+    """Queue TEXT for Bot Chat and kick the say job. Non-urgent messages wait in the outbox during quiet hours."""
     text = text.strip()
     if not text:
         return {"status": "empty"}
     mid = msg_id(key, text)
-    if not urgent and quiet_now():
-        with _delivery_lock():
-            if mid in _settled_ids():
-                return {"status": "duplicate", "id": mid}
-            pending = _pending(_lines(OUTBOX)).get(mid, {})
-            if pending:
-                return {"status": "queued", "id": mid, "reason": "quiet hours"}
-            return _queue(mid, key, job, text, "quiet hours", push_enabled=push_enabled, notes=notes)
-    deadline = time.monotonic() + wait_s
-    while True:
-        with _delivery_lock():
-            if mid in _settled_ids():
-                return {"status": "duplicate", "id": mid}
-            pending = _pending(_lines(OUTBOX)).get(mid, {})
-            notify = push_enabled and pending.get("push") is not False
-            relay_notes = notes or pending.get("notes", "")
-            try:
-                sid = _chat_tip()
-                if not turn_active(sid):
-                    return _send(mid, key, job, text, sid, notify, relay_notes)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(f"{phconf.owner()} is mid-turn in Bot Chat")
-            except Exception as exc:
-                return _queue(mid, key, job, text, f"{type(exc).__name__}: {exc}",
-                              attempts=pending.get("attempts", 0), push_enabled=notify, urgent=urgent, notes=relay_notes)
-        # Let flush or another producer run while waiting for the turn lease.
-        time.sleep(min(5, remaining))
-
-
-def flush() -> list[dict]:
     with _delivery_lock():
-        rows = _lines(OUTBOX)
-        if not rows:
-            return []
-        done = _settled_ids()
-        results, keep = [], []
-        for mid, r in _pending(rows).items():
-            if mid in done:
-                continue
-            if quiet_now() and not r.get("urgent"):
-                keep.append(r)  # held for the morning; not a failed attempt
-                continue
-            try:
-                sid = _chat_tip()
-                if turn_active(sid):
-                    raise TimeoutError(f"{phconf.owner()} is mid-turn in Bot Chat")
-                results.append(_send(mid, r.get("key", ""), r.get("job", ""), r["text"], sid, r["push"],
-                                     r.get("notes", "")))
-            except Exception as exc:
-                attempts = r["attempts"] + 1
-                if attempts < MAX_ATTEMPTS:
-                    keep.append({**r, "attempts": attempts, "reason": f"{type(exc).__name__}: {exc}"[:200]})
-                else:
-                    _append(SAY_LOG, {"status": "abandoned", "id": mid, "key": r.get("key"), "at": now_iso()})
-        tmp = OUTBOX.with_suffix(".tmp")
-        tmp.write_text("".join(json.dumps(k, ensure_ascii=False) + "\n" for k in keep), encoding="utf-8")
-        tmp.replace(OUTBOX)
-        return results
+        if mid in _settled_ids():
+            return {"status": "duplicate", "id": mid}
+        if mid not in _pending(_lines(OUTBOX)):
+            _append(OUTBOX, {"id": mid, "key": key, "job": job, "text": text, "queued_at": now_iso(), "urgent": urgent})
+    if not urgent and quiet_now():
+        return {"status": "queued", "id": mid, "reason": "quiet hours"}
+    receipt = {"status": "queued", "id": mid}
+    if kick_now:
+        receipt.update(kick())
+        if mid in _settled_ids():
+            receipt["status"] = "handed"
+    return receipt
 
 
-def main() -> int:
+def flush() -> dict:
+    """desk_tick's safety net: kick the say job when something is due."""
+    return kick() if pending_due() else {"kick": "nothing due"}
+
+
+# ---------------------------------------------------------------- confirmation (read only, public reader)
+
+def _content_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+    return str(content or "")
+
+
+def bot_chat_replies(home: Path | None = None) -> list[str] | None:
+    """The Bot's replies in the profile's Bot Chat, newest last; None when the store or the chat is missing."""
+    root = phconf.agent_root()   # a plain `python3` run (an agent's terminal) finds Hermes here
+    if root.exists() and str(root) not in sys.path:
+        sys.path.append(str(root))
+    from persistence_assembly import open_persistence_reader, profile_scope, store_exists
+    home = home or phconf.hermes_home()
+    if not store_exists(profile_scope(home=home)):
+        return None
+    with open_persistence_reader(home) as store:
+        row = store.sessions.get_by_title("Bot Chat")
+        if row is None:
+            return None
+        tip = store.lineage.tip(row.session_id)
+        return [_content_text(m.content).strip() for m in store.messages.read_conversation(tip)
+                if getattr(m, "role", "") == "assistant"]
+
+
+def confirm(replies=None) -> int:
+    """Mark handed messages delivered once the Bot's reply with the same text is in Bot Chat. Returns how many."""
+    handed = [r for r in _last_status().values() if r.get("status") == "handed" and isinstance(r.get("text"), str)]
+    if not handed:
+        return 0
+    try:
+        seen = set((replies if replies is not None else bot_chat_replies()) or [])
+    except Exception:
+        return 0
+    done = 0
+    with _delivery_lock():
+        for row in handed:
+            if row["text"].strip() in seen:
+                _append(SAY_LOG, {"status": "delivered", "id": row["id"], "key": row.get("key"), "at": now_iso()})
+                done += 1
+    return done
+
+
+def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd")
     s = sub.add_parser("say")
     s.add_argument("--key", required=True)
     s.add_argument("--job", default="manual")
     s.add_argument("--file")
-    s.add_argument("--notes", default="", help="Bot Chat context, outside the visible reply")
-    s.add_argument("--no-push", action="store_true", help="kept for compatibility; delivery is a real chat message")
     s.add_argument("--urgent", action="store_true", help="P0 only: deliver even during quiet hours")
     s.add_argument("text", nargs="?")
-    sub.add_parser("flush")
-    sub.add_parser("status")
-    a = p.parse_args()
+    for name in ("next", "flush", "confirm", "status"):
+        sub.add_parser(name)
+    a = p.parse_args(argv)
     if a.cmd == "say":
         text = Path(a.file).read_text() if a.file else (a.text if a.text is not None else sys.stdin.read())
-        receipt = deliver(text, a.key, a.job, push_enabled=not a.no_push, urgent=a.urgent, notes=a.notes)
-        print(json.dumps(receipt, ensure_ascii=False))
+        print(json.dumps(deliver(text, a.key, a.job, urgent=a.urgent), ensure_ascii=False))
+    elif a.cmd == "next":
+        confirm()
+        text = take_next()
+        if text:
+            print(job_output(text))   # cron delivers this to Bot Chat; nothing printed = no delivery
+    elif a.cmd == "confirm":
+        confirm()
     elif a.cmd == "status":
-        print(json.dumps({"queued": len(_lines(OUTBOX)), "delivered": len(delivered_ids())}))
+        print(json.dumps({"queued": len(_pending(_lines(OUTBOX))), "delivered": len(delivered_ids())}))
     else:
-        flush()  # silent: a cron no-agent job prints nothing
+        flush()   # silent: a cron no-agent job prints nothing
     return 0
 
 

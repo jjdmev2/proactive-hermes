@@ -539,7 +539,7 @@ class ResolveGateTests(DeskTests):
         self.assertEqual(self.compose([], "--take-held"), "Work on k\n")
         self.assertEqual(self.rows(desk.RUN_LOG)[-1]["unresolved"], ["k"])
 
-    def test_compose_passes_one_exact_note_per_spoken_draft(self):
+    def test_compose_posts_only_the_visible_text_for_spoken_drafts(self):
         for key in ("second", "third", "rolled"):
             self.put(key, draft="Hello, Sam.")
         self.put("first", act="decide")
@@ -547,15 +547,9 @@ class ResolveGateTests(DeskTests):
                  self.item("rolled", act="send"), self.item("first", "decision", act="decide")]
         text = ("Hey Alex, 3 things:\n1. Work on first\n2. Work on second Draft ready, reply 2.\n"
                 "3. Work on third Draft ready, reply 3.\n+1 more lined up, coming next (or ask me)")
-        expected_notes = "\n".join(
-            f'{n} = {key}: draft stored. If Alex replies {n}, "draft" or "show me", run '
-            f'`python3 {phconf.scripts_dir() / "ea_resolve.py"} show --key {key}` and paste its output '
-            'exactly, then ask "Send as is?". Send nothing without their yes to that exact text.'
-            for n, key in ((2, "second"), (3, "third"))
-        )
         self.assertEqual(self.cli(desk, "compose", "--job", "test", stdin=json.dumps(items)), SILENT)
-        self.deliver.assert_called_once_with(text, key="test:first,second,third", job="test", urgent=False,
-                                             notes=expected_notes)
+        # Nothing but the message: no private notes ride along (the delivery input is visible in Bot Chat).
+        self.deliver.assert_called_once_with(text, key="test:first,second,third", job="test", urgent=False)
         self.assertEqual(self.rows(desk.PING_LOG)[-1]["drafts"], {"second": "ready", "third": "ready"})
         self.assertEqual(self.compose([]), "Work on rolled Draft ready, reply 1.\n")
         self.deliver.reset_mock()

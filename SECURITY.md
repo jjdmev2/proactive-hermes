@@ -22,9 +22,10 @@ The approval file is always your profile's own `plugin-data/proactive-hermes/con
 
 ## Known limits
 
-- Scheduled jobs that read mail and web pages run as normal Hermes agent turns, with Hermes's default tools.
-- The plugin enforces approvals inside its own scripts and tells every job to treat source text as data, but it does not sandbox the agent's other tools.
-- To restrict those tools, use Hermes's own toolset and approval settings.
+- Scheduled jobs that read mail and web pages run as normal Hermes agent turns, each limited to the toolsets it needs: terminal, file and skills for every job, past chats for the promise tracker, web search for the look-ahead, and web plus the browser only for watches. Your enabled MCP connectors (Slack, Linear) are added by Hermes on top.
+- The terminal is still a terminal. The plugin enforces approvals inside its own scripts and tells every job to treat source text as data, but it does not sandbox what the agent could run there.
+- To restrict further, use Hermes's own toolset and approval settings. Run `hermes proactive setup` again after a plugin update so older jobs get their toolsets.
+- Desk messages reach Bot Chat as a scheduled turn your Bot answers. The Bot is told to repeat the message word for word; a message whose exact reply does not appear within 15 minutes is reported by the health check, never sent twice.
 
 ## Untrusted text
 

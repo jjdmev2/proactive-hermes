@@ -681,6 +681,7 @@ class JobTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {"HERMES_HOME": home}, clear=True))
         self.home = Path(home)
         self.run = FakeCron()
+        self.enterContext(patch.object(jobs, "_plugin_ensure", self.run.ensure))
         self.cfg = cli.base_config("custom")
         self.cfg["owner"]["name"] = "Alex"
         self.cfg["timezone"] = "Europe/Berlin"
@@ -692,17 +693,20 @@ class JobTests(unittest.TestCase):
 
     def test_default_config_registers_one_agent_job_with_the_gate_script(self):
         rows = jobs.apply(self.cfg, run=self.run)
-        self.assertEqual([r["action"] for r in rows].count("create"), 1)
-        (argv,) = self.created()
+        self.assertEqual([r["action"] for r in rows if r["job"] != "Proactive · say"].count("create"), 1)
+        jid = self.run.job("Proactive · look-ahead")
+        argv = self.run.live[jid]
         opt = lambda flag: argv[argv.index(flag) + 1]  # noqa: E731
+        # Reads untrusted mail and operator pages: web for timetables, no browser (it never books).
+        self.assertEqual(self.run.toolsets[jid], ["terminal", "file", "skills", "web"])
         self.assertEqual(opt("--script"), "proactive-hermes/lookahead_gate.py")
         self.assertEqual((opt("--deliver"), opt("--failure-deliver"), opt("--timezone")), ("local", "local", "Europe/Berlin"))
         self.assertEqual(opt("--name"), "Proactive · look-ahead")
         # browser-bookings is jobs.py's call (review item 1: not in a scheduled job); the desk skill always loads
         self.assertIn("proactive-hermes:proactive-desk", [argv[i + 1] for i, a in enumerate(argv) if a == "--skill"])
         self.assertNotIn("--no-agent", argv)
-        self.assertEqual(argv[argv.index("--") + 1], "*/30 7-22 * * *")
-        prompt = argv[-1]
+        self.assertEqual(self.run.schedule_of(jid), "*/30 7-22 * * *")
+        prompt = self.run.prompt_of(jid)
         self.assertIn("ea_lookahead.py fired", prompt)
         self.assertIn("compose --job lookahead", prompt)
         self.assertIn(str(self.home / "scripts" / "proactive-hermes"), prompt)
@@ -734,11 +738,11 @@ class JobTests(unittest.TestCase):
         self.cfg["calendar"]["enabled"] = False
         rows = {row["job"]: row["action"] for row in jobs.apply(self.cfg, run=self.run)}
         self.assertEqual(rows["Proactive · look-ahead"], "skip")
-        self.assertFalse(self.created())
+        self.assertFalse(self.run.live)
         self.cfg["mail"]["gmail_api"] = True
         self.cfg["features"]["lookahead"] = False
         jobs.apply(self.cfg, run=self.run)
-        self.assertFalse(self.created())
+        self.assertFalse(self.run.live)
 
     def test_other_jobs_have_no_skill_flags(self):
         self.cfg["features"].update(lookahead=False, health=True)
