@@ -152,7 +152,9 @@ The mail radar checks your mail every 15 minutes. With push, new mail wakes it w
 | **Ask first** | Sending email or Slack, replying to offers, registering for events, purchases (Hermes fills the cart, you pay), bookings (Hermes stops at the price and books on your yes to that exact quote), accepting invites. | Everything not allowed above lands here. Hermes prepares it fully and asks in one line; a "yes" approves that one action. The desk scripts never set a block, reminder or alarm in this row. After your yes in chat, Hermes sets it with its own phone and calendar tools, under Hermes's own approvals. |
 | **Never** | Entering or changing card details or payment methods, approving a payment in your bank app, passwords, deleting data. | These always stay with you. |
 
-The scripts check these levels themselves each time they act. If the approval setting in the config is broken, they refuse every block, reminder and alarm, setup will not save it, and `hermes proactive doctor` says `authority config malformed`.
+The scripts check these levels themselves each time they act. If one action sits in two levels, the strictest wins: never beats ask first, ask first beats without asking. Setup refuses such a setting, and an unknown level or action, with a message that names it, instead of saving or silently dropping it. If the approval setting in the config is broken, the scripts refuse every block, reminder and alarm, setup will not save it, and `hermes proactive doctor` says `authority config malformed`.
+
+Cleanup follows the same levels. The desk ticks off its own phone reminders and deletes its own calendar blocks and alerts only when reminders or calendar blocks are allowed without asking, and a delete also needs "deleting data" to be neither ask first nor never (it is never by default, so by default the desk deletes nothing). When you close an item and a cleanup step is not allowed, the item still closes and Hermes tells you what is left, then removes it with its own tools after your yes.
 
 ### Add your own watches
 
@@ -174,7 +176,7 @@ hermes proactive watch add --name "Card drop" --schedule "*/15 * * * *" \
 | `hermes proactive watch add ...` | Add a watch (see above) |
 | `hermes proactive remove` | Remove every job the plugin created (settings and history stay) |
 
-To uninstall completely: `hermes proactive remove`, then `hermes plugins remove proactive-hermes`, then delete `plugin-data/proactive-hermes/` and `scripts/proactive-hermes/` in your Hermes home (`~/.hermes`, or `~/.hermes/profiles/<name>`).
+To uninstall completely: `hermes proactive remove`, then `hermes plugins remove proactive-hermes`, then delete `plugin-data/proactive-hermes/`, `scripts/proactive-hermes` and `scripts/.proactive-hermes-gen/` in your Hermes home (`~/.hermes`, or `~/.hermes/profiles/<name>`).
 
 ## How it works
 

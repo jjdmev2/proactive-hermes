@@ -41,9 +41,11 @@ class TextFileRoundTrip(unittest.TestCase):
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (self.tmp / "runner.py").write_text(RUNNER, encoding="utf-8")
         (self.tmp / "payload.txt").write_text(PAYLOAD + "\n", encoding="utf-8")
-        (self.tmp / "config.json").write_text('{"calendar": {"enabled": true}}', encoding="utf-8")
+        data = self.tmp / "home" / "plugin-data" / "proactive-hermes"   # the profile's own config and state
+        data.mkdir(parents=True)
+        (data / "config.json").write_text('{"calendar": {"enabled": true}}', encoding="utf-8")
+        self.state = data / "state"
         self.env = {**os.environ, "RUNTIME_DIR": str(RUNTIME), "HERMES_HOME": str(self.tmp / "home"),
-                    "EA_STATE_DIR": str(self.tmp / "state"), "PROACTIVE_HERMES_CONFIG": str(self.tmp / "config.json"),
                     "OPENAI_API_KEY": "", "DESK_SAY_DISABLE_DOOR": "1"}
 
     def run_shell(self, module: str, patched: str, argv: str, stdin: bool = False) -> list[dict]:
@@ -98,7 +100,7 @@ class TextFileRoundTrip(unittest.TestCase):
         proc = subprocess.run(cmd, shell=True, cwd=self.tmp, env=self.env, capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse((self.tmp / "PWNED").exists())
-        rows = json.loads((self.tmp / "state" / "promises.json").read_text(encoding="utf-8"))
+        rows = json.loads((self.state / "promises.json").read_text(encoding="utf-8"))
         row = rows["p1"]
         self.assertEqual(row["what"], PAYLOAD)
         self.assertEqual(row["quote"], PAYLOAD)

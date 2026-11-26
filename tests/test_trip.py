@@ -17,6 +17,7 @@ class FakeCalendar:
         self.inserts = []
         self.readbacks = []
         self.patches = []
+        self.deletes = []
 
     def events(self):
         return self
@@ -41,6 +42,12 @@ class FakeCalendar:
     def patch(self, **request):
         self.patches.append(request)
         raise AssertionError("A repeated trip should not patch its existing block")
+
+    def delete(self, **request):
+        self.deletes.append(request)
+        self.fake_events.pop(request["eventId"])
+        self.response = ""
+        return self
 
     def get(self, **request):
         self.readbacks.append(request)

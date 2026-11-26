@@ -21,6 +21,7 @@ import ea_reminders as reminders
 import ph_jobs
 import phconf
 
+HERE = Path(__file__).resolve().parent   # once, at start: the runtime generation this run belongs to
 PROFILE = phconf.hermes_home()
 JOBS = PROFILE / "cron" / "jobs.json"
 OUTPUT = PROFILE / "cron" / "output"
@@ -171,12 +172,30 @@ def registry_ids() -> dict[str, str]:
 def missing_jobs(desk: list[dict]) -> list[str]:
     """Names of the managed jobs the installer keeps for this config (ph_jobs.expected, the installer's own rule:
     only flags that are jobs, only when the connection is there, one per watch) that no live job carries, matched
-    by identity: the installed name, or the id the installer recorded. A duplicate never stands in for another."""
-    names = {(j.get("name") or "").strip() for j in desk}
-    ids = {j.get("id") for j in desk if j.get("id")}
+    one to one by identity. First every expected job with an id the installer recorded claims the live job with that
+    id (renamed or not), then each remaining expected job claims an unclaimed live job with its installed name. A
+    live job counts for at most one expected job, so a duplicate or a misnamed job never stands in for another."""
+    expected = ph_jobs.expected(phconf.CFG)
     recorded = registry_ids()
-    return [ph_jobs.job_name(key) for key in ph_jobs.expected(phconf.CFG)
-            if ph_jobs.job_name(key) not in names and recorded.get(key) not in ids]
+    used: set[int] = set()
+    matched: set[str] = set()
+
+    def claim(key: str, test) -> None:
+        for i, job in enumerate(desk):
+            if i not in used and test(job):
+                used.add(i)
+                matched.add(key)
+                return
+
+    for key in expected:
+        jid = recorded.get(key)
+        if jid:
+            claim(key, lambda job, jid=jid: job.get("id") == jid)
+    for key in expected:
+        if key not in matched:
+            name = ph_jobs.job_name(key)
+            claim(key, lambda job, name=name: (job.get("name") or "").strip() == name)
+    return [ph_jobs.job_name(key) for key in expected if key not in matched]
 
 
 def check_jobs(jobs: list[dict]) -> None:
@@ -410,7 +429,7 @@ def main() -> int:
             log({"error": f"{type(exc).__name__}: {exc}"[:200]})
     lines = report()
     if lines:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        sys.path.insert(0, str(HERE))
         import desk_say
         text = (f"{phconf.owner()}, the desk has a fault and may miss things until it's fixed: "
                 + "; ".join(lines[:2]))

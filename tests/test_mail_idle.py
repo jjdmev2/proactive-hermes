@@ -54,8 +54,12 @@ class Base(unittest.TestCase):
         self.config = self.tmp / "config.json"
         self.config.write_text(json.dumps({"timezone": "Europe/Berlin",
                                            "mail": {"himalaya_accounts": ["icloud", {"account": "work"}]}}))
-        self.enterContext(patch.dict(os.environ, EA_STATE_DIR=str(self.tmp / "state"), HERMES_HOME=str(home),
-                                     PROACTIVE_HERMES_CONFIG=str(self.config)))
+        state = self.tmp / "state"
+        self.enterContext(patch.dict(os.environ, HERMES_HOME=str(home)))
+        # The config and state paths are not settable from the environment: patch the functions.
+        self.enterContext(patch.object(phconf, "config_path", return_value=self.config))
+        self.enterContext(patch.object(phconf, "state_dir",
+                                       side_effect=lambda: state.mkdir(mode=0o700, exist_ok=True) or state))
         self.enterContext(patch.object(phconf, "CFG", phconf.load()))
         self.enterContext(patch.object(phconf, "hermes_home", return_value=home))
         self.enterContext(patch.object(phconf, "secret", side_effect=fake_secret))

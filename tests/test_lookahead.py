@@ -477,7 +477,7 @@ class CliTests(Base):
 
     def run_script(self, script, *args):
         return REAL_RUN([sys.executable, str(script), *args], capture_output=True, text=True,
-                        env={**os.environ, **isolated_env(self.tmp)}, timeout=60)
+                        env={**os.environ, **isolated_env(self.root)}, timeout=60)
 
     def test_subprocess_last_line_and_exit_zero_on_error(self):
         bad = self.run_script(SCRIPT, "scan", "--now", "not-a-date")
@@ -773,7 +773,7 @@ class ConcurrencyTests(Base):
 
     def test_parallel_processes_never_lose_a_write(self):
         self.scan()
-        env = {**os.environ, **isolated_env(self.tmp)}
+        env = {**os.environ, **isolated_env(self.root)}
         procs = [subprocess.Popen([sys.executable, str(SCRIPT), "answer", "--key", key, "--mode", "scooter",
                                    "--note", f"n{i}"], env=env, stdout=subprocess.PIPE, text=True)
                  for i in range(6) for key in ("la:cal:tcg", "la:cal:gig")]
@@ -928,7 +928,7 @@ class NoteFileTests(Base):
         note.write_text(self.EVIL + "\n", encoding="utf-8")
         p = REAL_RUN([sys.executable, str(SCRIPT), "answer", "--key", "la:cal:tcg", "--mode", "booked",
                       "--note-file", str(note)], capture_output=True, text=True, cwd=work,
-                     env={**os.environ, **isolated_env(self.tmp)}, timeout=60)
+                     env={**os.environ, **isolated_env(self.root)}, timeout=60)
         self.assertEqual(json.loads(p.stdout.splitlines()[-1])["status"], "recorded", p.stdout + p.stderr)
         row = self.state()["items"]["la:cal:tcg"]
         self.assertEqual((row["note"], row["answers"][-1]["note"]), (self.EVIL, self.EVIL))
@@ -948,10 +948,12 @@ class StateDirTests(unittest.TestCase):
 
     def test_state_dir_is_0700(self):
         with TemporaryDirectory() as tmp:
-            fresh, loose = Path(tmp) / "new" / "state", Path(tmp) / "loose"
-            loose.mkdir(mode=0o755)
+            homes = Path(tmp) / "new", Path(tmp) / "loose"
+            loose = homes[1] / "plugin-data" / "proactive-hermes" / "state"
+            loose.mkdir(mode=0o755, parents=True)
             loose.chmod(0o755)
-            for d in (fresh, loose):
-                with patch.dict(os.environ, {"EA_STATE_DIR": str(d)}):
+            for home in homes:
+                d = home / "plugin-data" / "proactive-hermes" / "state"
+                with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
                     self.assertEqual(phconf.state_dir(), d)
                 self.assertEqual(d.stat().st_mode & 0o777, 0o700)

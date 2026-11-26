@@ -36,15 +36,17 @@ class ProbeTests(unittest.TestCase):
         self.google_api = home / "skills" / "productivity" / "google-workspace" / "scripts" / "google_api.py"
         self.google_api.parent.mkdir(parents=True)
         self.google_api.touch()
-        self.enterContext(patch.dict(os.environ, EA_STATE_DIR=str(self.tmp), HOME=str(home),
-                                     HERMES_HOME=str(home), PROACTIVE_HERMES_CONFIG=str(config)))
+        self.enterContext(patch.dict(os.environ, HOME=str(home), HERMES_HOME=str(home)))
         global resolve
         resolve = importlib.import_module("ea_resolve")
+        # The config and state paths are not settable from the environment: patch the functions.
+        self.enterContext(patch.object(resolve.phconf, "config_path", return_value=config))
+        self.enterContext(patch.object(resolve.phconf, "state_dir", return_value=self.tmp))
         self.enterContext(patch.object(resolve.phconf, "CFG", resolve.phconf.load()))
         self.enterContext(patch.object(resolve.phconf, "hermes_home", return_value=home))
         self.clock = datetime(2025, 2, 12, 16, tzinfo=resolve.phconf.tz())
         self.enterContext(patch.object(resolve, 'now', lambda: self.clock))
-        self.db = self.tmp / 'state.db'
+        self.db = home / 'state.db'   # Hermes's chat database of the profile
         with closing(sqlite3.connect(self.db)) as db, db:
             db.executescript('''
                 CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL);

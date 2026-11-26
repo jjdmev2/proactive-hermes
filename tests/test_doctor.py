@@ -7,8 +7,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "runtime"))
-os.environ.setdefault("EA_STATE_DIR", tempfile.mkdtemp())
-import ph_doctor  # noqa: E402
+with mock.patch.dict(os.environ, HERMES_HOME=tempfile.mkdtemp()):   # never the real profile
+    import ph_doctor  # noqa: E402
 
 
 class DoctorTests(unittest.TestCase):

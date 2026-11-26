@@ -43,8 +43,7 @@ LEASE_WAIT_S = 90
 
 
 def quiet_now() -> bool:
-    if os.environ.get("DESK_SAY_QUIET_OFF") == "1":
-        return False
+    """Inside the owner's quiet hours? No environment switch turns this off (tests patch this function)."""
     hour = datetime.now(phconf.tz()).hour
     start, end = phconf.quiet_hours()
     return start <= hour < end if start <= end else hour >= start or hour < end

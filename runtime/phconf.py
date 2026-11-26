@@ -3,7 +3,9 @@
 Every runtime script reads its settings from here and nothing personal lives in code.
 The config file is written by `hermes proactive setup` to
     <HERMES_HOME>/plugin-data/proactive-hermes/config.json
-and private state lives next to it in .../state (override with EA_STATE_DIR for tests).
+and private state lives next to it in .../state. Both paths always come from the active profile's Hermes home:
+no environment variable picks another authority file or state dir (tests patch config_path / state_dir, or give
+the process an isolated HERMES_HOME).
 """
 from __future__ import annotations
 
@@ -18,6 +20,9 @@ from zoneinfo import ZoneInfo
 PLUGIN = "proactive-hermes"
 MOBILE_ACTIONS = frozenset({"reminders", "alarms", "leave_time"})
 AUTO_ACTIONS = MOBILE_ACTIONS | {"calendar_blocks", "watch_actions"}
+# Every action name the authority lists may hold (auto takes only AUTO_ACTIONS). Setup rejects anything else.
+ACTIONS = AUTO_ACTIONS | {"send_email", "send_slack", "reply_offers", "register_events", "purchases", "bookings",
+                          "payments", "share_credentials", "delete_data"}
 
 DEFAULTS: dict = {
     "version": 1,
@@ -109,20 +114,21 @@ def data_dir() -> Path:
 
 
 def config_path() -> Path:
-    env = os.environ.get("PROACTIVE_HERMES_CONFIG")
-    return Path(env) if env else data_dir() / "config.json"
+    """The authority and settings file: always the active profile's own plugin-data config.json. The calling
+    process cannot point it elsewhere (no environment override); tests patch this function."""
+    return data_dir() / "config.json"
 
 
 def state_dir() -> Path:
-    """Private state (mail senders and subjects, ledgers): owner-only, 0700, also when it already existed."""
-    env = os.environ.get("EA_STATE_DIR")
-    d = Path(env) if env else data_dir() / "state"
+    """Private state (mail senders and subjects, ledgers, the outbox): <plugin-data>/state of the active profile,
+    owner-only, 0700, also when it already existed. No environment override; tests patch this function."""
+    d = data_dir() / "state"
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         if d.stat().st_mode & 0o077:
             d.chmod(0o700)
     except OSError:
-        pass  # not ours to change (e.g. a shared EA_STATE_DIR): leave it, never crash a job
+        pass  # not ours to change: leave it, never crash a job
     return d
 
 
@@ -163,15 +169,48 @@ def authority_problem(cfg: dict | None = None) -> str:
     return ""
 
 
+def authority_errors(cfg: dict | None = None) -> list[str]:
+    """What setup refuses to save beyond a malformed shape: an unknown action name, an action auto cannot hold, an
+    action listed in more than one level. At run time an overlap still resolves by precedence (allowed())."""
+    c = CFG if cfg is None else cfg
+    if authority_problem(c):
+        return []  # the shape is wrong: authority_problem says why
+    authority = c.get("authority", {})
+    errors = []
+    unknown = sorted(set(authority) - set(AUTHORITY_LISTS))
+    if unknown:
+        errors.append(f"unknown approval level(s) {', '.join(map(repr, unknown))}; use auto, ask_first or never")
+    for name in AUTHORITY_LISTS:
+        bad = [a for a in authority.get(name, []) if a not in ACTIONS]
+        if bad:
+            errors.append(f"authority.{name}: unknown action(s) {', '.join(map(repr, bad))}; "
+                          f"choose from {', '.join(sorted(ACTIONS))}")
+    bad = [a for a in authority.get("auto", []) if a in ACTIONS and a not in AUTO_ACTIONS]
+    if bad:
+        errors.append(f"authority.auto: {', '.join(map(repr, bad))} can never be automatic; "
+                      f"auto takes only {', '.join(sorted(AUTO_ACTIONS))}")
+    seen: dict[str, list[str]] = {}
+    for name in AUTHORITY_LISTS:
+        for a in dict.fromkeys(authority.get(name, [])):
+            seen.setdefault(a, []).append(name)
+    for a, levels in seen.items():
+        if len(levels) > 1:
+            errors.append(f"{a!r} is in both {' and '.join(levels)}: each action belongs to exactly one level")
+    return errors
+
+
 def allowed(action: str, *, cfg: dict | None = None) -> str:
-    """Resolve standing authority: "auto", "ask" or "never". A deny overrides any automatic grant, and a
-    malformed authority (see authority_problem) is "never" for every action: it fails closed."""
+    """Resolve standing authority: "auto", "ask" or "never". Precedence never > ask_first > auto: an action listed
+    in never is never, else one listed in ask_first is ask, else one listed in auto (and allowed to be automatic)
+    is auto, else ask. A malformed authority (see authority_problem) is "never" for every action: it fails closed."""
     c = CFG if cfg is None else cfg
     if authority_problem(c):
         return "never"
     authority = c.get("authority", {})
     if action in authority.get("never", []):
         return "never"
+    if action in authority.get("ask_first", []):
+        return "ask"
     if action in AUTO_ACTIONS and action in authority.get("auto", []):
         return "auto"
     return "ask"
@@ -185,6 +224,23 @@ def authorize(action: str, *, cfg: dict | None = None) -> tuple[bool, str]:
     approvals."""
     level = allowed(action, cfg=cfg)
     return level == "auto", level
+
+
+def authorize_cleanup(action: str, *, delete: bool = False, cfg: dict | None = None) -> tuple[bool, str, str]:
+    """Cleanup of the plugin's own writes (ticking off its own phone reminder, deleting its own calendar block or
+    alert) is a write too: it needs ACTION automatic, exactly like creating it. A delete also honours delete_data:
+    listed in never or ask_first, it refuses. (ok, refused action, its level); under ask or never the caller
+    refuses (exit 5) and leaves it to the chat flow, which uses Hermes's own tools after the owner's yes."""
+    c = CFG if cfg is None else cfg
+    level = allowed(action, cfg=c)
+    if level != "auto":
+        return False, action, level
+    if delete:
+        dd = allowed("delete_data", cfg=c)
+        authority = c.get("authority", {})
+        if dd == "never" or "delete_data" in authority.get("ask_first", []):
+            return False, "delete_data", dd
+    return True, action, "auto"
 
 
 def calendar_alerts_on(*, cfg: dict | None = None) -> bool:
@@ -225,7 +281,14 @@ def scripts_dir() -> Path:
 
 RUNTIME_STAMP = ".runtime-stamp.json"   # written by jobs.install_runtime next to the installed scripts
 CONTRACT = Path("skills") / "proactive-desk" / "references" / "desk-contract.md"
+CONTRACT_NAME = CONTRACT.name           # installed (rendered) as scripts_dir() / desk-contract.md; the jobs read it
+GENERATIONS = ".proactive-hermes-gen"   # scripts/<this>/<generation>: one complete runtime each; scripts_dir() points
 STALE = "runtime out of date: run hermes proactive setup"
+NO_CONTRACT = "desk contract missing: run hermes proactive setup"
+
+
+def file_digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def runtime_digest(plugin_root: Path) -> str:
@@ -244,32 +307,59 @@ def runtime_stamp() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def runtime_drift(dest: Path | None = None, stamp: dict | None = None) -> str:
+    """Empty when every installed file the stamp lists (runtime/*.py and the rendered desk-contract.md) is there with
+    the content setup installed, else why not. A stamp without a file list (an older install) is drift too."""
+    dest = dest or scripts_dir()
+    stamp = runtime_stamp() if stamp is None else stamp
+    if not (dest / CONTRACT_NAME).is_file():
+        return NO_CONTRACT
+    files = stamp.get("files")
+    if not isinstance(files, dict) or CONTRACT_NAME not in files:
+        return STALE
+    for name, digest in sorted(files.items()):
+        target = dest / name
+        try:
+            if not target.is_file():
+                return f"installed {name} missing: run hermes proactive setup"
+            if file_digest(target.read_bytes()) != digest:
+                return f"installed {name} changed since setup: run hermes proactive setup"
+        except OSError:
+            return f"installed {name} unreadable: run hermes proactive setup"
+    return ""
+
+
 def runtime_status(plugin_root: Path | None = None) -> tuple[str, str]:
-    """Is the installed runtime (scripts_dir) the one this plugin ships? (state, note), state one of:
-    "missing" (setup never installed it), "ok", "stale" (an older copy: setup was not re-run after an upgrade),
-    "unknown" (no plugin checkout to compare with). plugin_root defaults to the source the stamp names."""
+    """Is the installed runtime (scripts_dir) the one this plugin ships, unchanged? (state, note), state one of:
+    "missing" (setup never installed it), "ok", "stale" (an older copy, setup was not re-run after an upgrade, or
+    an installed file, the desk contract included, is missing or changed since setup), "unknown" (installed files
+    match their stamp but there is no plugin checkout to compare with). plugin_root defaults to the stamp's source."""
     dest = scripts_dir()
     if not (dest / "phconf.py").is_file():
         return "missing", "runtime not installed yet: run hermes proactive setup"
     stamp = runtime_stamp()
     source = plugin_root or stamp.get("source")
     root = Path(source) if source else None
-    if root is None or not (root / "runtime").is_dir():
-        return "unknown", "plugin source not found, cannot compare the installed runtime"
-    if stamp.get("digest") != runtime_digest(root):
-        return "stale", STALE
-    for f in (root / "runtime").glob("*.py"):
-        target = dest / f.name
-        if not target.is_file() or target.read_bytes() != f.read_bytes():
+    if root is not None and (root / "runtime").is_dir():
+        if stamp.get("digest") != runtime_digest(root):
             return "stale", STALE
+        for f in (root / "runtime").glob("*.py"):
+            target = dest / f.name
+            if not target.is_file() or target.read_bytes() != f.read_bytes():
+                return "stale", STALE
+    else:
+        root = None
+    drift = runtime_drift(dest, stamp)
+    if drift:
+        return "stale", drift
+    if root is None:
+        return "unknown", "plugin source not found, cannot compare the installed runtime"
     return "ok", "installed runtime matches the plugin"
 
 
 def agent_root() -> Path:
-    """The Hermes install directory (so a runtime script started by a bare python3 can import Hermes)."""
-    env = os.environ.get("HERMES_AGENT_ROOT")
-    if env:
-        return Path(env).expanduser()
+    """The Hermes install directory (so a runtime script started by a bare python3 can import Hermes), derived from
+    the active Hermes home only: no environment variable can point the secret lookup at other code."""
     home = hermes_home()
     base = home.parent.parent if home.parent.name == "profiles" else home
     return base / "hermes-agent"

@@ -8,11 +8,15 @@ changes nothing.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -141,7 +145,7 @@ def _human(items) -> str:
 
 def variables(cfg: dict) -> dict:
     q = cfg["quiet_hours"]
-    state = os.environ.get("EA_STATE_DIR", str(phconf.data_dir() / "state"))
+    state = str(phconf.data_dir() / "state")   # phconf.state_dir(), without creating it on a dry run
     v = {
         "OWNER": cfg["owner"].get("name") or "there",
         "AUTO": _human(cfg.get("authority", {}).get("auto")) or "nothing (ask first for everything)",
@@ -264,45 +268,182 @@ def prompt_for(job: dict, cfg: dict) -> str:
     return render(HEAD + body + TAIL, v)
 
 
-def _write_atomic(target: Path, data: bytes, mode: int | None = None) -> None:
-    """Replace TARGET in one step, so a job starting meanwhile never reads a half-written script."""
-    with NamedTemporaryFile(dir=target.parent, prefix=f".{target.name}-", delete=False) as fh:
-        tmp = Path(fh.name)
+class UnsafeRuntimeDestination(RuntimeError):
+    """The runtime would be written somewhere other than a real directory inside the active profile's Hermes home."""
+
+
+GENERATION_NAME = re.compile(r"^[0-9a-f]{12}-[0-9]+$")   # install_runtime keeps the active one and the one before
+
+
+def _real_dir(path: Path, what: str) -> None:
+    if path.is_symlink():
+        raise UnsafeRuntimeDestination(f"refusing to install the runtime: {what} {path} is a symlink")
+    if path.exists() and not path.is_dir():
+        raise UnsafeRuntimeDestination(f"refusing to install the runtime: {what} {path} is not a directory")
+
+
+def _pointer_generation(pointer: Path) -> str | None:
+    """The generation name scripts_dir() points to, None when it is absent or a legacy real directory. Any other
+    symlink (not made by install_runtime: elsewhere, nested, absolute) is refused."""
+    if not pointer.is_symlink():
+        if pointer.exists() and not pointer.is_dir():
+            raise UnsafeRuntimeDestination(f"refusing to install the runtime: {pointer} is not a directory")
+        return None
+    target = os.readlink(pointer)
+    head, _, name = target.partition("/")
+    if head != phconf.GENERATIONS or not GENERATION_NAME.match(name):
+        raise UnsafeRuntimeDestination(f"refusing to install the runtime: {pointer} is a symlink not made by setup "
+                                       f"(points to {target})")
+    return name
+
+
+def runtime_paths() -> tuple[Path, Path, Path]:
+    """(scripts root, generations dir, pointer) after checking they are what setup made, inside the active
+    profile's Hermes home: HERMES_HOME/scripts and HERMES_HOME/scripts/.proactive-hermes-gen are real directories
+    (no symlink anywhere below Hermes home), and HERMES_HOME/scripts/proactive-hermes is absent, a legacy real
+    directory, or setup's own relative link to one generation. Raises UnsafeRuntimeDestination otherwise."""
+    home = phconf.hermes_home()
+    pointer = phconf.scripts_dir()
+    root = pointer.parent
+    gens = root / phconf.GENERATIONS
+    if root != home / "scripts" or pointer.name != phconf.PLUGIN:
+        raise UnsafeRuntimeDestination(f"refusing to install the runtime outside {home}/scripts: {pointer}")
+    _real_dir(root, "the scripts directory")
+    _real_dir(gens, "the runtime generations directory")
+    _pointer_generation(pointer)
     try:
-        tmp.write_bytes(data)
-        if mode is not None:
-            tmp.chmod(mode)
-        tmp.replace(target)
-    finally:
-        tmp.unlink(missing_ok=True)
+        root.resolve().relative_to(home.resolve())
+    except ValueError:
+        raise UnsafeRuntimeDestination(f"refusing to install the runtime: {root} is outside {home}") from None
+    return root, gens, pointer
 
 
-def install_runtime(cfg: dict) -> Path:
-    """Copy runtime/*.py and the rendered desk contract to the scripts dir, then stamp it with the plugin's runtime
-    digest (phconf.runtime_status compares it: `hermes proactive doctor`, and the refresh on plugin load)."""
-    dest = phconf.scripts_dir()
-    dest.mkdir(parents=True, exist_ok=True)
-    phconf.state_dir()
-    for f in RUNTIME.glob("*.py"):
-        target = dest / f.name
-        data = f.read_bytes()
-        if not target.is_file() or target.read_bytes() != data:
-            _write_atomic(target, data, f.stat().st_mode & 0o777)
+def _runtime_files(cfg: dict) -> dict[str, tuple[bytes, int]]:
+    """One complete runtime generation: runtime/*.py, the rendered desk contract and the stamp that lists them."""
+    files = {f.name: (f.read_bytes(), f.stat().st_mode & 0o777) for f in sorted(RUNTIME.glob("*.py"))}
     contract = (HERE / phconf.CONTRACT).read_text()
     authority = ("\n\n### Configured authority\nDo not confuse a connected tool with authorization. A private block or "
                  "phone reminder also requires `phconf.allowed('calendar_blocks')` or `phconf.allowed('reminders')` "
                  "respectively to return `auto`. Read the current config by importing `phconf` from `{{SCRIPTS}}`. "
                  "No automatic action bypasses an ask-first or never rule. The scripts check it again themselves and "
-                 "answer `not_allowed` (exit 5) for anything that is not automatic.\n")
-    text = render(contract + authority, variables(cfg))
-    target = dest / "desk-contract.md"
-    if not target.is_file() or target.read_text() != text:
-        _write_atomic(target, text.encode())
-    stamp = json.dumps({"digest": phconf.runtime_digest(HERE), "source": str(HERE)}, indent=1) + "\n"
-    target = dest / phconf.RUNTIME_STAMP
-    if not target.is_file() or target.read_text() != stamp:
-        _write_atomic(target, stamp.encode())
-    return dest
+                 "answer `not_allowed` (exit 5) for anything that is not automatic, cleanup of their own reminders, "
+                 "blocks and alerts included.\n")
+    files[phconf.CONTRACT_NAME] = (render(contract + authority, variables(cfg)).encode(), 0o644)
+    stamp = {"digest": phconf.runtime_digest(HERE), "source": str(HERE),
+             "files": {name: phconf.file_digest(data) for name, (data, _mode) in files.items()}}
+    files[phconf.RUNTIME_STAMP] = ((json.dumps(stamp, indent=1, sort_keys=True) + "\n").encode(), 0o644)
+    return files
+
+
+def _matches(directory: Path, files: dict[str, tuple[bytes, int]]) -> bool:
+    try:
+        return all((directory / name).read_bytes() == data for name, (data, _mode) in files.items())
+    except OSError:
+        return False
+
+
+def _write_new(path: Path, data: bytes, mode: int) -> None:
+    """Create PATH (never follow or reuse an existing entry) with DATA, then fsync it."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    os.chmod(path, mode)
+
+
+def _exchange(a: Path, b: Path) -> bool:
+    """Swap two paths in one step (Linux renameat2 RENAME_EXCHANGE). False when the platform cannot."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (OSError, AttributeError):
+        return False
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    at_fdcwd, rename_exchange = -100, 2
+    if renameat2(at_fdcwd, os.fsencode(a), at_fdcwd, os.fsencode(b), rename_exchange) != 0:
+        return False
+    return True
+
+
+def _activate(root: Path, pointer: Path, name: str) -> None:
+    """Point scripts_dir() at generation NAME in one rename: a job resolves either the old or the new one, never a
+    mix. A legacy real directory is swapped out with renameat2 where available (else two renames) and removed."""
+    link = root / f".{phconf.PLUGIN}.link-{name}"
+    link.unlink(missing_ok=True)
+    os.symlink(f"{phconf.GENERATIONS}/{name}", link)
+    if pointer.is_symlink() or not pointer.exists():
+        os.replace(link, pointer)
+        return
+    if _exchange(link, pointer):   # legacy dir <-> new link, atomically; the old dir now sits at `link`
+        shutil.rmtree(link)
+        return
+    legacy = root / f".{phconf.PLUGIN}.legacy-{name}"
+    pointer.rename(legacy)
+    os.replace(link, pointer)
+    shutil.rmtree(legacy, ignore_errors=True)
+
+
+def _prune(gens: Path, keep: set[str]) -> None:
+    for entry in gens.iterdir():
+        if entry.name in keep or entry.name.startswith(".install"):
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            entry.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(entry, ignore_errors=True)
+
+
+@contextmanager
+def _install_lock(gens: Path):
+    with (gens / ".install.lock").open("a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+
+
+def install_runtime(cfg: dict) -> Path:
+    """Install runtime/*.py, the rendered desk contract and a stamp listing them (phconf.runtime_status compares
+    it: `hermes proactive doctor`, and the refresh on plugin load) as ONE generation, then activate it atomically.
+
+    Each generation is a new directory HERMES_HOME/scripts/.proactive-hermes-gen/<digest>-<time>, written in full
+    under a temporary name and renamed when complete; scripts_dir() (HERMES_HOME/scripts/proactive-hermes) is a
+    relative symlink to the active one, replaced in one rename. A job resolves its script once (Hermes cron runs the
+    resolved path; python puts the resolved directory on sys.path), so it runs one generation start to end. An
+    interrupted copy leaves the active generation untouched. The destination must be inside the active profile's
+    Hermes home with no symlink below it other than that pointer (runtime_paths), else nothing is written.
+    Running it again with nothing changed writes nothing."""
+    root, gens, pointer = runtime_paths()
+    files = _runtime_files(cfg)
+    phconf.state_dir()
+    if _pointer_generation(pointer) and _matches(pointer, files):
+        return pointer
+    root.mkdir(parents=True, exist_ok=True)
+    _real_dir(root, "the scripts directory")
+    gens.mkdir(mode=0o755, exist_ok=True)
+    _real_dir(gens, "the runtime generations directory")
+    with _install_lock(gens):
+        previous = _pointer_generation(pointer)
+        if previous and _matches(pointer, files):
+            return pointer
+        name = f"{phconf.runtime_digest(HERE)[:12]}-{time.time_ns()}"
+        staging = gens / f".tmp-{name}"
+        staging.mkdir(mode=0o755)
+        try:
+            for fname, (data, mode) in files.items():
+                _write_new(staging / fname, data, mode)
+            staging.rename(gens / name)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        _activate(root, pointer, name)
+        _prune(gens, {name} | ({previous} if previous else set()))
+    return pointer
 
 
 def _registry() -> Path:

@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import types
@@ -17,9 +18,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime"))
 
 
 def isolated_env(directory):
+    """HOME and an isolated Hermes profile under DIRECTORY. The plugin's config and state are then found exactly as in
+    production, at plugin_data(DIRECTORY)/config.json and .../state: no environment variable redirects them."""
     return {"HOME": str(directory), "HERMES_HOME": str(directory / "profiles" / "desk-test"),
-            "EA_STATE_DIR": str(directory), "PROACTIVE_HERMES_CONFIG": str(directory / "config.json"),
             "DESK_SAY_DISABLE_DOOR": "1"}
+
+
+def plugin_data(directory):
+    return Path(directory) / "profiles" / "desk-test" / "plugin-data" / "proactive-hermes"
 
 
 with TemporaryDirectory() as directory, patch.dict(os.environ, isolated_env(Path(directory))):
@@ -99,14 +105,18 @@ class RenderMessageTests(unittest.TestCase):
 
 
 class OfflineTestCase(unittest.TestCase):
+    """self.root is HOME, self.root/profiles/desk-test the Hermes home, self.tmp the plugin's state dir in it."""
+
     def setUp(self):
-        self.tmp = Path(self.enterContext(TemporaryDirectory()))
-        self.enterContext(patch.dict(os.environ, isolated_env(self.tmp)))
+        self.root = Path(self.enterContext(TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, isolated_env(self.root)))
+        self.tmp = phconf.state_dir()
+        self.assertEqual(self.tmp, plugin_data(self.root) / "state")
         self.configure(owner={"name": "Alex"})
         self.clock = datetime(2030, 4, 1, 10, tzinfo=phconf.tz())
 
     def configure(self, **config):
-        Path(os.environ["PROACTIVE_HERMES_CONFIG"]).write_text(json.dumps(config))
+        phconf.config_path().write_text(json.dumps(config))
         self.enterContext(patch.object(phconf, "CFG", phconf.load()))
 
     def patch_paths(self, module, *names):
@@ -553,11 +563,11 @@ class ResolveGateTests(DeskTests):
         self.assertEqual(self.cli(desk, "compose", "--job", "test", stdin=json.dumps([self.item("plain", act="send")])), SILENT)
         self.deliver.assert_called_once_with("Work on plain", key="test:plain", job="test", urgent=False)
 
-    def test_cli_honors_ea_state_dir_without_patch(self):
+    def test_cli_uses_the_profile_state_without_patch(self):
         item = self.item("cli", act="send", urgent=True)
         result = subprocess.run([sys.executable, desk.__file__, "compose", "--job", "test", "--print-only"],
                                 input=json.dumps([item]), text=True, capture_output=True, check=True,
-                                env={**os.environ, "EA_STATE_DIR": str(self.tmp)})
+                                env=dict(os.environ))   # the isolated HERMES_HOME: its own plugin-data/state
         self.assertEqual(result.stdout, "Work on cli\n")
         self.assertEqual(self.rows(self.tmp / "run_log.jsonl")[-1]["unresolved"], ["cli"])
         self.assertEqual(self.read_json(self.tmp / "said.json")["cli"]["fp"], desk.fp(item))
@@ -571,8 +581,10 @@ class ConfigurationTests(OfflineTestCase):
         self.assertEqual(desk.render_message(None, [text], []), "a" * 11 + "…")
         items = json.dumps([{"key": key, "kind": "action", "text": key} for key in ("one", "two", "three")])
         for flags, expected in (([], "one\n+2 more"), (["--brief"], "1. one\n2. two\n+1 more")):
-            state = self.tmp / ("brief" if flags else "normal")
-            env = {**os.environ, "EA_STATE_DIR": str(state)}
+            home = self.root / ("brief" if flags else "normal")   # a fresh profile each, with the same config
+            (home / "plugin-data" / "proactive-hermes").mkdir(parents=True)
+            shutil.copy(phconf.config_path(), home / "plugin-data" / "proactive-hermes" / "config.json")
+            env = {**os.environ, "HERMES_HOME": str(home)}
             output = subprocess.check_output([sys.executable, desk.__file__, "compose", "--job", "test",
                                               "--print-only", *flags], input=items, text=True, env=env)
             self.assertIn(expected, output)

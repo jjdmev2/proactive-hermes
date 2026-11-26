@@ -22,9 +22,13 @@ refuse: this script never acts on an ask-first action. When the owner says yes i
 alarm, the chat agent sets it with Hermes's own mobile tools, which carry Hermes's own approvals. A refusal prints
 {"status": "not_allowed", ...}, is logged to run_log.jsonl, exits 5 (add and alarm) and nothing reaches the bridge.
 Retries of an expired request follow the same rule: once the action is no longer automatic the item is marked
-'not_allowed' (terminal), logged once and never polled again.
+'not_allowed' (terminal), logged once and never polled again. Cleanup is a phone write too: ticking off the desk's
+own reminder needs `reminders` (and every authority it was queued under) automatic. Under ask or never, `close`
+answers not_allowed and exits 5, tick leaves it alone, and the chat flow ticks it off with Hermes's own tools after
+the owner's yes; a close retry that is no longer allowed ends 'close_not_allowed' (terminal, logged once).
 
-Exit codes (add, alarm): 0 queued or another receipt, 2 bad arguments, 5 not allowed by the configured authority.
+Exit codes (add, alarm, close): 0 queued or another receipt, 2 bad arguments, 5 not allowed by the configured
+authority.
 
 Phone access goes through the Hermes mobile device plugin's bridge (see bridge() below: the only code here that
 touches that plugin's files). The desk never wakes the phone itself.
@@ -338,9 +342,18 @@ def finished_keys() -> dict[str, str]:
     return out
 
 
+def close_block(item: dict) -> tuple[str, str] | None:
+    """Ticking a reminder off is a phone write: (action, level) of the first authority that is not automatic (the
+    item's own action, then every required_authority it was queued under), or None when it may be ticked off."""
+    for action in ("reminders", *item.get("required_authority", ())):
+        ok, refused, level = phconf.authorize_cleanup(action)
+        if not ok:
+            return refused, level
+    return None
+
+
 def close_allowed(item: dict) -> bool:
-    """Ticking a reminder off is still a phone action: honour 'never' and the authority it was queued under."""
-    return phconf.allowed("reminders") != "never" and all(map(auto_allowed, item.get("required_authority", ())))
+    return close_block(item) is None
 
 
 def _finished_evidence(key: str, done: dict[str, str]) -> str | None:
@@ -404,7 +417,15 @@ def check_closing(store, box: dict) -> bool:
         elif status in {"pending", "running"}:
             continue
         elif status == "expired" and int(item.get("close_attempts", 0)) < MAX_ATTEMPTS:
-            if not close_allowed(item):
+            blocked = close_block(item)
+            if blocked:
+                # No longer automatic: terminal, logged once, never polled again; the chat flow can tick it off.
+                action, level = blocked
+                item.update(status="close_not_allowed", authority=level, close_error=f"close refused: {action} is {level}")
+                ledger_set(key, {"reminder_status": "close_not_allowed"})
+                log({"not_allowed": key, "action": action, "authority": level, "close": True})
+                save(OUTBOX, box)
+                changed = True
                 continue
             try:
                 request_close(store, item, item.get("close_evidence", ""))
@@ -432,8 +453,11 @@ def close_reminder(key: str, evidence: str = "") -> dict:
             return {"status": "no_reminder", "key": key}
         if item.get("status") in {"closing", "done"}:
             return {"status": item["status"], "key": key}
-        if not close_allowed(item):
-            return {"status": "not_allowed", "key": key}
+        blocked = close_block(item)
+        if blocked:
+            action, level = blocked
+            log({"not_allowed": key, "action": action, "authority": level, "close": True})
+            return {**refusal(action, level), "key": key, "reminder_id": item.get("reminder_id")}
         _, store = bridge()
         request_close(store, item, evidence or "closed by owner")
         save(OUTBOX, box)
@@ -643,8 +667,7 @@ def cmd_tick(_a) -> int:
 
 
 def cmd_close(a) -> int:
-    print(json.dumps(close_reminder(a.key, a.evidence), ensure_ascii=False))
-    return 0
+    return receipt_exit(close_reminder(a.key, a.evidence))
 
 
 def cmd_status(_a) -> int:

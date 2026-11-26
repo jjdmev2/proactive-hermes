@@ -13,11 +13,12 @@ Usage:
   ea_calendar_block.py mine   [--days 14]
   ea_calendar_block.py delete --key KEY      (only Proactive Hermes blocks)
 
-Authority: create and alert are calendar writes made under `calendar_blocks`. Before any Google call they need
-it in the automatic authority (phconf.authorize); 'ask' and 'never' always refuse, and 'never' refuses delete
-too. When the owner says yes in chat to an ask-first block, the chat agent uses Hermes's own calendar tools,
-never this script. A refusal prints {"status": "not_allowed", ...}, is logged, exits 5 and creates nothing.
-free and mine only read.
+Authority: create, alert and delete are calendar writes made under `calendar_blocks`. Before any Google call they
+need it in the automatic authority (phconf.authorize, phconf.authorize_cleanup); 'ask' and 'never' always refuse.
+delete (cleanup of the plugin's own block or alert) also honours `delete_data`: listed in never or ask first, it
+refuses. When the owner says yes in chat to an ask-first block or removal, the chat agent uses Hermes's own
+calendar tools, never this script. A refusal prints {"status": "not_allowed", ...}, is logged, exits 5 and
+changes nothing. free and mine only read.
 
 `alert` is the time-critical path: a phone that syncs this calendar fires the popup on its own,
 so it never waits for the Hermes app to wake (the mobile bridge can lag by minutes).
@@ -277,9 +278,11 @@ def cmd_mine(a) -> None:
 
 
 def cmd_delete(a) -> None:
-    if phconf.allowed(ACTION) == "never":  # like ticking off a phone reminder: cleanup still honours never
-        log({"kind": "calendar_not_allowed", "key": a.key, "authority": "never"})
-        out({"status": "not_allowed", "action": ACTION, "authority": "never", "key": a.key}, 5)
+    # Removing the plugin's own block or alert is a calendar write: automatic authority only, and delete_data.
+    ok, action, basis = phconf.authorize_cleanup(ACTION, delete=True)
+    if not ok:
+        log({"kind": "calendar_not_allowed", "key": a.key, "action": action, "authority": basis})
+        out({"status": "not_allowed", "action": action, "authority": basis, "key": a.key}, 5)
     svc = service()
     ev = find_mine(svc, a.key)
     if not ev:

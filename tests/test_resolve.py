@@ -24,10 +24,13 @@ class ResolveTests(unittest.TestCase):
         config.write_text(json.dumps({"owner": {"name": "Alex", "work_emails": ["alex@acme.example"]},
                                       "timezone": "UTC"}), encoding="utf-8")
         state = self.tmp / "state"
-        self.enterContext(patch.dict(os.environ, EA_STATE_DIR=str(state), HERMES_HOME=str(self.tmp),
-                                     PROACTIVE_HERMES_CONFIG=str(config)))
+        self.enterContext(patch.dict(os.environ, HERMES_HOME=str(self.tmp)))
         global resolve
         resolve = importlib.import_module("ea_resolve")
+        # The config and state paths are not settable from the environment: patch the functions.
+        self.enterContext(patch.object(resolve.phconf, "config_path", return_value=config))
+        self.enterContext(patch.object(resolve.phconf, "state_dir",
+                                       side_effect=lambda: state.mkdir(mode=0o700, exist_ok=True) or state))
         self.enterContext(patch.object(resolve.phconf, "CFG", resolve.phconf.load()))
         self.clock = datetime(2025, 2, 12, 10, tzinfo=resolve.phconf.tz())
         self.enterContext(patch.object(resolve, 'now', lambda: self.clock))
@@ -120,7 +123,7 @@ class ResolveTests(unittest.TestCase):
             {'at': recent, 'kind': 'desk_message', 'keys': ['plain', 'sam'], 'drafts': {'sam': 'ready'}},
             {'at': self.clock.isoformat(), 'kind': 'desk_message', 'keys': ['new'], 'drafts': {}},
         ]
-        (resolve.state_dir() / 'ping_log.jsonl').write_text('\n'.join(map(json.dumps, rows)), encoding='utf-8')
+        (resolve.phconf.state_dir() / 'ping_log.jsonl').write_text('\n'.join(map(json.dumps, rows)), encoding='utf-8')
 
     def test_show_number_maps_display_position_and_marks_shown(self):
         resolve.put(self.record)

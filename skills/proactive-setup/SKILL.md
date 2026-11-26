@@ -87,7 +87,7 @@ Ask these three in plain words, after the details:
 
 ## 4. Apply
 
-Write the answers to a JSON file in the scratch dir, using the question keys (for example `"owner.name"`, `"timezone"`, `"quiet_hours": "22-7"`, `"slack.channels": "#team,#product"`). Extra choices from "My own" go in as nested keys, for example `{"schedule": {"morning_brief": "30 7 * * 1-5"}, "features": {"weekly_review": false}}`. Then run:
+Write the answers to a JSON file in the scratch dir, using the question keys (for example `"owner.name"`, `"timezone"`, `"quiet_hours": "22-7"`, `"slack.channels": "#team,#product"`). Extra choices from "My own" go in as nested keys, for example `{"schedule": {"morning_brief": "30 7 * * 1-5"}, "features": {"weekly_review": false}}`. Approval levels go in as `"authority.auto"`, `"authority.ask_first"` and `"authority.never"` (lists of action names). Each action belongs to one level only; setup refuses an action in two levels, an unknown action and any other dotted key that is not a question key, and says which one, so fix that answer and run it again. Then run:
 
 ```
 hermes proactive setup --preset juan|custom --answers <file> --dry-run

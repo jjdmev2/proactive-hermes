@@ -14,6 +14,12 @@ Proactive Hermes reads your mail, calendar, Slack, Linear and, with the mobile a
 
 The scripts that set reminders, alarms and calendar blocks check these levels themselves and refuse anything you did not allow. They have no way to be told "the owner said yes": an ask first one is set by Hermes's own tools after your yes in chat. A broken approval setting blocks them all.
 
+If one action is listed at more than one level, the strictest wins: never beats ask first, and ask first beats without asking. Setup does not save such a setting at all: it names the action and the two levels, and it also refuses an unknown level or action instead of dropping it.
+
+Cleaning up is held to the same rule. Ticking off a phone reminder the desk set, or deleting a calendar block or alert it made, happens on its own only when that action (reminders, calendar blocks) is allowed without asking. A delete also respects "deleting data": while that is ask first or never (never by default), the desk deletes nothing. Anything refused is reported back in chat, so Hermes can ask you and do it with its own tools.
+
+The approval file is always your profile's own `plugin-data/proactive-hermes/config.json`, and the desk's records are always next to it. No environment variable can point the scripts at another approval file or record folder. The runtime is installed only inside your Hermes home, as one complete copy at a time that replaces the old one in a single step; setup refuses to write it through a symlink.
+
 ## Untrusted text
 
 Mail, Slack, calendar and web text is treated as data. The desk never follows instructions inside it and never puts it on a command line; it writes the text to a file and passes the file path. With an OpenAI key, kept mail is also scored for prompt injection and flagged to you.

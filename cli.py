@@ -136,16 +136,19 @@ def parse(kind: str, raw: str):
     return raw
 
 
+AUTHORITY_KEYS = tuple(f"authority.{name}" for name in phconf.AUTHORITY_LISTS)
+
+
 def parse_answer(path: str, kind: str, value):
     if isinstance(value, str) and kind != "str":
         value = parse(kind, value)
-    if path == "authority.auto":
+    if path in AUTHORITY_KEYS:
         if not isinstance(value, list):
-            raise ValueError("authority.auto expects a comma-separated list or a JSON array")
-        invalid = [repr(action) for action in value if not isinstance(action, str) or action not in phconf.AUTO_ACTIONS]
+            raise ValueError(f"{path} expects a comma-separated list or a JSON array")
+        valid = phconf.AUTO_ACTIONS if path == "authority.auto" else phconf.ACTIONS
+        invalid = [repr(action) for action in value if not isinstance(action, str) or action not in valid]
         if invalid:
-            valid = ", ".join(sorted(phconf.AUTO_ACTIONS))
-            raise ValueError(f"authority.auto: invalid action(s) {', '.join(invalid)}; choose from {valid}")
+            raise ValueError(f"{path}: invalid action(s) {', '.join(invalid)}; choose from {', '.join(sorted(valid))}")
         value = list(dict.fromkeys(value))
     if path == "mobile.enabled" and not isinstance(value, bool):
         raise ValueError("mobile.enabled expects yes or no")
@@ -213,23 +216,65 @@ def recap_cron(cfg: dict) -> str:
     return f"*/5 {a}-{b} * * {days}"
 
 
+def authority_answers(answers: dict) -> dict:
+    """Every authority input in an answers file, validated before anything is merged: dotted keys
+    (authority.auto, authority.ask_first, authority.never) and a nested {"authority": {...}} object. An unknown
+    level or action, or one action given two levels, is an error, never silently dropped. Returns {level: list}."""
+    out: dict = {}
+    nested = answers.get("authority")
+    if nested is not None:
+        if not isinstance(nested, dict):
+            raise ValueError("authority config malformed: authority must be an object with auto, ask_first and "
+                             "never lists")
+        for level, value in nested.items():
+            if level not in phconf.AUTHORITY_LISTS:
+                raise ValueError(f"authority: unknown approval level {level!r}; use auto, ask_first or never")
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"authority config malformed: authority.{level} must be a list of action names")
+            out[level] = parse_answer(f"authority.{level}", "list", value)
+    for key in answers:
+        if key.startswith("authority."):
+            if key not in AUTHORITY_KEYS:
+                raise ValueError(f"unknown answer key {key!r}; use authority.auto, authority.ask_first or "
+                                 "authority.never")
+            level = key.split(".", 1)[1]
+            value = parse_answer(key, "list", answers[key])
+            if level in out and out[level] != value:
+                raise ValueError(f"{key} is given twice with different values (dotted and nested)")
+            out[level] = value
+    return out
+
+
 def apply_answers(cfg: dict, answers: dict) -> dict:
+    asked = {path for path, *_ in QUESTIONS}
+    unknown = [k for k in answers if "." in k and k not in asked and k not in AUTHORITY_KEYS
+               and not k.startswith("authority.")]
+    if unknown:
+        raise ValueError(f"unknown answer key(s) {', '.join(map(repr, unknown))}: use a question key "
+                         "(`hermes proactive questions`) or a nested object like {\"features\": {...}}")
+    authority = authority_answers(answers)
     flat = {}
     for path, _q, _d, kind in QUESTIONS:
-        if path in answers:
+        if path in answers and path not in AUTHORITY_KEYS:
             flat[path] = parse_answer(path, kind, answers[path])
     for path, v in flat.items():
         _set(cfg, path, v)
-    asked = {path for path, *_ in QUESTIONS}
-    nested = {k: v for k, v in answers.items() if "." not in k and k not in asked}
-    return finish_setup(phconf.merge(cfg, nested))
+    nested = {k: v for k, v in answers.items() if "." not in k and k not in asked and k != "authority"}
+    cfg = phconf.merge(cfg, nested)
+    for level, actions in authority.items():
+        cfg.setdefault("authority", {})[level] = actions
+    return finish_setup(cfg)
 
 
 def check_authority(cfg: dict) -> None:
-    """Refuse a malformed approval policy (e.g. "never": "calendar_blocks") instead of writing it."""
+    """Refuse a malformed approval policy (e.g. "never": "calendar_blocks"), an unknown level or action, or an
+    action in two levels, instead of writing it."""
     problem = phconf.authority_problem(cfg)
     if problem:
         raise ValueError(f"authority config malformed: {problem}")
+    errors = phconf.authority_errors(cfg)
+    if errors:
+        raise ValueError("authority: " + "; ".join(errors))
 
 
 def finish_setup(cfg: dict) -> dict:
@@ -415,7 +460,11 @@ def handle(args) -> int:
         print(key_note)
     path = write_config(cfg)
     phconf.CFG = cfg
-    rows = jobs.apply(cfg)
+    try:
+        rows = jobs.apply(cfg)
+    except jobs.UnsafeRuntimeDestination as exc:   # a symlink below the Hermes home: nothing was installed
+        print(f"Setup: {exc}", file=sys.stderr)
+        return 1
     print(f"Config: {path}")
     actions = [row["action"] for row in rows]
     for row in rows:

@@ -22,7 +22,7 @@ import ea_close  # noqa: E402  (test_desk puts runtime/ on sys.path)
 class CloseBase(OfflineTestCase):
     def setUp(self):
         super().setUp()
-        self.configure(reminders={"enabled": True})
+        self.configure(reminders={"enabled": True}, authority={"auto": ["reminders"]})  # ticking off needs auto
         self.enterContext(patch.object(reminders, "PLUGIN", self.tmp))
         (self.tmp / "bridge.py").touch()
         self.freeze_datetime(ea_close)
@@ -54,6 +54,31 @@ class CloseItemTests(CloseBase):
                          ("dropped", "owner: old", self.clock.isoformat()))
         self.assertEqual(self.store.requests[0][:2], ("reminders.complete", {"id": "RP"}))
         self.assertEqual(self.state("reminder_outbox.json")["promise-a"]["status"], "closing")
+
+    def test_refused_phone_and_calendar_cleanup_is_reported_for_the_chat_flow(self):
+        # The calendar delete runs end to end (ea_calendar_block.py in a subprocess, this test's HERMES_HOME): it
+        # refuses before any Google client exists. delete_data stays in the default never list.
+        self.write("actions.json", {"promise-a": {"calendar_alert_id": "E1"}})
+        cases = (
+            ({"ask_first": ["reminders"], "auto": ["calendar_blocks"]},
+             [{"what": "phone reminder", "action": "reminders", "authority": "ask"},
+              {"what": "calendar alert", "action": "delete_data", "authority": "never"}]),
+            ({"never": ["reminders"], "ask_first": ["calendar_blocks"]},
+             [{"what": "phone reminder", "action": "reminders", "authority": "never"},
+              {"what": "calendar alert", "action": "calendar_blocks", "authority": "ask"}]),
+            ({"auto": ["reminders", "calendar_blocks"], "ask_first": ["delete_data"], "never": []},
+             [{"what": "calendar alert", "action": "delete_data", "authority": "ask"}]),
+        )
+        for authority, left in cases:
+            with self.subTest(authority=authority):
+                self.write("promises.json", {"promise-a": {"status": "open", "what": "Send the deck to Sam"}})
+                self.configure(reminders={"enabled": True}, calendar={"enabled": True}, authority=authority)
+                out = ea_close.close("promise-a", "owner: done", "done")
+                self.assertEqual(out["left_for_chat"], left)
+                self.assertIn("promise", out["closed_in"])
+                self.assertNotIn("calendar alert", out["closed_in"])
+                self.assertEqual(out["calendar_alert"]["status"], "not_allowed")
+        self.assertEqual([op for op, *_ in self.store.requests], ["reminders.complete"])   # only the auto case
 
     def test_close_marks_goal_and_status_done(self):
         out = ea_close.close("goal-b", "proof", "done")
@@ -234,7 +259,7 @@ class TextFileOptionTests(CloseBase):
     """Untrusted text comes in through files, never through the command line."""
 
     def run_cli(self, *args, stdin=""):
-        env = {**os.environ, "EA_STATE_DIR": str(self.tmp)}
+        env = os.environ.copy()   # the isolated HERMES_HOME: the script finds this test's state as in production
         return subprocess.run([sys.executable, ea_close.__file__, *args], input=stdin, text=True, capture_output=True,
                               cwd=self.tmp, env=env, timeout=60)
 

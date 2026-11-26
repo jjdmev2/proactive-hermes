@@ -16,7 +16,6 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import phconf
-from phconf import state_dir
 RESOLVABLE = {"send", "reply", "intro", "questions", "followup", "book", "decide", "pay"}
 FRESH = timedelta(hours=48)
 MAX_DRAFT = 2500
@@ -131,7 +130,7 @@ def _save(root: Path, rows: dict) -> None:
 
 @contextmanager
 def _write_store():
-    root = state_dir()
+    root = phconf.state_dir()
     root.mkdir(parents=True, exist_ok=True)
     fd = os.open(root / "resolutions_log.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as log:
@@ -166,7 +165,7 @@ def _open(row: dict, at: datetime) -> bool:
 
 
 def get(key, item_fp=None, now=None) -> dict | None:
-    row = _load(state_dir()).get(key)
+    row = _load(phconf.state_dir()).get(key)
     at = _timestamp(now if now is not None else _now())
     if not isinstance(row, dict) or at is None or not _open(row, at):
         return None
@@ -218,7 +217,7 @@ def key_for_number(n, max_age_hours=36):
     cutoff = _timestamp(now()) - timedelta(hours=max_age_hours)
     latest = None
     try:
-        with (state_dir() / "ping_log.jsonl").open(encoding="utf-8") as log:
+        with (phconf.state_dir() / "ping_log.jsonl").open(encoding="utf-8") as log:
             for line in log:
                 try:
                     row = json.loads(line)
@@ -287,7 +286,7 @@ def search_ledgers(who, terms) -> dict:
     def matches(text):
         return any(p.search(re.sub(r"[-_]+", " ", text)) for p in patterns)
 
-    root = state_dir()
+    root = phconf.state_dir()
     ledger, decisions, related, sources, gaps = [], [], [], [], []
     cutoff = _timestamp(now()) - timedelta(days=7)
     try:
@@ -330,7 +329,7 @@ def search_ledgers(who, terms) -> dict:
 
 def search_sessions(who, terms, days=14, db=None) -> list[dict]:
     if db is None:
-        db = (state_dir() if os.getenv("EA_STATE_DIR") else phconf.hermes_home()) / "state.db"
+        db = phconf.hermes_home() / "state.db"   # Hermes's chat database of the active profile
     query = " OR ".join('"' + part.replace('"', '""') + '"' for part in _needles(who, terms))
     if not query:
         return []
@@ -602,7 +601,7 @@ def main(argv=None) -> int:
             result = mark(a.key, dropped_at=at, dropped_why=a.dropped)
     else:
         at = _timestamp(now())
-        result = [row for row in _load(state_dir()).values() if not a.open or _open(row, at)]
+        result = [row for row in _load(phconf.state_dir()).values() if not a.open or _open(row, at)]
     print(json.dumps(result, ensure_ascii=False))
     return 0
 

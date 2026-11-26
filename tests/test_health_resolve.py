@@ -21,9 +21,12 @@ class ResolveHealthTests(unittest.TestCase):
                           encoding="utf-8")
         state = self.tmp / "state"
         home = self.tmp / "profiles" / "example"
-        self.enterContext(patch.dict("os.environ", EA_STATE_DIR=str(state), HERMES_HOME=str(home),
-                                     PROACTIVE_HERMES_CONFIG=str(config)))
+        self.enterContext(patch.dict("os.environ", HERMES_HOME=str(home)))
         import phconf
+        # The config and state paths are not settable from the environment: patch the functions.
+        self.enterContext(patch.object(phconf, "config_path", return_value=config))
+        self.enterContext(patch.object(phconf, "state_dir",
+                                       side_effect=lambda: state.mkdir(mode=0o700, exist_ok=True) or state))
         self.enterContext(patch.object(phconf, "CFG", phconf.load()))
         self.enterContext(patch.object(phconf, "hermes_home", return_value=home))
         spec = importlib.util.spec_from_file_location("test_ea_health", RUNTIME / "ea_health.py")

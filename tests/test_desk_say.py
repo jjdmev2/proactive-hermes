@@ -21,8 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime"))
 
 
 def isolated_env(directory):
-    return {"HOME": str(directory), "HERMES_HOME": str(directory), "EA_STATE_DIR": str(directory),
-            "PROACTIVE_HERMES_CONFIG": str(directory / "config.json"), "DESK_SAY_DISABLE_DOOR": "1"}
+    """HOME and HERMES_HOME in DIRECTORY: config and state are that profile's own (no override variable)."""
+    return {"HOME": str(directory), "HERMES_HOME": str(directory), "DESK_SAY_DISABLE_DOOR": "1"}
 
 
 with TemporaryDirectory() as directory, patch.dict(os.environ, isolated_env(Path(directory))):
@@ -31,6 +31,7 @@ with TemporaryDirectory() as directory, patch.dict(os.environ, isolated_env(Path
 
 REAL_DOOR = say.door_deliver
 REAL_HIDE = say.hide_relay_cards
+REAL_QUIET = say.quiet_now
 
 
 class DeskSayTests(unittest.TestCase):
@@ -38,8 +39,10 @@ class DeskSayTests(unittest.TestCase):
 
     def setUp(self):
         tmp = Path(self.enterContext(TemporaryDirectory()))
-        self.enterContext(patch.dict(os.environ, isolated_env(tmp), DESK_SAY_QUIET_OFF="1"))
-        Path(os.environ["PROACTIVE_HERMES_CONFIG"]).write_text(json.dumps({
+        self.enterContext(patch.dict(os.environ, isolated_env(tmp)))
+        self.enterContext(patch.object(say, "quiet_now", return_value=False))   # quiet hours tested on their own
+        phconf.config_path().parent.mkdir(parents=True, exist_ok=True)
+        phconf.config_path().write_text(json.dumps({
             "owner": {"name": "Alex"}, "timezone": "Asia/Tokyo", "quiet_hours": {"start": 13, "end": 15},
         }))
         self.enterContext(patch.object(phconf, "CFG", phconf.load()))
@@ -236,12 +239,12 @@ class DeskSayTests(unittest.TestCase):
 
     # --- quiet hours ----------------------------------------------------------------------
     def test_quiet_now_uses_configured_timezone_and_same_day_hours(self):
-        with patch.dict(os.environ, DESK_SAY_QUIET_OFF="0"), patch.object(say, "datetime") as clock:
+        with patch.dict(os.environ, DESK_SAY_QUIET_OFF="1"), patch.object(say, "datetime") as clock:
             for utc_hour, quiet in ((3, False), (4, True), (5, True), (6, False)):
                 with self.subTest(utc_hour=utc_hour):
                     utc = datetime(2030, 4, 1, utc_hour, tzinfo=timezone.utc)
                     clock.now.side_effect = utc.astimezone
-                    self.assertEqual(say.quiet_now(), quiet)
+                    self.assertEqual(REAL_QUIET(), quiet)   # no environment switch turns quiet hours off
 
     def test_quiet_hours_hold_non_urgent_until_morning(self):
         with patch.object(say, "quiet_now", return_value=True):

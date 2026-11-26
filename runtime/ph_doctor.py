@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -34,7 +33,7 @@ FIX = {
     "mail": "Set up the google-workspace skill (Gmail) or a himalaya mail account.",
     "authority": "authority config malformed: run `hermes proactive setup` to write the approval levels again. "
                  "Until then every reminder, alarm and calendar block is refused.",
-    "runtime": "Run `hermes proactive setup`: it installs or updates the runtime scripts.",
+    "runtime": "Run `hermes proactive setup`: it installs or updates the runtime scripts and the desk contract.",
 }
 
 
@@ -56,7 +55,7 @@ def check_runtime() -> tuple[bool, str]:
 
 
 def _agent_path() -> None:
-    root = Path(os.environ.get("HERMES_AGENT_ROOT", Path.home() / ".hermes" / "hermes-agent"))
+    root = phconf.agent_root()   # derived from the active Hermes home, never from an environment variable
     if root.exists() and str(root) not in sys.path:
         sys.path.insert(0, str(root))
 

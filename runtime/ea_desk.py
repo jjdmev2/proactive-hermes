@@ -57,6 +57,7 @@ from tempfile import NamedTemporaryFile
 import ea_resolve
 import phconf
 
+HERE = Path(__file__).resolve().parent   # once, at start: the runtime generation this run belongs to
 STATE = phconf.state_dir()
 SAID = STATE / "said.json"
 DIGEST = STATE / "digest_queue.jsonl"
@@ -431,7 +432,7 @@ def compose(a, items: list[dict], *, flush=False) -> int:
     receipt = {"status": "printed"}
     if not print_only:
         # The desk posts in Bot Chat as an assistant message. The cron run stays private.
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        sys.path.insert(0, str(HERE))
         import desk_say
         note_arg = {"notes": notes} if notes else {}
         receipt = desk_say.deliver(message, key=f"{a.job}:{','.join(ping['keys'])}", job=a.job, urgent=urgent, **note_arg)

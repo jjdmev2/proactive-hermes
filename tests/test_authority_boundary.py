@@ -9,6 +9,7 @@ installer keeps by identity. The installed runtime carries a stamp, so a stale c
 """
 import importlib.util
 import io
+import itertools
 import json
 import os
 import shutil
@@ -41,6 +42,14 @@ MALFORMED = {
     "ask_first as a string": {"auto": ["reminders", "alarms", "calendar_blocks"], "ask_first": "send_email"},
     "authority not an object": "reminders",
 }
+
+
+def profile_config(home: Path, config: dict) -> Path:
+    """Write CONFIG where a runtime script started with HERMES_HOME=HOME reads it: the profile's own plugin-data."""
+    data = home / "plugin-data" / "proactive-hermes"
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "config.json").write_text(json.dumps(config))
+    return data / "state"
 
 
 def authority(level: str, action: str) -> dict:
@@ -230,10 +239,9 @@ class PhoneExitCode(OfflineTestCase):
         home = self.tmp / "home"
         (home / "plugins" / reminders.BRIDGE_PLUGIN).mkdir(parents=True)
         (home / "plugins" / reminders.BRIDGE_PLUGIN / "bridge.py").write_text("raise SystemExit('bridge touched')\n")
-        cfg = self.tmp / "phone.json"
-        cfg.write_text(json.dumps({"reminders": {"enabled": True}, "authority": {"ask_first": ["reminders", "alarms"]}}))
-        env = {**os.environ, "PROACTIVE_HERMES_CONFIG": str(cfg), "EA_STATE_DIR": str(self.tmp / "state"),
-               "HERMES_HOME": str(home)}
+        state = profile_config(home, {"reminders": {"enabled": True},
+                                      "authority": {"ask_first": ["reminders", "alarms"]}})
+        env = {**os.environ, "HERMES_HOME": str(home)}
         at = (datetime.now(phconf.tz()) + timedelta(hours=2)).isoformat()
         for argv in (["add", "--key", "k", "--title", "T"], ["alarm", "--key", "a", "--at", at, "--label", "L"]):
             with self.subTest(cmd=argv[0]):
@@ -241,7 +249,7 @@ class PhoneExitCode(OfflineTestCase):
                                       capture_output=True, text=True, env=env, timeout=60)
                 self.assertEqual(proc.returncode, 5, proc.stderr)
                 self.assertEqual(json.loads(proc.stdout)["status"], "not_allowed")
-        logged = self.rows(self.tmp / "state" / reminders.RUN_LOG)
+        logged = self.rows(state / reminders.RUN_LOG)
         self.assertEqual([r["not_allowed"] for r in logged if "not_allowed" in r], ["k", "a"])
 
 
@@ -316,13 +324,32 @@ class CalendarAuthority(OfflineTestCase):
                     self.assertEqual((result["status"], result["authority"], code), ("not_allowed", "never", 5))
         self.service.assert_not_called()
 
-    def test_delete_honours_never_only(self):
-        self.set_level("never")
-        result, code = self.run_cli("delete", "--key", "ea:focus")
-        self.assertEqual((result["status"], code), ("not_allowed", 5))
+    def test_delete_needs_auto_calendar_blocks_and_honours_delete_data(self):
+        # Deleting its own block or alert is a calendar write: automatic only. delete_data in never or ask first
+        # refuses it too; delete_data unlisted does not.
+        cases = [
+            ({"never": ["calendar_blocks"]}, ("calendar_blocks", "never")),
+            ({"ask_first": ["calendar_blocks"]}, ("calendar_blocks", "ask")),
+            ({}, ("calendar_blocks", "ask")),
+            ({"auto": ["calendar_blocks"], "ask_first": ["calendar_blocks"]}, ("calendar_blocks", "ask")),
+            ({"auto": ["calendar_blocks"]}, ("delete_data", "never")),            # the default never list
+            ({"auto": ["calendar_blocks"], "never": [], "ask_first": ["delete_data"]}, ("delete_data", "ask")),
+        ]
+        for policy, (action, level) in cases:
+            with self.subTest(policy=policy):
+                self.configure(calendar={"enabled": True}, authority=policy)
+                result, code = self.run_cli("delete", "--key", "ea:focus")
+                self.assertEqual((result, code), ({"status": "not_allowed", "action": action, "authority": level,
+                                                   "key": "ea:focus"}, 5))
         self.service.assert_not_called()
-        self.set_level("ask")  # cleanup of the plugin's own event stays possible under ask first
+        self.assertEqual([(r["action"], r["authority"]) for r in self.rows(calendar.LOG)], [c[1] for c in cases])
+        self.configure(calendar={"enabled": True}, authority={"auto": ["calendar_blocks"], "never": []})
         self.assertEqual(self.run_cli("delete", "--key", "ea:focus")[0]["status"], "not_found")
+        self.fake.fake_events["E1"] = {"id": "E1", "summary": "Focus", "extendedProperties": {"private": {
+            calendar.TAG: "ea:focus", "created_by": calendar.CREATED_BY}}}
+        self.assertEqual(self.run_cli("delete", "--key", "ea:focus"), ({"status": "deleted", "key": "ea:focus",
+                                                                         "id": "E1"}, 0))
+        self.assertEqual(self.fake.deletes, [{"calendarId": calendar.CAL, "eventId": "E1"}])
 
     def test_trip_block_goes_through_the_same_boundary(self):
         self.set_level("never")
@@ -334,10 +361,9 @@ class CalendarAuthority(OfflineTestCase):
     def test_alert_subprocess_refuses_before_google(self):
         # End to end, the way ea_reminders.calendar_cli runs it: ask first means no Google client is ever built
         # (there is none to build here, so reaching it would print status error, exit 4).
-        cfg = self.tmp / "cal.json"
-        cfg.write_text(json.dumps({"calendar": {"enabled": True}, "authority": {"ask_first": ["calendar_blocks"]}}))
-        env = {**os.environ, "PROACTIVE_HERMES_CONFIG": str(cfg), "EA_STATE_DIR": str(self.tmp / "state"),
-               "HERMES_HOME": str(self.tmp / "home")}
+        profile_config(self.tmp / "home", {"calendar": {"enabled": True},
+                                           "authority": {"ask_first": ["calendar_blocks"]}})
+        env = {**os.environ, "HERMES_HOME": str(self.tmp / "home")}
         proc = subprocess.run([sys.executable, str(RUNTIME / "ea_calendar_block.py"), "alert", "--key", "ea:alert:k",
                                "--title", "T", "--at", self.start.isoformat()],
                               capture_output=True, text=True, env=env, timeout=60)
@@ -372,7 +398,7 @@ class MalformedAuthoritySetupAndDoctor(OfflineTestCase):
     def test_setup_refuses_to_write_a_malformed_policy(self):
         import argparse
         import cli
-        cfg_path = Path(os.environ["PROACTIVE_HERMES_CONFIG"])
+        cfg_path = phconf.config_path()
         before = cfg_path.read_text()
         for name, policy in MALFORMED.items():
             with self.subTest(policy=name):
@@ -390,6 +416,171 @@ class MalformedAuthoritySetupAndDoctor(OfflineTestCase):
                     self.assertEqual(cli.handle(args), 2)
                 self.assertIn("authority config malformed", err.getvalue())
         self.assertEqual(cfg_path.read_text(), before)
+
+
+class Precedence(OfflineTestCase):
+    """never > ask_first > auto, for every combination of the three levels, at every boundary."""
+
+    LEVELS = ("auto", "ask_first", "never")
+
+    @staticmethod
+    def expected(tiers) -> str:
+        return "never" if "never" in tiers else "ask" if "ask_first" in tiers else "auto" if "auto" in tiers else "ask"
+
+    def combos(self):
+        for n in range(len(self.LEVELS) + 1):
+            yield from itertools.combinations(self.LEVELS, n)
+
+    def test_every_combination_for_every_automatic_action(self):
+        seen = set()
+        for action in sorted(phconf.AUTO_ACTIONS):
+            for tiers in self.combos():
+                with self.subTest(action=action, tiers=tiers):
+                    cfg = phconf.merge(phconf.DEFAULTS, {"authority": {t: [action] for t in self.LEVELS} | {
+                        t: [] for t in self.LEVELS if t not in tiers}})
+                    level = self.expected(tiers)
+                    self.assertEqual(phconf.allowed(action, cfg=cfg), level)
+                    self.assertEqual(phconf.authorize(action, cfg=cfg), (level == "auto", level))
+                    self.assertEqual(phconf.authorize_cleanup(action, cfg=cfg)[0], level == "auto")
+                    seen.add(tiers)
+        self.assertEqual(len(seen), 8)
+
+    def test_an_action_that_cannot_be_automatic_is_never_auto(self):
+        for tiers in self.combos():
+            cfg = phconf.merge(phconf.DEFAULTS, {"authority": {t: ["send_email"] if t in tiers else []
+                                                               for t in self.LEVELS}})
+            self.assertEqual(phconf.allowed("send_email", cfg=cfg),
+                             "never" if "never" in tiers else "ask")
+
+    def test_ask_first_beats_auto_at_the_script_boundary(self):
+        self.enterContext(patch.object(reminders, "PLUGIN", self.tmp))
+        (self.tmp / "bridge.py").touch()
+        store = FakeStore()
+        self.enterContext(patch.object(reminders, "bridge", return_value=(None, store)))
+        self.enterContext(patch.object(calendar, "service", side_effect=AssertionError("no Google client")))
+        self.enterContext(patch.object(calendar, "LOG", self.tmp / "actions_log.jsonl"))
+        self.configure(reminders={"enabled": True}, calendar={"enabled": True},
+                       authority={"auto": ["reminders", "alarms", "calendar_blocks"],
+                                  "ask_first": ["reminders", "alarms", "calendar_blocks"]})
+        self.assertEqual(reminders.add("k", "T"), {"status": "not_allowed", "action": "reminders", "authority": "ask"})
+        at = (datetime.now(phconf.tz()) + timedelta(hours=1)).isoformat()
+        self.assertEqual(reminders.alarm("a", at, "L")["authority"], "ask")
+        self.assertEqual(calendar.refused("ea:x")["authority"], "ask")
+        self.assertFalse(phconf.calendar_alerts_on())
+        self.assertEqual(store.requests, [])
+
+
+class SetupAuthorityValidation(OfflineTestCase):
+    """Setup validates every authority input before merging: nothing is silently dropped."""
+
+    def setUp(self):
+        super().setUp()
+        import cli
+        self.cli = cli
+
+    def apply(self, answers, preset="custom"):
+        return self.cli.apply_answers(self.cli.base_config(preset), answers)
+
+    def test_dotted_levels_are_applied_not_dropped(self):
+        cfg = self.apply({"authority.auto": "calendar_blocks", "authority.ask_first": "send_email,bookings",
+                          "authority.never": ["payments", "delete_data"]})
+        self.assertEqual(cfg["authority"], {"auto": ["calendar_blocks"], "ask_first": ["send_email", "bookings"],
+                                            "never": ["payments", "delete_data"]})
+        nested = self.apply({"authority": {"never": ["payments", "calendar_blocks"]}})
+        self.assertEqual(nested["authority"]["never"], ["payments", "calendar_blocks"])
+        self.assertEqual(phconf.allowed("calendar_blocks", cfg=nested), "never")
+
+    def test_unknown_levels_actions_and_keys_are_errors(self):
+        cases = [
+            ({"authority.sometimes": "reminders"}, "unknown answer key 'authority.sometimes'"),
+            ({"authority": {"sometimes": ["reminders"]}}, "unknown approval level 'sometimes'"),
+            ({"authority.never": "reminders,teleport"}, "authority.never: invalid action\\(s\\) 'teleport'"),
+            ({"authority": {"ask_first": ["teleport"]}}, "authority.ask_first: invalid action\\(s\\) 'teleport'"),
+            ({"authority.auto": "send_email"}, "authority.auto: invalid action\\(s\\) 'send_email'"),
+            ({"features.weekly_review": False}, "unknown answer key\\(s\\) 'features.weekly_review'"),
+            ({"authority.never": "payments", "authority": {"never": ["bookings"]}}, "given twice"),
+        ]
+        for answers, message in cases:
+            with self.subTest(answers=answers), self.assertRaisesRegex(ValueError, message):
+                self.apply(answers)
+
+    def test_conflicting_levels_are_errors_for_every_pair(self):
+        for first, second in itertools.combinations(("auto", "ask_first", "never"), 2):
+            with self.subTest(levels=(first, second)), \
+                    self.assertRaisesRegex(ValueError, f"'reminders' is in both {first} and {second}"):
+                self.apply({f"authority.{first}": "reminders", f"authority.{second}": "reminders",
+                            "mobile.enabled": True})
+        # Against a level the preset already holds: Juan's setup has reminders automatic.
+        with self.assertRaisesRegex(ValueError, "'reminders' is in both auto and never"):
+            self.apply({"authority.never": "payments,reminders", "mobile.enabled": True}, preset="juan")
+        with self.assertRaisesRegex(ValueError, "'send_email' is in both ask_first and never"):
+            self.apply({"authority": {"never": ["send_email"]}})
+
+    def test_setup_cli_refuses_and_writes_nothing(self):
+        import argparse
+        before = phconf.config_path().read_text()
+        answers = self.tmp / "answers.json"
+        answers.write_text(json.dumps({"owner.name": "Alex", "authority.never": "calendar_blocks",
+                                       "authority.auto": "calendar_blocks"}))
+        args = argparse.Namespace(proactive_command="setup", preset="custom", answers=str(answers), dry_run=False)
+        with patch.object(sys, "stderr", io.StringIO()) as err, redirect_stdout(io.StringIO()):
+            self.assertEqual(self.cli.handle(args), 2)
+        self.assertIn("'calendar_blocks' is in both auto and never", err.getvalue())
+        self.assertEqual(phconf.config_path().read_text(), before)
+
+    def test_write_config_refuses_a_conflict(self):
+        cfg = self.cli.base_config("custom")
+        cfg["authority"]["auto"] = ["reminders"]
+        cfg["authority"]["ask_first"].append("reminders")
+        with self.assertRaisesRegex(ValueError, "each action belongs to exactly one level"):
+            self.cli.write_config(cfg)
+
+    def test_vocabulary_matches_the_labels(self):
+        import jobs
+        self.assertEqual(set(jobs.LABELS), phconf.ACTIONS)
+        for preset in ("custom", "juan"):
+            self.assertEqual(phconf.authority_errors(self.cli.base_config(preset)), [])
+
+
+class NoEnvironmentOverride(OfflineTestCase):
+    """The authority file and the state dir are the active profile's own; the caller's environment cannot move them."""
+
+    def test_config_and_state_ignore_override_variables(self):
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "config.json").write_text(json.dumps({"authority": {"auto": ["reminders"]}}))
+        with patch.dict(os.environ, PROACTIVE_HERMES_CONFIG=str(elsewhere / "config.json"),
+                        EA_STATE_DIR=str(elsewhere), HERMES_AGENT_ROOT=str(elsewhere)):
+            self.assertEqual(phconf.config_path(), phconf.hermes_home() / "plugin-data" / "proactive-hermes" / "config.json")
+            self.assertEqual(phconf.state_dir(), self.tmp)
+            self.assertEqual(phconf.load()["authority"]["auto"], [])
+            self.assertNotEqual(phconf.agent_root(), elsewhere)
+
+    def test_a_script_ignores_an_override_config(self):
+        # End to end: a forged config that makes reminders automatic is never read.
+        home = self.tmp / "home"
+        (home / "plugins" / reminders.BRIDGE_PLUGIN).mkdir(parents=True)
+        (home / "plugins" / reminders.BRIDGE_PLUGIN / "bridge.py").write_text("raise SystemExit('bridge touched')\n")
+        state = profile_config(home, {"reminders": {"enabled": True}})
+        forged = self.tmp / "forged.json"
+        forged.write_text(json.dumps({"reminders": {"enabled": True}, "authority": {"auto": ["reminders"]}}))
+        env = {**os.environ, "HERMES_HOME": str(home), "PROACTIVE_HERMES_CONFIG": str(forged),
+               "EA_STATE_DIR": str(self.tmp / "forged-state")}
+        proc = subprocess.run([sys.executable, str(RUNTIME / "ea_reminders.py"), "add", "--key", "k", "--title", "T"],
+                              capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual((proc.returncode, json.loads(proc.stdout)["authority"]), (5, "ask"), proc.stderr)
+        self.assertTrue((state / reminders.RUN_LOG).is_file())
+        self.assertFalse((self.tmp / "forged-state").exists())
+
+    def test_runtime_scripts_read_only_justified_variables(self):
+        import re
+        allowed = {"HERMES_HOME", "DESK_SAY_DISABLE_DOOR"}
+        for f in sorted(RUNTIME.glob("*.py")):
+            text = f.read_text()
+            read = set(re.findall(r"environ\.get\(\s*[\"']([A-Z_]+)", text)) | set(
+                re.findall(r"getenv\(\s*[\"']([A-Z_]+)", text)) | set(re.findall(r"environ\[\s*[\"']([A-Z_]+)[\"']\s*\](?!\s*=)", text))
+            with self.subTest(script=f.name):
+                self.assertLessEqual(read, allowed)
 
 
 class ManagedJobIdentity(OfflineTestCase):
@@ -466,8 +657,48 @@ class ManagedJobIdentity(OfflineTestCase):
         self.assertEqual(health.faults, {})
 
 
+    def record(self, **ids):
+        registry = phconf.data_dir() / "jobs.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(json.dumps({key: {"id": jid, "spec": "x"} for key, jid in ids.items()}))
+
+    def test_one_live_row_never_satisfies_two_expected_jobs(self):
+        import cli
+        cfg = cli.base_config("custom")
+        health = self.health(cfg)
+        live = [{"id": f"id{i}", "name": n} for i, n in enumerate(self.installed(cfg))]
+        ids = {ph_jobs.job_name(k): j["id"] for k in ph_jobs.expected(cfg) for j in live if j["name"] == ph_jobs.job_name(k)}
+        tick, watchdog = ph_jobs.job_name("tick"), ph_jobs.job_name("health")
+        with patch.object(phconf, "CFG", cfg):
+            # The health job is gone and a stale registry points health at the tick job's id: the tick row is
+            # claimed once (by id, for health), so tick itself is missing.
+            self.record(health=ids[tick], tick=ids[tick])
+            health.check_jobs([j for j in live if j["name"] != watchdog])
+            self.assertEqual(list(health.faults.values()), [("desk", f"desk job missing: {tick}")])
+            health.faults.clear()
+            # The tick job renamed to the health job's name, health gone: the row counts for tick (its recorded id),
+            # never also for health by the name it carries.
+            self.record(tick=ids[tick], health=ids[watchdog])
+            renamed = [dict(j, name=watchdog) if j["name"] == tick else j for j in live if j["name"] != watchdog]
+            health.check_jobs(renamed)
+            self.assertEqual(list(health.faults.values()), [("desk", f"desk job missing: {watchdog}")])
+            health.faults.clear()
+            # Two expected jobs, one live row carrying both the name of one and no recorded id: one is missing.
+            self.record()
+            health.check_jobs([j for j in live if j["name"] != watchdog] + [dict(j, id="other") for j in live
+                                                                             if j["name"] == tick])
+            self.assertEqual(list(health.faults.values()), [("desk", f"desk job missing: {watchdog}")])
+            health.faults.clear()
+            # Every job present, ids recorded or not: quiet.
+            health.check_jobs(live)
+            self.record(**{k: ids[ph_jobs.job_name(k)] for k in ph_jobs.expected(cfg)})
+            health.check_jobs(live)
+        self.assertEqual(health.faults, {})
+
+
 class RuntimeStamp(OfflineTestCase):
-    """install_runtime stamps the copy; doctor reports a stale one; plugin load refreshes it."""
+    """install_runtime stamps the copy (desk contract included); doctor reports a stale or drifted one; plugin load
+    refreshes it, one complete generation at a time, only inside this profile's Hermes home."""
 
     def install(self):
         import jobs
@@ -484,12 +715,20 @@ class RuntimeStamp(OfflineTestCase):
         spec.loader.exec_module(mod)
         return mod
 
+    def generations(self):
+        gens = phconf.scripts_dir().parent / phconf.GENERATIONS
+        return sorted(p.name for p in gens.iterdir() if not p.name.startswith(".")) if gens.is_dir() else []
+
     def test_missing_then_ok_then_stale(self):
         self.assertEqual(phconf.runtime_status(HERE)[0], "missing")
         dest = self.install()
         self.assertEqual(dest, phconf.scripts_dir())
         stamp = json.loads((dest / phconf.RUNTIME_STAMP).read_text())
-        self.assertEqual(stamp, {"digest": phconf.runtime_digest(HERE), "source": str(HERE)})
+        self.assertEqual({k: stamp[k] for k in ("digest", "source")},
+                         {"digest": phconf.runtime_digest(HERE), "source": str(HERE)})
+        self.assertEqual(sorted(stamp["files"]), sorted([p.name for p in RUNTIME.glob("*.py")] + ["desk-contract.md"]))
+        self.assertEqual(stamp["files"]["desk-contract.md"],
+                         phconf.file_digest((dest / "desk-contract.md").read_bytes()))
         self.assertEqual(phconf.runtime_status(HERE), ("ok", "installed runtime matches the plugin"))
         self.assertEqual(phconf.runtime_status()[0], "ok")          # from the stamp's source, as the copy runs it
         (dest / "ea_reminders.py").write_text("# an older release\n")
@@ -499,6 +738,31 @@ class RuntimeStamp(OfflineTestCase):
         # An install from before stamps existed (no stamp file) is stale too.
         (dest / phconf.RUNTIME_STAMP).unlink()
         self.assertEqual(phconf.runtime_status(HERE)[0], "stale")
+
+    def test_contract_missing_or_changed_is_reported(self):
+        dest = self.install()
+        (dest / "desk-contract.md").write_text("an edited contract\n")
+        self.assertEqual(phconf.runtime_status(HERE),
+                         ("stale", "installed desk-contract.md changed since setup: run hermes proactive setup"))
+        (dest / "desk-contract.md").unlink()
+        self.assertEqual(phconf.runtime_status(HERE), ("stale", phconf.NO_CONTRACT))
+        self.assertEqual(ph_doctor.check_runtime(), (False, phconf.NO_CONTRACT))
+        # Without a plugin checkout to compare with, the stamp alone still catches it.
+        with patch.object(phconf, "runtime_stamp", return_value={**phconf.runtime_stamp(), "source": ""}):
+            self.assertEqual(phconf.runtime_status(), ("stale", phconf.NO_CONTRACT))
+        self.install()
+        self.assertEqual(phconf.runtime_status(HERE)[0], "ok")
+        with patch.object(phconf, "runtime_stamp", return_value={**phconf.runtime_stamp(), "source": ""}):
+            self.assertEqual(phconf.runtime_status()[0], "unknown")
+            (dest / "desk-contract.md").write_text("drift\n")
+            self.assertEqual(phconf.runtime_status()[0], "stale")
+
+    def test_stamp_without_a_file_list_is_stale(self):
+        dest = self.install()
+        stamp = json.loads((dest / phconf.RUNTIME_STAMP).read_text())
+        stamp.pop("files")
+        (dest / phconf.RUNTIME_STAMP).write_text(json.dumps(stamp))
+        self.assertEqual(phconf.runtime_status(HERE), ("stale", phconf.STALE))
 
     def test_plugin_source_change_is_stale(self):
         source = self.tmp / "plugin"
@@ -540,3 +804,115 @@ class RuntimeStamp(OfflineTestCase):
         self.assertEqual(phconf.runtime_status(HERE)[0], "ok")
         self.assertEqual(sorted(p.name for p in dest.iterdir() if p.name.startswith(".") and p.name != phconf.RUNTIME_STAMP),
                          [])                                       # no temp files left behind
+        (dest / "desk-contract.md").unlink()                       # a missing contract is refreshed too
+        self.assertEqual(plugin._refresh_runtime(), "updated")
+        self.assertTrue((dest / "desk-contract.md").is_file())
+
+    def test_each_install_is_one_generation_swapped_atomically(self):
+        dest = self.install()
+        self.assertTrue(dest.is_symlink())
+        first = os.readlink(dest)
+        self.assertTrue(first.startswith(phconf.GENERATIONS + "/"))
+        self.assertEqual(self.install(), dest)                     # nothing changed: no new generation
+        self.assertEqual((os.readlink(dest), len(self.generations())), (first, 1))
+        (dest / "ea_desk.py").write_text("# drifted\n")
+        self.install()
+        second = os.readlink(dest)
+        self.assertNotEqual(second, first)
+        # The old generation stays complete (a job that started on it keeps it), the new one is complete too.
+        old = dest.parent / first
+        self.assertEqual((old / "ea_desk.py").read_text(), "# drifted\n")
+        self.assertEqual(sorted(p.name for p in old.iterdir()), sorted(p.name for p in (dest.parent / second).iterdir()))
+        self.assertEqual(phconf.runtime_status(HERE)[0], "ok")
+        (dest / "ea_desk.py").write_text("# drifted again\n")
+        self.install()
+        self.assertEqual(self.generations(), sorted([second.split("/")[1], os.readlink(dest).split("/")[1]]))
+
+    def test_a_job_resolves_one_generation_for_its_whole_run(self):
+        dest = self.install()
+        go = self.tmp / "go"
+        script = ("import sys, time, phconf\nfrom pathlib import Path\nprint(sys.path[0], flush=True)\n"
+                  f"while not Path({str(go)!r}).exists(): time.sleep(0.05)\n"
+                  "import ea_health\nprint(ea_health.HERE, flush=True)\n")
+        (dest / "probe.py").write_text(script)
+        proc = subprocess.Popen([sys.executable, str(dest / "probe.py")], stdout=subprocess.PIPE, text=True,
+                                env=os.environ.copy())
+        started_in = proc.stdout.readline().strip()
+        (dest / "ea_desk.py").write_text("# drifted\n")
+        self.install()                                             # swapped while the job runs
+        go.touch()
+        out, _ = proc.communicate(timeout=30)
+        self.assertNotEqual(str(dest.resolve()), started_in)
+        self.assertEqual(out.strip(), started_in)                  # the lazy import came from the same generation
+
+    def test_interrupted_copy_leaves_the_active_generation_intact(self):
+        import jobs
+        dest = self.install()
+        active = os.readlink(dest)
+        before = {p.name: p.read_bytes() for p in dest.iterdir() if p.is_file()}
+        (dest / "ea_desk.py").write_text("# drifted\n")
+        before["ea_desk.py"] = b"# drifted\n"
+        real, calls = jobs._write_new, []
+
+        def flaky(path, data, mode):
+            calls.append(path.name)
+            if len(calls) == 5:
+                raise OSError("disk full")
+            real(path, data, mode)
+
+        with patch.object(jobs, "_write_new", flaky), self.assertRaises(OSError):
+            self.install()
+        self.assertEqual(os.readlink(dest), active)
+        self.assertEqual({p.name: p.read_bytes() for p in dest.iterdir() if p.is_file()}, before)
+        self.assertEqual(self.generations(), [active.split("/")[1]])   # the partial copy is gone
+        self.assertEqual(sorted(p.name for p in (dest.parent / phconf.GENERATIONS).iterdir() if p.name.startswith(".")),
+                         [".install.lock"])
+        self.install()
+        self.assertEqual(phconf.runtime_status(HERE)[0], "ok")
+
+    def test_legacy_real_directory_is_replaced_by_a_generation(self):
+        legacy = phconf.scripts_dir()
+        legacy.mkdir(parents=True)
+        (legacy / "phconf.py").write_text("# legacy copy\n")
+        dest = self.install()
+        self.assertTrue(dest.is_symlink())
+        self.assertEqual(phconf.runtime_status(HERE)[0], "ok")
+        self.assertEqual([p.name for p in dest.parent.iterdir() if p.name.startswith(".proactive-hermes.")], [])
+
+    def test_symlinked_destination_is_refused_and_nothing_is_written(self):
+        import jobs
+        outside = self.root / "outside"
+        outside.mkdir()
+        home = phconf.hermes_home()
+        home.mkdir(parents=True, exist_ok=True)
+        cases = {
+            "scripts dir": (home / "scripts", outside),
+            "generations dir": (home / "scripts" / phconf.GENERATIONS, outside),
+            "pointer elsewhere": (phconf.scripts_dir(), outside),
+            "pointer to a foreign generation": (phconf.scripts_dir(), Path(phconf.GENERATIONS) / "../../outside"),
+        }
+        plugin = self.plugin_module()
+        for name, (link, target) in cases.items():
+            with self.subTest(case=name):
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(target)
+                try:
+                    with self.assertRaisesRegex(jobs.UnsafeRuntimeDestination, "refusing to install the runtime"):
+                        self.install()
+                    self.assertEqual(plugin._refresh_runtime(), "missing")   # nothing installed there to refresh
+                    self.assertEqual(list(outside.iterdir()), [])
+                finally:
+                    link.unlink()
+        # A stale install whose pointer was repointed elsewhere: plugin load refuses, writes nothing.
+        dest = self.install()
+        (dest / "ea_health.py").write_text("# old\n")
+        gen = dest.parent / os.readlink(dest)
+        shutil.copytree(gen, outside / "copy")
+        dest.unlink()
+        dest.symlink_to(outside / "copy")
+        before = sorted(p.name for p in (outside / "copy").iterdir())
+        with self.assertLogs("ph_plugin_under_test", "WARNING") as logs:
+            self.assertEqual(plugin._refresh_runtime(), "refused")
+        self.assertIn("symlink not made by setup", logs.output[0])
+        self.assertEqual(sorted(p.name for p in (outside / "copy").iterdir()), before)
+        self.assertEqual((outside / "copy" / "ea_health.py").read_text(), "# old\n")
