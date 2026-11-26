@@ -21,10 +21,10 @@ records when it was closed and what it said; ea_desk lets it speak again once it
 Also deletes the item's calendar alert ('ea:alert:<key>', see ea_reminders.py) when the desk's records show
 one exists, through `ea_calendar_block.py delete`, which only touches events Proactive Hermes created.
 
-Ticking off the phone reminder and deleting the alert are writes: each needs its action in the automatic authority
-(reminders, calendar_blocks; a delete also honours delete_data). A refused one is not dropped: the records still
-close, and the answer lists it under "left_for_chat" ({"what", "action", "authority"}) so the chat agent asks the
-owner and, on a yes, removes it with Hermes's own phone or calendar tools.
+Ticking off the phone reminder and deleting the alert are cleanup: each needs `cleanup` in the automatic authority.
+A refused one is not dropped: the records still close, and the answer lists what remains ("phone reminder",
+"calendar alert") under "ask" (cleanup is ask first: offer to remove it and, on a yes, do it with Hermes's own phone
+or calendar tools) or "never" (just tell the owner what is still there).
 
 Never deletes anything on the phone or calendar the desk did not create. Prints JSON.
 """
@@ -182,11 +182,9 @@ def close(key: str, why: str = "", status: str = "done", evidence: str | None = 
     out = {"key": key, "status": status, "closed_in": touched, "reminder": rem_out}
     if alert_out is not None:
         out["calendar_alert"] = alert_out
-    left = [{"what": what, "action": res.get("action"), "authority": res.get("authority")}
-            for what, res in (("phone reminder", rem_out), ("calendar alert", alert_out or {}))
-            if res.get("status") == "not_allowed"]
-    if left:
-        out["left_for_chat"] = left
+    for what, res in (("phone reminder", rem_out), ("calendar alert", alert_out or {})):
+        if res.get("status") == "not_allowed":
+            out.setdefault("never" if res.get("authority") == "never" else "ask", []).append(what)
     if errors:
         out["errors"] = errors
     return out

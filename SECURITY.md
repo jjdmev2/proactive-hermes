@@ -16,9 +16,15 @@ The scripts that set reminders, alarms and calendar blocks check these levels th
 
 If one action is listed at more than one level, the strictest wins: never beats ask first, and ask first beats without asking. Setup does not save such a setting at all: it names the action and the two levels, and it also refuses an unknown level or action instead of dropping it.
 
-Cleaning up is held to the same rule. Ticking off a phone reminder the desk set, or deleting a calendar block or alert it made, happens on its own only when that action (reminders, calendar blocks) is allowed without asking. A delete also respects "deleting data": while that is ask first or never (never by default), the desk deletes nothing. Anything refused is reported back in chat, so Hermes can ask you and do it with its own tools.
+Cleaning up has its own approval, `cleanup`. Ticking off a phone reminder the desk set, or deleting a calendar block or alert it made, happens on its own only when cleanup is allowed without asking. Under ask first Hermes tells you what is left and offers to remove it with its own tools after your yes; under never it only tells you. The scripts never delete your own data.
 
-The approval file is always your profile's own `plugin-data/proactive-hermes/config.json`, and the desk's records are always next to it. No environment variable can point the scripts at another approval file or record folder. The runtime is installed only inside your Hermes home, as one complete copy at a time that replaces the old one in a single step; setup refuses to write it through a symlink.
+The approval file is always your profile's own `plugin-data/proactive-hermes/config.json`, and the desk's records are always next to it. No environment variable other than `HERMES_HOME`, which selects the whole profile, changes the approval file or record folder. The runtime is installed only by `hermes proactive setup`, only inside your Hermes home, as one complete copy at a time that replaces the old one in a single step. Setup checks for symlinks before it saves anything and refuses to write through one. An old scripts folder from an earlier release is renamed and kept, not deleted, and files you added next to the scripts are carried over to each new copy.
+
+## Known limits
+
+- Scheduled jobs that read mail and web pages run as normal Hermes agent turns, with Hermes's default tools.
+- The plugin enforces approvals inside its own scripts and tells every job to treat source text as data, but it does not sandbox the agent's other tools.
+- To restrict those tools, use Hermes's own toolset and approval settings.
 
 ## Untrusted text
 

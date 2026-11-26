@@ -200,14 +200,15 @@ class SetupAnswersTests(unittest.TestCase):
         cfg = cli.apply_answers(cli.base_config("juan"), {
             "mobile": {"enabled": False}, "reminders": {"enabled": True},
         })
-        self.assertEqual(cfg["authority"]["auto"], ["calendar_blocks"])
+        self.assertEqual(cfg["authority"]["auto"], ["calendar_blocks", "cleanup"])
         self.assertIs(cfg["reminders"]["enabled"], False)
 
     def test_juan_preset_authority(self):
         cfg = cli.base_config("juan")
-        self.assertEqual(cfg["authority"]["auto"], ["calendar_blocks", "reminders", "alarms", "leave_time"])
+        auto = ["calendar_blocks", "reminders", "alarms", "leave_time", "cleanup"]
+        self.assertEqual(cfg["authority"]["auto"], auto)
         cfg = cli.apply_answers(cfg, {"mobile.enabled": True})
-        self.assertEqual(cfg["authority"]["auto"], ["calendar_blocks", "reminders", "alarms", "leave_time"])
+        self.assertEqual(cfg["authority"]["auto"], auto)
 
     def test_invalid_timezone_raises(self):
         for key in ("timezone", "daily_call.timezone"):

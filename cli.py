@@ -34,7 +34,7 @@ QUESTIONS = [
     ("mail.gmail_api", "Read Gmail and Google Calendar through the google-workspace skill? (y/n)", "mail.gmail_api", "bool"),
     ("mail.himalaya_accounts", "Other mail accounts set up in himalaya to read (names, comma separated), or none?", None, "list"),
     ("calendar.enabled", "May I put private focus blocks on your calendar for key tasks? (y/n)", "calendar.enabled", "bool"),
-    ("authority.auto", "Which may I do without asking? calendar_blocks, reminders, alarms (urgent only), leave_time (block + 'leave now' reminder for trips). Comma separated, or none", "authority.auto", "list"),
+    ("authority.auto", "Which may I do without asking? calendar_blocks, reminders, alarms (urgent only), leave_time (block + 'leave now' reminder for trips), cleanup (remove my own blocks and alerts and tick off my own reminders once an item is closed). Comma separated, or none", "authority.auto", "list"),
     ("mobile.enabled", "Do you use the Hermes mobile app with reminders, alarms and location shared? (y/n)", "mobile.enabled", "bool"),
     ("slack.enabled", "Do you use Slack through Nous Portal connectors? (y/n)", "slack.enabled", "bool"),
     ("slack.channels", "Slack channels to watch for asks to you (e.g. #team,#product), or none?", None, "list"),
@@ -144,7 +144,8 @@ def parse_answer(path: str, kind: str, value):
         value = parse(kind, value)
     if path in AUTHORITY_KEYS:
         if not isinstance(value, list):
-            raise ValueError(f"{path} expects a comma-separated list or a JSON array")
+            raise ValueError(f"authority config malformed: {path} must be a list of action names (a comma-separated "
+                             f"list or a JSON array), not {json.dumps(value)}")
         valid = phconf.AUTO_ACTIONS if path == "authority.auto" else phconf.ACTIONS
         invalid = [repr(action) for action in value if not isinstance(action, str) or action not in valid]
         if invalid:
@@ -221,16 +222,17 @@ def authority_answers(answers: dict) -> dict:
     (authority.auto, authority.ask_first, authority.never) and a nested {"authority": {...}} object. An unknown
     level or action, or one action given two levels, is an error, never silently dropped. Returns {level: list}."""
     out: dict = {}
-    nested = answers.get("authority")
-    if nested is not None:
+    if "authority" in answers:   # an explicit null is malformed too, never "keep the defaults"
+        nested = answers["authority"]
         if not isinstance(nested, dict):
             raise ValueError("authority config malformed: authority must be an object with auto, ask_first and "
-                             "never lists")
+                             f"never lists, not {json.dumps(nested)}")
         for level, value in nested.items():
             if level not in phconf.AUTHORITY_LISTS:
                 raise ValueError(f"authority: unknown approval level {level!r}; use auto, ask_first or never")
             if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-                raise ValueError(f"authority config malformed: authority.{level} must be a list of action names")
+                raise ValueError(f"authority config malformed: authority.{level} must be a list of action names, "
+                                 f"not {json.dumps(value)}")
             out[level] = parse_answer(f"authority.{level}", "list", value)
     for key in answers:
         if key.startswith("authority."):
@@ -381,8 +383,9 @@ def handle_watch(args, jobs) -> int:
                 watches.append(watch)
         elif existing is not None:
             watches.remove(existing)
+        jobs.runtime_paths()   # a refused runtime destination leaves config.json unchanged
         write_config(cfg)
-    except ValueError as exc:
+    except (ValueError, jobs.UnsafeRuntimeDestination) as exc:
         print(f"Watch: {exc}", file=sys.stderr)
         return 2
     try:
@@ -455,6 +458,11 @@ def handle(args) -> int:
             if row["action"] not in ("keep", "skip"):
                 print(f"  would {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
         return 0
+    try:
+        jobs.runtime_paths()   # checked before config.json is written, so a refused install changes nothing
+    except jobs.UnsafeRuntimeDestination as exc:
+        print(f"Setup: {exc}", file=sys.stderr)
+        return 1
     key_note = decisions_note(cfg)
     if key_note:
         print(key_note)
@@ -462,7 +470,7 @@ def handle(args) -> int:
     phconf.CFG = cfg
     try:
         rows = jobs.apply(cfg)
-    except jobs.UnsafeRuntimeDestination as exc:   # a symlink below the Hermes home: nothing was installed
+    except jobs.UnsafeRuntimeDestination as exc:   # changed since the check above: nothing was installed
         print(f"Setup: {exc}", file=sys.stderr)
         return 1
     print(f"Config: {path}")

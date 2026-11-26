@@ -71,7 +71,7 @@ If `hermes proactive doctor` does not show the `decisions` check as ok, say once
 
 Ask these three in plain words, after the details:
 
-1. **Approval levels.** "Which of these may I do without asking: private calendar blocks, reminders, alarms for urgent things, leave-time planning for trips? Everything else I prepare and ask first. Payments and passwords always stay with you." Juan's setup allows all four.
+1. **Approval levels.** "Which of these may I do without asking: private calendar blocks, reminders, alarms for urgent things, leave-time planning for trips, cleanup (removing my own blocks and alerts and ticking off my own reminders once an item is closed)? Everything else I prepare and ask first. Payments and passwords always stay with you." Juan's setup allows all five.
 2. **The Hermes mobile app.** Recommend it strongly: reminders, alarms, location (for leave times) and calendar make the desk useful on the go. Ask them to install it, sign in to the same Hermes, and share Reminders, Alarms, Location and Calendar in its settings. Check with the mobile device tools if they are available.
 3. **First watches.** Offer two or three from their life, for example:
    - selling apps (Vinted, eBay, Marketplace): "tell me when a buyer makes an offer, with a suggested reply"

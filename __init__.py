@@ -3,10 +3,9 @@
 Registers the `hermes proactive` CLI (setup, status, remove, questions), the `/proactive` slash command,
 and three bundled skills: `proactive-setup` (the guided interview), `proactive-desk` (how to work
 the desk in chat: drafts, close-outs, promises) and `browser-bookings` (approval-gated rides, tickets,
-food). The scheduled jobs and runtime scripts are installed by `hermes proactive setup`. On load this module
-registers, and if setup already installed the runtime and the plugin has since been upgraded (or an installed file
-drifted), it installs a new runtime generation and activates it atomically (jobs.install_runtime; never the first
-install, never the cron jobs).
+food). The scheduled jobs and runtime scripts are installed only by `hermes proactive setup`; loading the plugin
+never writes them. After a plugin update, `hermes proactive doctor` reports `runtime out of date: run hermes
+proactive setup` until setup runs again.
 """
 from __future__ import annotations
 
@@ -70,35 +69,6 @@ def _start_mail_push(ctx) -> None:
         logger.warning("proactive-hermes: mail push not started (%s)", type(exc).__name__)
 
 
-def _refresh_runtime() -> str:
-    """After a plugin upgrade, bring an installed runtime up to date (the scheduled jobs run the copy in
-    <HERMES_HOME>/scripts/proactive-hermes, not this checkout). Only when setup already ran (config and an installed
-    runtime exist) and the installed runtime is stale (an older stamp, or an installed file, the desk contract
-    included, missing or changed). jobs.install_runtime writes one complete new generation and activates it in one
-    rename, and refuses (nothing written) when the destination is not a real directory inside this profile's Hermes
-    home. Job prompts change only with `hermes proactive setup`. Returns what it did, never raises."""
-    try:
-        import sys
-        sys.path.insert(0, str(HERE / "runtime"))
-        import phconf
-        if not phconf.config_path().is_file():
-            return "not set up"
-        state, _note = phconf.runtime_status(HERE)
-        if state != "stale":
-            return state
-        from . import jobs
-        try:
-            jobs.install_runtime(phconf.load())
-        except jobs.UnsafeRuntimeDestination as exc:
-            logger.warning("proactive-hermes: runtime not refreshed: %s", exc)
-            return "refused"
-        logger.info("proactive-hermes: runtime scripts updated after a plugin upgrade")
-        return "updated"
-    except Exception as exc:
-        logger.warning("proactive-hermes: runtime not refreshed (%s); run `hermes proactive setup`", type(exc).__name__)
-        return "error"
-
-
 def register(ctx) -> None:
     from . import cli
     ctx.register_cli_command(
@@ -108,7 +78,6 @@ def register(ctx) -> None:
     ctx.register_command("proactive", _slash, description="Set up or check Proactive Hermes",
                          args_hint="[setup|status]")
     ctx.register_hook("pre_llm_call", _offer_setup)
-    _refresh_runtime()
     _start_mail_push(ctx)
     for name, desc in SKILLS.items():
         try:

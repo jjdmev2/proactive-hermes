@@ -22,7 +22,7 @@ import ea_close  # noqa: E402  (test_desk puts runtime/ on sys.path)
 class CloseBase(OfflineTestCase):
     def setUp(self):
         super().setUp()
-        self.configure(reminders={"enabled": True}, authority={"auto": ["reminders"]})  # ticking off needs auto
+        self.configure(reminders={"enabled": True}, authority={"auto": ["reminders", "cleanup"]})  # ticking off needs cleanup auto
         self.enterContext(patch.object(reminders, "PLUGIN", self.tmp))
         (self.tmp / "bridge.py").touch()
         self.freeze_datetime(ea_close)
@@ -55,30 +55,39 @@ class CloseItemTests(CloseBase):
         self.assertEqual(self.store.requests[0][:2], ("reminders.complete", {"id": "RP"}))
         self.assertEqual(self.state("reminder_outbox.json")["promise-a"]["status"], "closing")
 
-    def test_refused_phone_and_calendar_cleanup_is_reported_for_the_chat_flow(self):
+    def test_refused_cleanup_lands_in_the_ask_or_never_list(self):
         # The calendar delete runs end to end (ea_calendar_block.py in a subprocess, this test's HERMES_HOME): it
-        # refuses before any Google client exists. delete_data stays in the default never list.
+        # refuses before any Google client exists. Only `cleanup` decides; delete_data plays no part.
         self.write("actions.json", {"promise-a": {"calendar_alert_id": "E1"}})
+        both = ["phone reminder", "calendar alert"]
         cases = (
-            ({"ask_first": ["reminders"], "auto": ["calendar_blocks"]},
-             [{"what": "phone reminder", "action": "reminders", "authority": "ask"},
-              {"what": "calendar alert", "action": "delete_data", "authority": "never"}]),
-            ({"never": ["reminders"], "ask_first": ["calendar_blocks"]},
-             [{"what": "phone reminder", "action": "reminders", "authority": "never"},
-              {"what": "calendar alert", "action": "calendar_blocks", "authority": "ask"}]),
-            ({"auto": ["reminders", "calendar_blocks"], "ask_first": ["delete_data"], "never": []},
-             [{"what": "calendar alert", "action": "delete_data", "authority": "ask"}]),
+            ({"auto": ["reminders", "calendar_blocks"], "ask_first": ["cleanup"]}, {"ask": both}),
+            ({"auto": ["reminders", "calendar_blocks"], "never": ["cleanup"]}, {"never": both}),
+            ({"auto": ["reminders", "calendar_blocks"], "never": []}, {"ask": both}),       # unlisted = ask
         )
         for authority, left in cases:
             with self.subTest(authority=authority):
                 self.write("promises.json", {"promise-a": {"status": "open", "what": "Send the deck to Sam"}})
                 self.configure(reminders={"enabled": True}, calendar={"enabled": True}, authority=authority)
                 out = ea_close.close("promise-a", "owner: done", "done")
-                self.assertEqual(out["left_for_chat"], left)
+                self.assertEqual({k: out[k] for k in ("ask", "never") if k in out}, left)
+                self.assertNotIn("left_for_chat", out)
                 self.assertIn("promise", out["closed_in"])
                 self.assertNotIn("calendar alert", out["closed_in"])
                 self.assertEqual(out["calendar_alert"]["status"], "not_allowed")
-        self.assertEqual([op for op, *_ in self.store.requests], ["reminders.complete"])   # only the auto case
+        self.assertEqual(self.store.requests, [])
+
+    def test_cleanup_auto_cleans_even_with_delete_data_never(self):
+        self.write("actions.json", {"promise-a": {"calendar_alert_id": "E1"}})
+        self.configure(reminders={"enabled": True}, calendar={"enabled": True},
+                       authority={"auto": ["cleanup"], "never": ["delete_data"]})
+        with patch.object(ea_close.reminders, "calendar_cli", return_value={"status": "deleted"}) as cal:
+            out = ea_close.close("promise-a", "owner: done", "done")
+        cal.assert_called_once()
+        self.assertEqual(out["closed_in"], ["ledger", "promise", "phone reminder", "calendar alert"])
+        self.assertNotIn("ask", out)
+        self.assertNotIn("never", out)
+        self.assertEqual([op for op, *_ in self.store.requests], ["reminders.complete"])
 
     def test_close_marks_goal_and_status_done(self):
         out = ea_close.close("goal-b", "proof", "done")

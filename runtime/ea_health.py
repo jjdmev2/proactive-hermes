@@ -169,19 +169,20 @@ def registry_ids() -> dict[str, str]:
     return out
 
 
-def missing_jobs(desk: list[dict]) -> list[str]:
+def missing_jobs(live: list[dict]) -> list[str]:
     """Names of the managed jobs the installer keeps for this config (ph_jobs.expected, the installer's own rule:
     only flags that are jobs, only when the connection is there, one per watch) that no live job carries, matched
     one to one by identity. First every expected job with an id the installer recorded claims the live job with that
     id (renamed or not), then each remaining expected job claims an unclaimed live job with its installed name. A
-    live job counts for at most one expected job, so a duplicate or a misnamed job never stands in for another."""
+    live job counts for at most one expected job, so a duplicate or a misnamed job never stands in for another.
+    LIVE is every cron job, not only the ones named with the desk prefix: a renamed job keeps its recorded id."""
     expected = ph_jobs.expected(phconf.CFG)
     recorded = registry_ids()
     used: set[int] = set()
     matched: set[str] = set()
 
     def claim(key: str, test) -> None:
-        for i, job in enumerate(desk):
+        for i, job in enumerate(live):
             if i not in used and test(job):
                 used.add(i)
                 matched.add(key)
@@ -204,7 +205,7 @@ def check_jobs(jobs: list[dict]) -> None:
     except Exception:
         croniter = None
     desk = [j for j in jobs if (j.get("name") or "").startswith(DESK_PREFIXES)]
-    missing = missing_jobs(desk)
+    missing = missing_jobs(jobs)   # all live jobs: ids are matched before the prefix filter
     if missing:
         fault("desk", "desk job missing: " + ", ".join(missing))
     for job in desk:
@@ -411,7 +412,7 @@ def main() -> int:
         fault("desk", "cron jobs.json unreadable")
         jobs = []
     desk_jobs = [job for job in jobs if (job.get("name") or "").startswith(DESK_PREFIXES)]
-    steps = [lambda: check_local_delivery(desk_jobs), lambda: check_jobs(desk_jobs),
+    steps = [lambda: check_local_delivery(desk_jobs), lambda: check_jobs(jobs),
              lambda: check_contract(desk_jobs), check_say_outbox, check_say_receipts]
     if phconf.CFG["features"]["mail_radar"] and phconf.CFG["mail"]["himalaya_accounts"]:
         steps.append(check_cursor)

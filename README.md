@@ -90,7 +90,7 @@ hermes proactive doctor
 
 `hermes proactive doctor` checks the gateway, the Bot Chat, the phone, the OpenAI key, your mail, your approval levels and the installed scripts, and tells you how to fix anything missing. `hermes proactive doctor --send-test` posts one test message into your Bot Chat, so you can see it land on your phone. If `hermes proactive` is not found (plugins running with `plugins.isolation: host`), use `python3 ~/.hermes/plugins/proactive-hermes/cli.py doctor` and the same flags.
 
-After you update the plugin, Hermes copies the new scripts into place the next time it loads the plugin. The scheduled jobs change only when you run `hermes proactive setup` again. If `doctor` says `runtime out of date: run hermes proactive setup`, do that.
+After you update the plugin, run `hermes proactive setup` once: it installs the new scripts and updates the jobs. Loading the plugin never changes them. Until then `doctor` says `runtime out of date: run hermes proactive setup`.
 
 ### Give Hermes access
 
@@ -148,13 +148,13 @@ The mail radar checks your mail every 15 minutes. With push, new mail wakes it w
 
 | Level | Juan's setup | You can change it to |
 | :--- | :--- | :--- |
-| **Without asking** | Private calendar blocks, phone reminders, alarms for urgent things, leave times for trips. | Any of these, or none. Watch actions too, if you want a watch to act on its own. |
+| **Without asking** | Private calendar blocks, phone reminders, alarms for urgent things, leave times for trips, cleanup of the desk's own blocks, alerts and reminders. | Any of these, or none. Watch actions too, if you want a watch to act on its own. |
 | **Ask first** | Sending email or Slack, replying to offers, registering for events, purchases (Hermes fills the cart, you pay), bookings (Hermes stops at the price and books on your yes to that exact quote), accepting invites. | Everything not allowed above lands here. Hermes prepares it fully and asks in one line; a "yes" approves that one action. The desk scripts never set a block, reminder or alarm in this row. After your yes in chat, Hermes sets it with its own phone and calendar tools, under Hermes's own approvals. |
 | **Never** | Entering or changing card details or payment methods, approving a payment in your bank app, passwords, deleting data. | These always stay with you. |
 
 The scripts check these levels themselves each time they act. If one action sits in two levels, the strictest wins: never beats ask first, ask first beats without asking. Setup refuses such a setting, and an unknown level or action, with a message that names it, instead of saving or silently dropping it. If the approval setting in the config is broken, the scripts refuse every block, reminder and alarm, setup will not save it, and `hermes proactive doctor` says `authority config malformed`.
 
-Cleanup follows the same levels. The desk ticks off its own phone reminders and deletes its own calendar blocks and alerts only when reminders or calendar blocks are allowed without asking, and a delete also needs "deleting data" to be neither ask first nor never (it is never by default, so by default the desk deletes nothing). When you close an item and a cleanup step is not allowed, the item still closes and Hermes tells you what is left, then removes it with its own tools after your yes.
+Cleanup is its own approval, `cleanup`. The desk ticks off its own phone reminders and deletes its own calendar blocks and alerts only when cleanup is allowed without asking (Juan's setup allows it; otherwise it is ask first). When you close an item and cleanup is not allowed, the item still closes and Hermes tells you what is left: under ask first it offers to remove it with its own tools after your yes, under never it only tells you. Your own data is never deleted by the scripts.
 
 ### Add your own watches
 
@@ -306,7 +306,7 @@ Works with sites that book on the web: Uber (m.uber.com), most rail operators, W
 
 ## Privacy and safety
 
-- **Approval first.** The desk only does on its own what you allowed in setup (in Juan's setup: blocks, reminders, alarms, leave times). Sending, replying, registering, buying and booking wait for your yes to that exact action, unless you let a specific watch act on its own. Hermes never enters card details or passwords, and nothing is paid without your yes to an exact quote.
+- **Approval first.** The desk only does on its own what you allowed in setup (in Juan's setup: blocks, reminders, alarms, leave times and cleanup of its own items). Sending, replying, registering, buying and booking wait for your yes to that exact action, unless you let a specific watch act on its own. Hermes never enters card details or passwords, and nothing is paid without your yes to an exact quote.
 - **Local.** Settings, drafts, promises and logs stay in your Hermes home, in a folder only your user can read. We run no server and collect no telemetry.
 - **Your Bot's model sees what the desk reads.** Mail, Slack and calendar text go to the model provider of your Bot's profile, as in any Hermes chat.
 - **What goes to OpenAI** (only with a key, only to the Decisions API): for mail, the sender, subject and first 600 characters of the body; for Slack, the message being judged; for promises and the work recap, the message or call item and the Linear title it is matched against; for your replies, the reply and the numbered list it answers; and the text of anything checked for prompt injection. Nothing else, and no files. OpenAI offers zero data retention for eligible accounts.

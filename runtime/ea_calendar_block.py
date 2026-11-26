@@ -13,10 +13,9 @@ Usage:
   ea_calendar_block.py mine   [--days 14]
   ea_calendar_block.py delete --key KEY      (only Proactive Hermes blocks)
 
-Authority: create, alert and delete are calendar writes made under `calendar_blocks`. Before any Google call they
-need it in the automatic authority (phconf.authorize, phconf.authorize_cleanup); 'ask' and 'never' always refuse.
-delete (cleanup of the plugin's own block or alert) also honours `delete_data`: listed in never or ask first, it
-refuses. When the owner says yes in chat to an ask-first block or removal, the chat agent uses Hermes's own
+Authority: create and alert are calendar writes made under `calendar_blocks`; delete (cleanup of the plugin's own
+block or alert) is made under `cleanup`. Before any Google call each needs its action in the automatic authority
+(phconf.authorize); 'ask' and 'never' always refuse. When the owner says yes in chat to an ask-first block or removal, the chat agent uses Hermes's own
 calendar tools, never this script. A refusal prints {"status": "not_allowed", ...}, is logged, exits 5 and
 changes nothing. free and mine only read.
 
@@ -278,11 +277,11 @@ def cmd_mine(a) -> None:
 
 
 def cmd_delete(a) -> None:
-    # Removing the plugin's own block or alert is a calendar write: automatic authority only, and delete_data.
-    ok, action, basis = phconf.authorize_cleanup(ACTION, delete=True)
+    # Removing the plugin's own block or alert is cleanup: only when `cleanup` is automatic.
+    ok, basis = phconf.authorize(phconf.CLEANUP)
     if not ok:
-        log({"kind": "calendar_not_allowed", "key": a.key, "action": action, "authority": basis})
-        out({"status": "not_allowed", "action": action, "authority": basis, "key": a.key}, 5)
+        log({"kind": "calendar_not_allowed", "key": a.key, "action": phconf.CLEANUP, "authority": basis})
+        out({"status": "not_allowed", "action": phconf.CLEANUP, "authority": basis, "key": a.key}, 5)
     svc = service()
     ev = find_mine(svc, a.key)
     if not ev:

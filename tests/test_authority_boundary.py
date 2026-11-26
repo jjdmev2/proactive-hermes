@@ -5,7 +5,7 @@ calendar alerts, calendar deletes): 'never' and 'ask' put nothing on the fake ph
 service, and only 'auto' does. There is no owner approval path in the scripts: an ask-first action the owner says
 yes to in chat goes through Hermes's own tools, never these scripts. A malformed authority fails closed. A retry
 that is no longer allowed ends in a terminal 'not_allowed' state. The health watchdog matches the jobs the
-installer keeps by identity. The installed runtime carries a stamp, so a stale copy is reported and refreshed.
+installer keeps by identity. The installed runtime carries a stamp, so a stale copy is reported (only setup installs it).
 """
 import importlib.util
 import io
@@ -41,6 +41,9 @@ MALFORMED = {
     "auto with a non-string": {"auto": ["reminders", 7]},
     "ask_first as a string": {"auto": ["reminders", "alarms", "calendar_blocks"], "ask_first": "send_email"},
     "authority not an object": "reminders",
+    "authority null": None,
+    "tier null": {"auto": None},
+    "tier string": {"auto": ["reminders"], "never": "payments"},
 }
 
 
@@ -324,26 +327,26 @@ class CalendarAuthority(OfflineTestCase):
                     self.assertEqual((result["status"], result["authority"], code), ("not_allowed", "never", 5))
         self.service.assert_not_called()
 
-    def test_delete_needs_auto_calendar_blocks_and_honours_delete_data(self):
-        # Deleting its own block or alert is a calendar write: automatic only. delete_data in never or ask first
-        # refuses it too; delete_data unlisted does not.
+    def test_delete_needs_auto_cleanup(self):
+        # Deleting its own block or alert is cleanup: only `cleanup` automatic allows it, whatever calendar_blocks
+        # and delete_data say. Unlisted is ask.
         cases = [
-            ({"never": ["calendar_blocks"]}, ("calendar_blocks", "never")),
-            ({"ask_first": ["calendar_blocks"]}, ("calendar_blocks", "ask")),
-            ({}, ("calendar_blocks", "ask")),
-            ({"auto": ["calendar_blocks"], "ask_first": ["calendar_blocks"]}, ("calendar_blocks", "ask")),
-            ({"auto": ["calendar_blocks"]}, ("delete_data", "never")),            # the default never list
-            ({"auto": ["calendar_blocks"], "never": [], "ask_first": ["delete_data"]}, ("delete_data", "ask")),
+            ({"auto": ["calendar_blocks"], "never": ["cleanup"]}, "never"),
+            ({"auto": ["calendar_blocks"], "ask_first": ["cleanup"]}, "ask"),
+            ({"auto": ["calendar_blocks"], "never": []}, "ask"),
+            ({"auto": ["cleanup"], "ask_first": ["cleanup"]}, "ask"),
         ]
-        for policy, (action, level) in cases:
+        for policy, level in cases:
             with self.subTest(policy=policy):
                 self.configure(calendar={"enabled": True}, authority=policy)
                 result, code = self.run_cli("delete", "--key", "ea:focus")
-                self.assertEqual((result, code), ({"status": "not_allowed", "action": action, "authority": level,
+                self.assertEqual((result, code), ({"status": "not_allowed", "action": "cleanup", "authority": level,
                                                    "key": "ea:focus"}, 5))
         self.service.assert_not_called()
-        self.assertEqual([(r["action"], r["authority"]) for r in self.rows(calendar.LOG)], [c[1] for c in cases])
-        self.configure(calendar={"enabled": True}, authority={"auto": ["calendar_blocks"], "never": []})
+        self.assertEqual([(r["action"], r["authority"]) for r in self.rows(calendar.LOG)],
+                         [("cleanup", level) for _policy, level in cases])
+        self.configure(calendar={"enabled": True}, authority={"auto": ["cleanup"], "never": ["calendar_blocks",
+                                                                                           "delete_data"]})
         self.assertEqual(self.run_cli("delete", "--key", "ea:focus")[0]["status"], "not_found")
         self.fake.fake_events["E1"] = {"id": "E1", "summary": "Focus", "extendedProperties": {"private": {
             calendar.TAG: "ea:focus", "created_by": calendar.CREATED_BY}}}
@@ -418,6 +421,27 @@ class MalformedAuthoritySetupAndDoctor(OfflineTestCase):
         self.assertEqual(cfg_path.read_text(), before)
 
 
+    def test_null_and_malformed_policy_render_deny_all_and_setup_rejects_them(self):
+        import cli
+        import jobs
+        watch = {"name": "w", "schedule": "*/15 * * * *", "check": "c", "when": "w", "then": "act", "act": "x"}
+        for name in ("authority null", "tier null", "tier string"):
+            policy = MALFORMED[name]
+            with self.subTest(policy=name):
+                cfg = cli.base_config("custom")
+                cfg["authority"], cfg["watches"] = policy, [watch]
+                self.assertIn("authority config malformed", jobs.variables(cfg)["AUTO"])
+                for job in jobs.JOBS + [jobs.watch_job(watch)]:
+                    jobs.prompt_for(job, cfg)                      # renders, never crashes
+                self.assertIn("Watch actions are not authorized", jobs.prompt_for(jobs.watch_job(watch), cfg))
+                self.configure(authority=policy)
+                self.assertEqual([phconf.allowed(a) for a in ("reminders", "cleanup")], ["never", "never"])
+                self.assertTrue(ph_doctor.check_authority()[1].startswith("authority config malformed"))
+        for answers in ({"authority": None}, {"authority": {"never": None}}, {"authority.auto": None}):
+            with self.subTest(answers=answers), self.assertRaisesRegex(ValueError, "authority config malformed"):
+                cli.apply_answers(cli.base_config("custom"), answers)
+
+
 class Precedence(OfflineTestCase):
     """never > ask_first > auto, for every combination of the three levels, at every boundary."""
 
@@ -441,7 +465,6 @@ class Precedence(OfflineTestCase):
                     level = self.expected(tiers)
                     self.assertEqual(phconf.allowed(action, cfg=cfg), level)
                     self.assertEqual(phconf.authorize(action, cfg=cfg), (level == "auto", level))
-                    self.assertEqual(phconf.authorize_cleanup(action, cfg=cfg)[0], level == "auto")
                     seen.add(tiers)
         self.assertEqual(len(seen), 8)
 
@@ -654,8 +677,10 @@ class ManagedJobIdentity(OfflineTestCase):
             registry.parent.mkdir(parents=True, exist_ok=True)
             registry.write_text(json.dumps({"tick": {"id": tick_id, "spec": "x"}}))
             health.check_jobs(renamed)
+            self.assertEqual(health.faults, {})
+            # Renamed without the desk prefix: its recorded id still counts (ids are matched before the filter).
+            health.check_jobs([dict(j, name="My own tick") if j["id"] == tick_id else j for j in live])
         self.assertEqual(health.faults, {})
-
 
     def record(self, **ids):
         registry = phconf.data_dir() / "jobs.json"
@@ -697,8 +722,8 @@ class ManagedJobIdentity(OfflineTestCase):
 
 
 class RuntimeStamp(OfflineTestCase):
-    """install_runtime stamps the copy (desk contract included); doctor reports a stale or drifted one; plugin load
-    refreshes it, one complete generation at a time, only inside this profile's Hermes home."""
+    """install_runtime stamps the copy (desk contract included); doctor reports a stale or drifted one; only setup
+    installs it, one complete generation at a time, only inside this profile's Hermes home."""
 
     def install(self):
         import jobs
@@ -786,27 +811,16 @@ class RuntimeStamp(OfflineTestCase):
         self.assertEqual((row["ok"], row["note"]), (False, "runtime out of date: run hermes proactive setup"))
         self.assertIn("hermes proactive setup", row["fix"])
 
-    def test_plugin_load_refreshes_only_an_installed_stale_runtime(self):
+    def test_plugin_load_never_writes_the_runtime(self):
+        from unittest.mock import MagicMock
         plugin = self.plugin_module()
-        cfg_path = phconf.config_path()
-        cfg_path.unlink()
-        self.assertEqual(plugin._refresh_runtime(), "not set up")
-        self.assertFalse(phconf.scripts_dir().exists())
-        cfg_path.write_text(json.dumps({"owner": {"name": "Alex"}}))
-        self.assertEqual(plugin._refresh_runtime(), "missing")      # first install stays with setup
-        self.assertFalse((phconf.scripts_dir() / "phconf.py").exists())
+        self.assertFalse(hasattr(plugin, "_refresh_runtime"))
         dest = self.install()
-        self.assertEqual(plugin._refresh_runtime(), "ok")
         (dest / "ea_health.py").write_text("# old\n")
-        (dest / phconf.RUNTIME_STAMP).write_text(json.dumps({"digest": "old", "source": str(HERE)}))
-        self.assertEqual(plugin._refresh_runtime(), "updated")
-        self.assertEqual((dest / "ea_health.py").read_bytes(), (RUNTIME / "ea_health.py").read_bytes())
-        self.assertEqual(phconf.runtime_status(HERE)[0], "ok")
-        self.assertEqual(sorted(p.name for p in dest.iterdir() if p.name.startswith(".") and p.name != phconf.RUNTIME_STAMP),
-                         [])                                       # no temp files left behind
-        (dest / "desk-contract.md").unlink()                       # a missing contract is refreshed too
-        self.assertEqual(plugin._refresh_runtime(), "updated")
-        self.assertTrue((dest / "desk-contract.md").is_file())
+        with patch.object(plugin, "_start_mail_push"):
+            plugin.register(MagicMock())
+        self.assertEqual((dest / "ea_health.py").read_text(), "# old\n")   # only setup installs it
+        self.assertEqual(ph_doctor.check_runtime(), (False, phconf.STALE))
 
     def test_each_install_is_one_generation_swapped_atomically(self):
         dest = self.install()
@@ -826,7 +840,12 @@ class RuntimeStamp(OfflineTestCase):
         self.assertEqual(phconf.runtime_status(HERE)[0], "ok")
         (dest / "ea_desk.py").write_text("# drifted again\n")
         self.install()
-        self.assertEqual(self.generations(), sorted([second.split("/")[1], os.readlink(dest).split("/")[1]]))
+        third = os.readlink(dest)
+        # The active generation and the two before it stay, so a job still running on one can finish.
+        self.assertEqual(self.generations(), sorted(g.split("/")[1] for g in (first, second, third)))
+        (dest / "ea_desk.py").write_text("# drifted a third time\n")
+        self.install()
+        self.assertEqual(self.generations(), sorted(g.split("/")[1] for g in (second, third, os.readlink(dest))))
 
     def test_a_job_resolves_one_generation_for_its_whole_run(self):
         dest = self.install()
@@ -870,16 +889,39 @@ class RuntimeStamp(OfflineTestCase):
         self.install()
         self.assertEqual(phconf.runtime_status(HERE)[0], "ok")
 
-    def test_legacy_real_directory_is_replaced_by_a_generation(self):
+    def test_legacy_directory_is_kept_and_foreign_files_survive_upgrades(self):
         legacy = phconf.scripts_dir()
         legacy.mkdir(parents=True)
         (legacy / "phconf.py").write_text("# legacy copy\n")
-        dest = self.install()
+        (legacy / "my_notes.txt").write_text("mine\n")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            dest = self.install()
         self.assertTrue(dest.is_symlink())
         self.assertEqual(phconf.runtime_status(HERE)[0], "ok")
+        kept = [p for p in dest.parent.iterdir() if p.name.startswith(f"{phconf.PLUGIN}.legacy-")]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual({p.name: p.read_text() for p in kept[0].iterdir()},
+                         {"phconf.py": "# legacy copy\n", "my_notes.txt": "mine\n"})   # nothing deleted
+        self.assertIn(str(kept[0]), out.getvalue())
         self.assertEqual([p.name for p in dest.parent.iterdir() if p.name.startswith(".proactive-hermes.")], [])
+        (dest / "my_tool.py").write_text("# mine\n")             # added inside the active generation
+        for n in range(2):                                         # two upgrades
+            previous = os.readlink(dest)
+            (dest / "ea_desk.py").write_text(f"# drifted {n}\n")
+            with redirect_stdout(io.StringIO()) as quiet:
+                self.install()
+            self.assertEqual(quiet.getvalue(), "")                  # the legacy move is mentioned once
+            self.assertNotEqual(os.readlink(dest), previous)
+            self.assertTrue((dest.parent / previous / "phconf.py").is_file())   # the previous generation stays
+            self.assertEqual((dest / "my_notes.txt").read_text(), "mine\n")
+            self.assertEqual((dest / "my_tool.py").read_text(), "# mine\n")
+        self.assertEqual(phconf.runtime_status(HERE)[0], "ok")
+        self.assertEqual((kept[0] / "my_notes.txt").read_text(), "mine\n")
 
     def test_symlinked_destination_is_refused_and_nothing_is_written(self):
+        import argparse
+        import cli
         import jobs
         outside = self.root / "outside"
         outside.mkdir()
@@ -891,7 +933,9 @@ class RuntimeStamp(OfflineTestCase):
             "pointer elsewhere": (phconf.scripts_dir(), outside),
             "pointer to a foreign generation": (phconf.scripts_dir(), Path(phconf.GENERATIONS) / "../../outside"),
         }
-        plugin = self.plugin_module()
+        answers = self.tmp / "answers.json"
+        answers.write_text(json.dumps({"owner.name": "Changed"}))
+        before = phconf.config_path().read_text()
         for name, (link, target) in cases.items():
             with self.subTest(case=name):
                 link.parent.mkdir(parents=True, exist_ok=True)
@@ -899,20 +943,16 @@ class RuntimeStamp(OfflineTestCase):
                 try:
                     with self.assertRaisesRegex(jobs.UnsafeRuntimeDestination, "refusing to install the runtime"):
                         self.install()
-                    self.assertEqual(plugin._refresh_runtime(), "missing")   # nothing installed there to refresh
+                    ok, note = ph_doctor.check_runtime()             # doctor names the blocking symlink
+                    self.assertFalse(ok)
+                    self.assertIn("setup would refuse: refusing to install the runtime: ", note)
+                    self.assertIn(str(link), note)
+                    args = argparse.Namespace(proactive_command="setup", preset="custom", answers=str(answers),
+                                              dry_run=False)
+                    with patch.object(sys, "stderr", io.StringIO()) as err, redirect_stdout(io.StringIO()):
+                        self.assertEqual(cli.handle(args), 1)
+                    self.assertIn(str(link), err.getvalue())
+                    self.assertEqual(phconf.config_path().read_text(), before)   # refused before config.json
                     self.assertEqual(list(outside.iterdir()), [])
                 finally:
                     link.unlink()
-        # A stale install whose pointer was repointed elsewhere: plugin load refuses, writes nothing.
-        dest = self.install()
-        (dest / "ea_health.py").write_text("# old\n")
-        gen = dest.parent / os.readlink(dest)
-        shutil.copytree(gen, outside / "copy")
-        dest.unlink()
-        dest.symlink_to(outside / "copy")
-        before = sorted(p.name for p in (outside / "copy").iterdir())
-        with self.assertLogs("ph_plugin_under_test", "WARNING") as logs:
-            self.assertEqual(plugin._refresh_runtime(), "refused")
-        self.assertIn("symlink not made by setup", logs.output[0])
-        self.assertEqual(sorted(p.name for p in (outside / "copy").iterdir()), before)
-        self.assertEqual((outside / "copy" / "ea_health.py").read_text(), "# old\n")

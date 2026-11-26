@@ -17,7 +17,7 @@ except ImportError:
 class CloseTestCase(OfflineTestCase):
     def setUp(self):
         super().setUp()
-        self.configure(reminders={"enabled": True}, authority={"auto": ["reminders"]})  # ticking off needs auto
+        self.configure(reminders={"enabled": True}, authority={"auto": ["reminders", "cleanup"]})  # ticking off needs cleanup auto
         self.enterContext(patch.object(reminders, "PLUGIN", self.tmp))
         (self.tmp / "bridge.py").touch()
         self.freeze_datetime(reminders)
@@ -226,20 +226,22 @@ class TickTests(CloseTestCase):
 
 
 class AuthorityTests(CloseTestCase):
-    """Ticking off the desk's own reminder is a phone write: it needs `reminders` automatic, like creating it."""
+    """Ticking off the desk's own reminder is cleanup: it needs `cleanup` automatic (never > ask_first > auto)."""
 
     def refusals(self):
         return [r for r in self.rows(self.tmp / reminders.RUN_LOG) if "not_allowed" in r]
 
     def test_never_and_ask_block_automatic_and_explicit_closing_with_exit_5(self):
-        for level, authority in (("never", {"never": ["reminders"]}), ("ask", {"ask_first": ["reminders"]}),
-                                 ("ask", {}), ("never", {"auto": ["reminders"], "never": ["reminders"]}),
-                                 ("ask", {"auto": ["reminders"], "ask_first": ["reminders"]})):
+        for level, authority in (("never", {"auto": ["reminders"], "never": ["cleanup"]}),
+                                 ("ask", {"auto": ["reminders"], "ask_first": ["cleanup"]}),
+                                 ("ask", {"auto": ["reminders"]}),                       # unlisted = ask
+                                 ("never", {"auto": ["reminders", "cleanup"], "never": ["cleanup"]}),
+                                 ("ask", {"auto": ["reminders", "cleanup"], "ask_first": ["cleanup"]})):
             with self.subTest(authority=authority):
                 self.configure(reminders={"enabled": True}, authority=authority)
                 self.assertEqual(self.cli(reminders, "tick"), "")
                 self.assertEqual(json.loads(self.cli(reminders, "close", "--key", "promise-x", code=5)),
-                                 {"status": "not_allowed", "action": "reminders", "authority": level,
+                                 {"status": "not_allowed", "action": "cleanup", "authority": level,
                                   "key": "promise-x", "reminder_id": "R1"})
                 self.assertEqual(self.store.requests, [])
                 self.assertEqual(self.box()["promise-x"]["status"], "landed")   # left for the chat flow
@@ -248,31 +250,31 @@ class AuthorityTests(CloseTestCase):
                           ("promise-x", "never", True), ("promise-x", "ask", True)])
 
     def test_auto_closes(self):
-        self.assertEqual(phconf.allowed("reminders"), "auto")
+        self.assertEqual(phconf.allowed("cleanup"), "auto")
         self.assertEqual(json.loads(self.cli(reminders, "close", "--key", "still-open"))["status"], "closing")
 
-    def test_revoked_item_authority_stops_closing_and_ends_close_retries(self):
+    def test_cleanup_alone_decides_and_revoking_it_ends_close_retries(self):
         box = self.box()
         box["promise-x"]["required_authority"] = ["leave_time", "reminders"]
         self.write(reminders.OUTBOX, box)
-        self.configure(reminders={"enabled": True}, authority={"auto": ["reminders", "leave_time"]})
+        self.configure(reminders={"enabled": True}, authority={"auto": ["cleanup"]})   # reminders itself is ask
         self.cli(reminders, "tick")
         self.assertIn("R1", [i for i, _ in self.complete_requests()])
         self.store.results["request-1"] = {"status": "expired"}
-        self.configure(reminders={"enabled": True}, authority={"auto": ["reminders"]})
+        self.configure(reminders={"enabled": True}, authority={"auto": ["reminders", "leave_time"]})
         before = len(self.store.requests)
         for _ in range(3):
             self.cli(reminders, "tick")
         self.assertEqual(len(self.store.requests), before)
         item = self.box()["promise-x"]
-        self.assertEqual((item["status"], item["close_error"]), ("close_not_allowed", "close refused: leave_time is ask"))
+        self.assertEqual((item["status"], item["close_error"]), ("close_not_allowed", "close refused: cleanup is ask"))
         self.assertEqual(self.read_json(self.tmp / reminders.LEDGER)["promise-x"]["reminder_status"], "close_not_allowed")
-        self.assertEqual([(r["not_allowed"], r["action"]) for r in self.refusals()], [("promise-x", "leave_time")])
+        self.assertEqual([(r["not_allowed"], r["action"]) for r in self.refusals()], [("promise-x", "cleanup")])
 
-    def test_close_retry_refused_once_reminders_is_no_longer_auto(self):
+    def test_close_retry_refused_once_cleanup_is_no_longer_auto(self):
         self.cli(reminders, "tick")
         self.store.results["request-1"] = {"status": "expired"}
-        self.configure(reminders={"enabled": True}, authority={"ask_first": ["reminders"]})
+        self.configure(reminders={"enabled": True}, authority={"auto": ["reminders", "cleanup"], "never": ["cleanup"]})
         before = len(self.store.requests)
         self.cli(reminders, "tick")
         self.cli(reminders, "tick")

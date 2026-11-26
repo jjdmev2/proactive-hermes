@@ -13,13 +13,15 @@ import copy
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PLUGIN = "proactive-hermes"
 MOBILE_ACTIONS = frozenset({"reminders", "alarms", "leave_time"})
-AUTO_ACTIONS = MOBILE_ACTIONS | {"calendar_blocks", "watch_actions"}
+CLEANUP = "cleanup"   # removing the desk's own calendar blocks and alerts, ticking off its own phone reminders
+AUTO_ACTIONS = MOBILE_ACTIONS | {"calendar_blocks", "watch_actions", CLEANUP}
 # Every action name the authority lists may hold (auto takes only AUTO_ACTIONS). Setup rejects anything else.
 ACTIONS = AUTO_ACTIONS | {"send_email", "send_slack", "reply_offers", "register_events", "purchases", "bookings",
                           "payments", "share_credentials", "delete_data"}
@@ -169,6 +171,16 @@ def authority_problem(cfg: dict | None = None) -> str:
     return ""
 
 
+def authority_levels(cfg: dict | None = None) -> dict[str, list[str]] | None:
+    """The validated reader every authority lookup goes through: {"auto": [...], "ask_first": [...], "never": [...]},
+    or None when the policy is malformed (authority_problem), which every caller treats as deny all."""
+    c = CFG if cfg is None else cfg
+    if authority_problem(c):
+        return None
+    authority = c.get("authority", {})
+    return {name: list(authority.get(name, [])) for name in AUTHORITY_LISTS}
+
+
 def authority_errors(cfg: dict | None = None) -> list[str]:
     """What setup refuses to save beyond a malformed shape: an unknown action name, an action auto cannot hold, an
     action listed in more than one level. At run time an overlap still resolves by precedence (allowed())."""
@@ -203,44 +215,26 @@ def allowed(action: str, *, cfg: dict | None = None) -> str:
     """Resolve standing authority: "auto", "ask" or "never". Precedence never > ask_first > auto: an action listed
     in never is never, else one listed in ask_first is ask, else one listed in auto (and allowed to be automatic)
     is auto, else ask. A malformed authority (see authority_problem) is "never" for every action: it fails closed."""
-    c = CFG if cfg is None else cfg
-    if authority_problem(c):
+    levels = authority_levels(cfg)
+    if levels is None:
         return "never"
-    authority = c.get("authority", {})
-    if action in authority.get("never", []):
+    if action in levels["never"]:
         return "never"
-    if action in authority.get("ask_first", []):
+    if action in levels["ask_first"]:
         return "ask"
-    if action in AUTO_ACTIONS and action in authority.get("auto", []):
+    if action in AUTO_ACTIONS and action in levels["auto"]:
         return "auto"
     return "ask"
 
 
 def authorize(action: str, *, cfg: dict | None = None) -> tuple[bool, str]:
     """The execution-boundary check every write the plugin makes on its own goes through (phone reminders and
-    alarms, calendar blocks and alerts): (True, "auto") only when the action is automatic, else (False, "ask" or
-    "never") and the caller must not touch the service. Ask first is never done by a script: after the owner's yes
-    in chat, the chat agent uses Hermes's own tools (mobile reminders and alarms, calendar), with Hermes's own
-    approvals."""
+    alarms, calendar blocks and alerts, and CLEANUP of its own blocks, alerts and reminders): (True, "auto") only
+    when the action is automatic, else (False, "ask" or "never") and the caller must not touch the service. Ask
+    first is never done by a script: after the owner's yes in chat, the chat agent uses Hermes's own tools (mobile
+    reminders and alarms, calendar), with Hermes's own approvals."""
     level = allowed(action, cfg=cfg)
     return level == "auto", level
-
-
-def authorize_cleanup(action: str, *, delete: bool = False, cfg: dict | None = None) -> tuple[bool, str, str]:
-    """Cleanup of the plugin's own writes (ticking off its own phone reminder, deleting its own calendar block or
-    alert) is a write too: it needs ACTION automatic, exactly like creating it. A delete also honours delete_data:
-    listed in never or ask_first, it refuses. (ok, refused action, its level); under ask or never the caller
-    refuses (exit 5) and leaves it to the chat flow, which uses Hermes's own tools after the owner's yes."""
-    c = CFG if cfg is None else cfg
-    level = allowed(action, cfg=c)
-    if level != "auto":
-        return False, action, level
-    if delete:
-        dd = allowed("delete_data", cfg=c)
-        authority = c.get("authority", {})
-        if dd == "never" or "delete_data" in authority.get("ask_first", []):
-            return False, "delete_data", dd
-    return True, action, "auto"
 
 
 def calendar_alerts_on(*, cfg: dict | None = None) -> bool:
@@ -283,6 +277,7 @@ RUNTIME_STAMP = ".runtime-stamp.json"   # written by jobs.install_runtime next t
 CONTRACT = Path("skills") / "proactive-desk" / "references" / "desk-contract.md"
 CONTRACT_NAME = CONTRACT.name           # installed (rendered) as scripts_dir() / desk-contract.md; the jobs read it
 GENERATIONS = ".proactive-hermes-gen"   # scripts/<this>/<generation>: one complete runtime each; scripts_dir() points
+GENERATION_NAME = re.compile(r"^[0-9a-f]{12}-[0-9]+$")
 STALE = "runtime out of date: run hermes proactive setup"
 NO_CONTRACT = "desk contract missing: run hermes proactive setup"
 
@@ -326,6 +321,34 @@ def runtime_drift(dest: Path | None = None, stamp: dict | None = None) -> str:
                 return f"installed {name} changed since setup: run hermes proactive setup"
         except OSError:
             return f"installed {name} unreadable: run hermes proactive setup"
+    return ""
+
+
+def runtime_destination_problem() -> str:
+    """Why setup would refuse to install the runtime, or "": HERMES_HOME/scripts and its generations dir must be real
+    directories inside this profile's Hermes home, and scripts_dir() absent, a legacy real directory, or setup's own
+    relative link to one generation. Shared by setup (jobs.runtime_paths) and `hermes proactive doctor`."""
+    home, pointer = hermes_home(), scripts_dir()
+    root = pointer.parent
+    refuse = "refusing to install the runtime: "
+    if root != home / "scripts" or pointer.name != PLUGIN:
+        return f"refusing to install the runtime outside {home}/scripts: {pointer}"
+    for path, what in ((root, "the scripts directory"), (root / GENERATIONS, "the runtime generations directory")):
+        if path.is_symlink():
+            return f"{refuse}{what} {path} is a symlink"
+        if path.exists() and not path.is_dir():
+            return f"{refuse}{what} {path} is not a directory"
+    if pointer.is_symlink():
+        target = os.readlink(pointer)
+        head, _, name = target.partition("/")
+        if head != GENERATIONS or not GENERATION_NAME.match(name):
+            return f"{refuse}{pointer} is a symlink not made by setup (points to {target})"
+    elif pointer.exists() and not pointer.is_dir():
+        return f"{refuse}{pointer} is not a directory"
+    try:
+        root.resolve().relative_to(home.resolve())
+    except ValueError:
+        return f"{refuse}{root} is outside {home}"
     return ""
 
 

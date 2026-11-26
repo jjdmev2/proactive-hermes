@@ -22,9 +22,8 @@ refuse: this script never acts on an ask-first action. When the owner says yes i
 alarm, the chat agent sets it with Hermes's own mobile tools, which carry Hermes's own approvals. A refusal prints
 {"status": "not_allowed", ...}, is logged to run_log.jsonl, exits 5 (add and alarm) and nothing reaches the bridge.
 Retries of an expired request follow the same rule: once the action is no longer automatic the item is marked
-'not_allowed' (terminal), logged once and never polled again. Cleanup is a phone write too: ticking off the desk's
-own reminder needs `reminders` (and every authority it was queued under) automatic. Under ask or never, `close`
-answers not_allowed and exits 5, tick leaves it alone, and the chat flow ticks it off with Hermes's own tools after
+'not_allowed' (terminal), logged once and never polled again. Cleanup has its own action: ticking off the desk's
+own reminder needs `cleanup` automatic (phconf.CLEANUP). Under ask or never, `close` answers not_allowed and exits 5, tick leaves it alone, and the chat flow ticks it off with Hermes's own tools after
 the owner's yes; a close retry that is no longer allowed ends 'close_not_allowed' (terminal, logged once).
 
 Exit codes (add, alarm, close): 0 queued or another receipt, 2 bad arguments, 5 not allowed by the configured
@@ -343,13 +342,10 @@ def finished_keys() -> dict[str, str]:
 
 
 def close_block(item: dict) -> tuple[str, str] | None:
-    """Ticking a reminder off is a phone write: (action, level) of the first authority that is not automatic (the
-    item's own action, then every required_authority it was queued under), or None when it may be ticked off."""
-    for action in ("reminders", *item.get("required_authority", ())):
-        ok, refused, level = phconf.authorize_cleanup(action)
-        if not ok:
-            return refused, level
-    return None
+    """Ticking off the desk's own reminder is cleanup: (phconf.CLEANUP, level) unless `cleanup` is automatic, else
+    None (it may be ticked off)."""
+    ok, level = phconf.authorize(phconf.CLEANUP)
+    return None if ok else (phconf.CLEANUP, level)
 
 
 def close_allowed(item: dict) -> bool:

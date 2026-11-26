@@ -49,8 +49,12 @@ def plugin_root() -> Path | None:
 
 
 def check_runtime() -> tuple[bool, str]:
-    """Is the installed runtime the one this plugin ships? An upgrade without a new setup leaves old scripts."""
+    """Is the installed runtime the one this plugin ships? An upgrade without a new setup leaves old scripts (only
+    setup installs them). When setup would refuse to install here, the note names why (e.g. the symlink)."""
     state, note = phconf.runtime_status(plugin_root())
+    problem = phconf.runtime_destination_problem()
+    if problem:
+        return False, f"{note}; setup would refuse: {problem}"
     return state in ("ok", "unknown"), note
 
 
