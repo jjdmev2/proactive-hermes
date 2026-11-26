@@ -411,6 +411,51 @@ class GatewayStartTests(Base):
         self.assertFalse(svc.thread.is_alive())
         self.assertTrue(svc.stop.is_set())
 
+    def test_no_poke_starts_after_unload_even_one_already_past_its_checks(self):
+        ctx = FakeCtx()
+        entered, release, cli_calls, result = threading.Event(), threading.Event(), [], []
+
+        def job_state(jid, run=None):
+            entered.set()
+            release.wait(5)
+            return {"id": jid, "state": "active"}
+        with patch.object(mi.Service, "run_forever"), patch.object(mi, "radar_job_id", return_value="0123456789ab"), \
+                patch.object(mi, "radar_job_state", job_state), \
+                patch.object(mi, "_trigger_cli", lambda jid: cli_calls.append(jid) or True):
+            self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "started")
+            svc = mi._SERVICE
+            poker = threading.Thread(target=lambda: result.append(svc.debouncer.poke()))
+            poker.start()
+            self.assertTrue(entered.wait(5))
+            ctx.unload[0]()                # unload while the poke is between its checks and the cron run
+            release.set()
+            poker.join(5)
+        self.assertEqual(cli_calls, [])
+        self.assertEqual(result, [False])
+        self.assertTrue(svc.fence.closed)
+
+    def test_a_new_start_waits_for_the_old_loop_thread_to_retire(self):
+        ctx = FakeCtx()
+        gate = threading.Event()
+
+        def lingering(svc):
+            gate.wait(5)               # an old loop that has not noticed the stop yet
+        with patch.object(mi.Service, "run_forever", lingering), patch.object(mi, "JOIN_S", 0.05):
+            self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "started")
+            old = mi._SERVICE
+            mi.stop_service()
+            self.assertTrue(old.thread.is_alive())
+            self.assertEqual(mi._RETIRING, [old.thread])
+            self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "previous still stopping")
+            self.assertIsNone(mi._SERVICE)
+            gate.set()
+            old.thread.join(5)
+            self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "started")
+        self.assertEqual(mi._RETIRING, [])
+        self.assertIsNot(mi._SERVICE, old)
+        self.assertFalse(old.fence.is_open())          # the old generation can never poke again
+        self.assertTrue(mi._SERVICE.fence.is_open())
+
     def test_is_gateway_process_reads_argv(self):
         with patch.object(sys, "argv", ["hermes", "-p", "x", "gateway", "run", "--replace"]), \
              patch.dict(sys.modules, {"gateway.run": None}):

@@ -97,7 +97,7 @@ Show the job list in plain words (what arrives when). On their OK run the same c
 
 ## If `hermes proactive` is not found
 
-Under `plugins.isolation: host` the CLI command is not registered. Use the same commands through the plugin file: `python3 <HERMES_HOME>/plugins/proactive-hermes/cli.py questions|setup|status|remove ...` with the same flags.
+Under `plugins.isolation: host` the CLI command is not registered. Use the same commands through the plugin file, with the Python that runs Hermes: `~/.hermes/hermes-agent/venv/bin/python <HERMES_HOME>/plugins/proactive-hermes/cli.py questions|setup|status|remove ...` with the same flags. A plain `python3` cannot load Hermes's cron API, so setup refuses there and changes nothing.
 
 ## Rules
 

@@ -11,7 +11,8 @@ description: >
   tracks your promises, brings ready drafts, blocks trips and tells you when to leave, and
   sets phone reminders and alarms. It acts only within the approval levels you choose;
   sending, buying and registering wait for your yes. Set up with /proactive setup.
-requires_hermes: ">=0.23.4"
+# cron.plugin_api (ensure_named_job, delivery_platforms) first ships after v0.23.4; setup also checks it before any change.
+requires_hermes: ">=0.23.5"
 provides_tools: []
 # Optional at runtime: the work recap skips public holidays only when `holidays` imports (guarded import in
 # runtime/work_recap_gate.py). Declared so Hermes installs it with the plugin, after your consent.

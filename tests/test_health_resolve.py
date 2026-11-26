@@ -115,31 +115,69 @@ class ResolveHealthTests(unittest.TestCase):
         ])
 
     def test_local_delivery_uses_configured_profile(self):
-        with patch.object(health.subprocess, "run") as run, patch.object(health, "log"):
+        with patch.object(health.subprocess, "run") as run, patch.object(health, "log"), \
+                patch.object(health, "registry_ids", return_value={"mail_radar": "example-job"}):
             health.check_local_delivery([{"id": "example-job", "deliver": "origin"}])
         run.assert_called_once_with(["hermes", "-p", "example", "cron", "edit", "example-job",
                                      "--deliver", "local"], capture_output=True, text=True, timeout=60)
 
-    def test_only_the_say_job_keeps_its_bot_chat_delivery(self):
-        jobs = [{"id": "say-job", "name": "Proactive · say", "deliver": "bot-chat", "failure_deliver": "local"},
+    def test_say_job_heals_to_bot_chat_and_only_recorded_jobs_are_touched(self):
+        jobs = [{"id": "say-job", "name": "Proactive · say", "deliver": "local", "failure_deliver": "origin"},
                 {"id": "radar", "name": "Proactive · mail radar", "deliver": "bot-chat"},
-                {"id": "say-fail", "name": "Proactive · say", "deliver": "bot-chat", "failure_deliver": "origin"}]
-        with patch.object(health.subprocess, "run") as run, patch.object(health, "log"):
+                {"id": "foreign", "name": "Proactive · say", "deliver": "telegram", "failure_deliver": "origin"}]
+        with patch.object(health.subprocess, "run") as run, patch.object(health, "log"), \
+                patch.object(health, "registry_ids", return_value={"say": "say-job", "mail_radar": "radar"}):
             health.check_local_delivery(jobs)
         healed = [call.args[0][5:] for call in run.call_args_list]
-        self.assertEqual(healed, [["radar", "--deliver", "local"], ["say-fail", "--failure-deliver", "local"]])
+        self.assertEqual(healed, [["say-job", "--deliver", "bot-chat"], ["say-job", "--failure-deliver", "local"],
+                                  ["radar", "--deliver", "local"]])
+        self.assertEqual(list(health.faults.values()),
+                         [("desk", "the say job delivered to local, not Bot Chat; set back to Bot Chat")])
+
+    def test_a_say_job_on_bot_chat_is_left_alone(self):
+        jobs = [{"id": "say-job", "name": "Proactive · say", "deliver": "bot-chat", "failure_deliver": "local"}]
+        with patch.object(health.subprocess, "run") as run, patch.object(health, "registry_ids",
+                                                                         return_value={"say": "say-job"}):
+            health.check_local_delivery(jobs)
+        run.assert_not_called()
+        self.assertEqual(health.faults, {})
+
+    def _say_log(self):
+        import desk_say
+        health.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        log = health.STATE_DIR / "say_log.jsonl"
+        self.enterContext(patch.multiple(desk_say, SAY_LOG=log, OUTBOX=health.STATE_DIR / "say_outbox.jsonl",
+                                         STATE=health.STATE_DIR, STATUS_LOG=health.STATE_DIR / "say_status.json"))
+        self.enterContext(patch.object(desk_say, "confirm", return_value=0))
+        return log, desk_say
 
     def test_handed_message_without_a_seen_reply_is_reported_after_15_minutes(self):
-        log = health.STATE_DIR / "say_log.jsonl"
-        health.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        log, _ = self._say_log()
         self.append(log, {"id": "old", "status": "handed", "text": "x", "at": (self.clock - timedelta(minutes=16)).isoformat()})
         self.append(log, {"id": "new", "status": "handed", "text": "y", "at": (self.clock - timedelta(minutes=2)).isoformat()})
         self.append(log, {"id": "ok", "status": "handed", "text": "z", "at": (self.clock - timedelta(hours=1)).isoformat()})
         self.append(log, {"id": "ok", "status": "delivered", "at": self.clock.isoformat()})
-        import desk_say
-        with patch.object(desk_say, "confirm", return_value=0):
-            health.check_say_receipts()
+        health.check_say_receipts()
         self.assertEqual(list(health.faults.values()), [("desk", "1 desk message(s) with an unclear post, check say_log")])
+
+    def test_an_unverified_message_is_reported_for_a_day_then_clears(self):
+        log, _ = self._say_log()
+        self.append(log, {"id": "u", "status": "handed", "text": "x", "at": (self.clock - timedelta(hours=30)).isoformat()})
+        self.append(log, {"id": "u", "status": "unverified", "at": (self.clock - timedelta(hours=6)).isoformat()})
+        health.check_say_receipts()
+        self.assertEqual(len(health.faults), 1)
+        health.faults.clear()
+        with patch.object(health, "now", return_value=self.clock + timedelta(hours=19)):
+            health.check_say_receipts()
+        self.assertEqual(health.faults, {})
+
+    def test_a_say_job_that_held_messages_for_its_route_is_reported(self):
+        _, desk_say = self._say_log()
+        desk_say.STATUS_LOG.write_text(json.dumps({"at": self.clock.isoformat(),
+                                                   "route_problem": "say job delivers to local, not Bot Chat"}))
+        health.check_say_receipts()
+        self.assertEqual(list(health.faults.values()),
+                         [("desk", "desk messages held: say job delivers to local, not Bot Chat")])
 
     def test_main_runs_resolve_step_without_other_health_effects(self):
         self.run_row("a", "b", "c")

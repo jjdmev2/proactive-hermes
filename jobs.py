@@ -4,7 +4,9 @@ Each job is owned by the plugin: its id is recorded in <plugin-data>/jobs.json a
 with "Proactive ·". `apply()` installs the runtime scripts under HERMES_HOME/scripts/proactive-hermes
 (cron gate scripts must live under HERMES_HOME/scripts), renders the prompts from config.json, and
 creates, updates or removes jobs so the set always matches the enabled features. Running it twice
-changes nothing.
+changes nothing. Only jobs recorded in jobs.json are ever edited, replaced or removed; a job is never
+adopted because its name or settings match. Before any change it checks that Hermes's public cron API
+for plugins (cron.plugin_api) is there, and the say job is created first.
 """
 from __future__ import annotations
 
@@ -106,11 +108,17 @@ JOBS: list[dict] = [
      "body": "Proactive Hermes desk messages to Bot Chat (no-agent script)."},
 ]
 
-# Agent jobs read untrusted mail, Slack, calendar and web text, so each runs with only the toolsets it needs
+# Agent jobs read untrusted mail, Slack, calendar and web text, so each asks for only the toolsets it needs
 # (cron.plugin_api.ensure_named_job enabled_toolsets; `hermes cron edit` keeps them). terminal runs the desk scripts
-# and the mail and calendar commands, file writes untrusted text to files, skills reads the desk contract and the
-# connector skills. Enabled MCP servers (Slack, Linear) are added by Hermes on top of any per-job list.
+# and the mail and calendar commands, file writes untrusted text to files, skills reads the desk contract.
+# Slack and Linear are hosted connector tools: Hermes refuses every connector call unless the job has the
+# `connections` toolset, and it adds only local MCP servers on top of a per-job list, never connectors. So every
+# agent job gets `connections` when Slack, Linear or the daily call is set up: the briefs, the sweep, the recaps, the
+# promise tracker, meeting prep and the weekly review read them, and the contract's resolve step searches Slack for
+# any item. Hermes layers the operator's `agent.disabled_toolsets` on top of every per-job list; the list is a
+# narrowing request, not a sandbox (SECURITY.md, Known limits).
 BASE_TOOLSETS = ["terminal", "file", "skills"]
+CONNECTORS = "connections"
 TOOLSETS: dict[str, list[str]] = {
     "promises": BASE_TOOLSETS + ["session_search"],   # "what they told you in chat" reads past chats
     "lookahead": BASE_TOOLSETS + ["web"],             # operator timetables, organiser pages, weather; never books
@@ -118,13 +126,25 @@ TOOLSETS: dict[str, list[str]] = {
 WATCH_TOOLSETS = BASE_TOOLSETS + ["web", "browser"]  # watches check pages: shops, marketplaces, event sites
 
 
-def toolsets_for(job: dict) -> list[str] | None:
+def uses_connectors(cfg: dict | None) -> bool:
+    """Slack, Linear or the daily call (its notes live in Slack, its issues in Linear) is set up."""
+    if not cfg:
+        return False
+    return bool((cfg.get("slack") or {}).get("enabled") or (cfg.get("linear") or {}).get("enabled")
+                or (cfg.get("daily_call") or {}).get("enabled"))
+
+
+def toolsets_for(job: dict, cfg: dict | None = None) -> list[str] | None:
     """The job's enabled_toolsets; None for no-agent jobs (they run a script and no model)."""
     if job.get("no_agent"):
         return None
     if "watch" in job:
-        return list(WATCH_TOOLSETS)
-    return list(TOOLSETS.get(job["key"], BASE_TOOLSETS))
+        out = list(WATCH_TOOLSETS)
+    else:
+        out = list(TOOLSETS.get(job["key"], BASE_TOOLSETS))
+    if uses_connectors(cfg):
+        out.append(CONNECTORS)
+    return out
 
 # Appended to the evening brief when meeting prep is on and a calendar is connected (see variables()).
 TOMORROW_MEETINGS = (
@@ -522,18 +542,35 @@ def _created_job_id(output: str) -> str:
     return ids[0]
 
 
-def _list_job_ids(run) -> set[str]:
+def _job_states(run) -> dict[str, str]:
+    """{job id: state} from `hermes cron list --all` ("  <id> [active|paused|...]" header lines only)."""
     output = _cron(run, "list", "--all")
-    ids = set(re.findall(rf"^[ \t]+({_JOB_ID}) \[[^\]\n]+\]", output, re.MULTILINE))
-    if not ids and not re.search(r"^No scheduled jobs\b", output, re.MULTILINE):
+    states = dict(re.findall(rf"^[ \t]+({_JOB_ID}) \[([^\]\n]+)\]", output, re.MULTILINE))
+    if not states and not re.search(r"^No scheduled jobs\b", output, re.MULTILINE):
         raise RuntimeError("Could not read job IDs from `hermes cron list --all`.")
-    return ids
+    return states
+
+
+def _list_job_ids(run) -> set[str]:
+    return set(_job_states(run))
 
 
 def _remove(run, jid: str) -> None:
     output = _cron(run, "remove", jid)
     if not re.search(rf"^Removed job: .*\({re.escape(jid)}\)[ \t]*$", output, re.MULTILINE):
         raise RuntimeError(f"`hermes cron remove` did not confirm removal of {jid}.")
+
+
+def _pause(run, jid: str) -> None:
+    output = _cron(run, "pause", jid)
+    if not re.search(rf"^Paused job: .*\({re.escape(jid)}\)[ \t]*$", output, re.MULTILINE):
+        raise RuntimeError(f"`hermes cron pause` did not confirm pausing {jid}.")
+
+
+def _resume(run, jid: str) -> None:
+    output = _cron(run, "resume", jid)
+    if not re.search(rf"^Resumed job: .*\({re.escape(jid)}\)[ \t]*$", output, re.MULTILINE):
+        raise RuntimeError(f"`hermes cron resume` did not confirm resuming {jid}.")
 
 
 def _options(fields: dict, *, edit: bool) -> list[str]:
@@ -559,31 +596,150 @@ def _edit(run, jid: str, fields: dict) -> None:
         raise RuntimeError(f"`hermes cron edit` did not confirm updating {jid}.")
 
 
+class IncompatibleHermes(RuntimeError):
+    """This Hermes lacks the public cron API the plugin needs (cron.plugin_api). Raised before anything changes."""
+
+
+# The first Hermes release that ships cron.plugin_api (added after v0.23.4, which does not have it).
+MIN_HERMES = "0.23.5"
+NEEDED_API = ("ensure_named_job", "delivery_platforms")
+
+
+def _plugin_api():
+    """cron.plugin_api, the public cron module for plugins. A bare `python3 cli.py` finds Hermes through
+    phconf.agent_root() (derived from the active Hermes home)."""
+    root = phconf.agent_root()
+    if root.is_dir() and str(root) not in sys.path:
+        sys.path.append(str(root))
+    import cron.plugin_api as api
+    return api
+
+
+def api_problem() -> str | None:
+    """Why this Hermes cannot run setup, or None. Only imports; changes nothing."""
+    try:
+        api = _plugin_api()
+    except Exception as exc:
+        return (f"cron.plugin_api cannot be imported ({type(exc).__name__}): this Hermes is older than {MIN_HERMES}, or "
+                f"this python cannot find Hermes. Proactive Hermes needs Hermes {MIN_HERMES} or newer: run `hermes update`, "
+                f"then `hermes proactive setup` again (or the plugin's cli.py with the Python that runs Hermes). "
+                f"Nothing was changed.")
+    missing = [name for name in NEEDED_API if not callable(getattr(api, name, None))]
+    if missing:
+        return (f"this Hermes's cron.plugin_api has no {', '.join(missing)}. Proactive Hermes needs Hermes "
+                f"{MIN_HERMES} or newer: run `hermes update`, then `hermes proactive setup` again. Nothing was changed.")
+    return None
+
+
+def preflight() -> None:
+    """Refuse before any change when the public cron API is missing (setup and watch call it first)."""
+    problem = api_problem()
+    if problem:
+        raise IncompatibleHermes(problem)
+
+
 def _plugin_ensure(name: str, **kwargs) -> dict:
-    from cron.plugin_api import ensure_named_job   # public cron API for plugins; create only
-    return ensure_named_job(name, **kwargs)
+    return _plugin_api().ensure_named_job(name, **kwargs)   # public cron API for plugins; create only
 
 
-def _create(run, ensure, fields: dict) -> str:
-    """Create one job. A job with toolsets is created through cron.plugin_api.ensure_named_job (the only public way
-    to set enabled_toolsets), then `hermes cron edit` sets everything else; the edit keeps the toolsets."""
+def _dormant_schedule() -> str:
+    """Yesterday at 03:00, once a year: in any time zone its next run is about a year away. An agent job is created
+    under it, then `hermes cron edit` gives it the real schedule (after a pause when the job it replaces was paused),
+    so a new job never runs before it has its final settings and state."""
+    day = time.localtime(time.time() - 86400)
+    return f"0 3 {day.tm_mday} {day.tm_mon} *"
+
+
+
+def _create(run, ensure, fields: dict, *, paused: bool = False) -> str:
+    """Create one NEW job and return its id. Never adopts an existing job: a job with toolsets is created through
+    cron.plugin_api.ensure_named_job (the only public way to set enabled_toolsets) under a unique name nobody else
+    has, and must come back with that name and the asked toolsets; then `hermes cron edit` sets the real name and
+    everything else (the edit keeps the toolsets). PAUSED pauses it before it gets its real schedule."""
     toolsets = fields.get("enabled_toolsets")
-    if toolsets is None:
-        output = _cron(run, "create", *_options(fields, edit=False), "--", fields["schedule"], fields["prompt"])
-        return _created_job_id(output)
-    job = (ensure or _plugin_ensure)(fields["name"], prompt=fields["prompt"], schedule=fields["schedule"],
+    if toolsets is None:   # a no-agent job: `hermes cron create` makes a new job with its final settings at once
+        jid = _created_job_id(_cron(run, "create", *_options(fields, edit=False), "--", fields["schedule"],
+                                    fields["prompt"]))
+        if paused:
+            try:
+                _pause(run, jid)
+            except Exception:
+                _remove_quietly(run, jid)
+                raise
+        return jid
+    unique = f"{fields['name']} (setup {os.urandom(6).hex()})"
+    job = (ensure or _plugin_ensure)(unique, prompt=fields["prompt"], schedule=_dormant_schedule(),
                                      deliver=fields["deliver"], enabled_toolsets=list(toolsets),
                                      home=str(phconf.hermes_home()))
     jid = job.get("id") if isinstance(job, dict) else None
     if not isinstance(jid, str) or not re.fullmatch(_JOB_ID, jid):
         raise RuntimeError(f"cron.plugin_api.ensure_named_job returned no job ID for {fields['name']!r}.")
-    if list(job.get("enabled_toolsets") or []) != list(toolsets):
-        # ensure_named_job returns an existing job of the same name unchanged; never adopt or remove one setup
-        # did not record.
-        raise RuntimeError(f"A job named {fields['name']!r} already exists ({jid}) and is not recorded by setup. "
-                           f"Remove it with `hermes cron remove {jid}`, then run `hermes proactive setup` again.")
-    _edit(run, jid, fields)
+    if job.get("name") != unique or list(job.get("enabled_toolsets") or []) != list(toolsets):
+        raise RuntimeError(f"cron.plugin_api.ensure_named_job returned job {jid}, which setup did not create; "
+                           "nothing of it was changed.")
+    try:
+        if paused:
+            _pause(run, jid)
+        _edit(run, jid, fields)
+    except Exception:
+        _remove_quietly(run, jid)   # our own half-made job, never anything else
+        raise
     return jid
+
+
+def _remove_quietly(run, jid: str) -> None:
+    try:
+        _remove(run, jid)
+    except Exception as exc:
+        logger.warning("proactive-hermes: could not remove half-made job %s (%s)", jid, exc)
+
+
+def _output_dir(jid: str) -> Path:
+    return phconf.hermes_home() / "cron" / "output" / jid
+
+
+def _carry_output(old: str, new: str) -> int:
+    """Copy the old job's saved run outputs to the new job (`hermes cron remove` deletes a job's output folder).
+    Never overwrites; returns how many files were copied."""
+    src, dst = _output_dir(old), _output_dir(new)
+    if not src.is_dir() or src.is_symlink():
+        return 0
+    copied = 0
+    for path in sorted(src.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        target = dst / path.relative_to(src)
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.copy2(path, target)
+        copied += 1
+    return copied
+
+
+def _replace(run, ensure, old: str, state: str, fields: dict) -> str:
+    """Swap the recorded job OLD for a new one (`hermes cron edit` cannot change toolsets). The new job is made
+    first; a paused or disabled OLD gives a paused new job; OLD's run outputs are copied over; only then is OLD
+    removed. OLD is paused during the swap so the two never both run; any failure before the removal leaves OLD as
+    it was and removes only the half-made new job."""
+    was_active = state == "active"
+    if was_active:
+        _pause(run, old)
+    try:
+        new = _create(run, ensure, fields, paused=not was_active)
+        try:
+            _carry_output(old, new)
+        except Exception:
+            _remove_quietly(run, new)
+            raise
+    except Exception:
+        if was_active:
+            try:
+                _resume(run, old)
+            except Exception as exc:
+                logger.warning("proactive-hermes: could not resume %s after a failed replace (%s)", old, exc)
+        raise
+    return new
 
 
 def _job_id(entry) -> str | None:
@@ -592,13 +748,19 @@ def _job_id(entry) -> str | None:
 
 
 def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None) -> list[dict]:
+    """Make the plugin's jobs match CFG. Only jobs recorded in the plugin's own registry (<plugin-data>/jobs.json)
+    are ever edited, replaced or removed; a job is never adopted because its name or settings match."""
+    if not dry_run:
+        preflight()   # before any change: no runtime, no job, no registry write on a Hermes without cron.plugin_api
     reg = _load_registry()
-    live = _list_job_ids(run) if reg else set()
+    states = _job_states(run) if reg else {}
+    live = set(states)
     out = []
     if not dry_run:
         install_runtime(cfg)
+    # The say job first: every desk message reaches Bot Chat through it, so it exists before anything can speak.
     desired = JOBS + [watch_job(watch) for watch in cfg.get("watches", [])]
-    for job in desired:
+    for job in sorted(desired, key=lambda j: j["key"] != "say"):
         key = job["key"]
         entry = reg.get(key)
         jid = _job_id(entry)
@@ -617,7 +779,7 @@ def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None) 
         }
         if job.get("skills"):  # only jobs with skills carry the key, so other jobs' specs stay unchanged
             fields["skills"] = job["skills"]
-        toolsets = toolsets_for(job)
+        toolsets = toolsets_for(job, cfg)
         if toolsets is not None:  # agent jobs only, so the no-agent jobs' specs stay unchanged
             fields["enabled_toolsets"] = toolsets
         # The CLI list omits settings like prompt and catch-up. Cache the last
@@ -640,14 +802,18 @@ def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None) 
                     reg[key] = {"id": jid, "spec": spec, **record}
                     _save_registry(reg)
             else:
-                # `hermes cron edit` cannot change toolsets: replace the job (new id, same name and settings).
+                # `hermes cron edit` cannot change toolsets: a new job replaces the recorded one (new id, same
+                # name, settings, pause state and run history), made before the old one is removed.
                 action = "replace"
                 if not dry_run:
-                    _remove(run, jid)
-                    del reg[key]
+                    new = _replace(run, ensure, jid, states[jid], fields)
+                    reg[key] = {"id": new, "spec": spec, **record}
                     _save_registry(reg)
-                    reg[key] = {"id": _create(run, ensure, fields), "spec": spec, **record}
-                    _save_registry(reg)
+                    try:
+                        _remove(run, jid)
+                    except Exception as exc:
+                        raise RuntimeError(f"Replaced {fields['name']!r} with job {new}, but the old job {jid} "
+                                           f"(paused) was not removed: run `hermes cron remove {jid}`. ({exc})") from exc
         else:
             action = "remove" if jid in live else "skip"
             if not dry_run and key in reg:
@@ -656,6 +822,8 @@ def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None) 
                 del reg[key]
                 _save_registry(reg)
         out.append({"job": fields["name"], "action": action, "schedule": fields["schedule"], "timezone": tz})
+    order = {PREFIX + job["name"]: i for i, job in enumerate(desired)}
+    out.sort(key=lambda row: order.get(row["job"], len(order)))   # report in template order
     active_watches = {job["key"] for job in desired if "watch" in job}
     for key in list(reg):
         if not key.startswith("watch:") or key in active_watches:

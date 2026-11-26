@@ -682,6 +682,7 @@ class JobTests(unittest.TestCase):
         self.home = Path(home)
         self.run = FakeCron()
         self.enterContext(patch.object(jobs, "_plugin_ensure", self.run.ensure))
+        self.enterContext(patch.object(jobs, "api_problem", return_value=None))
         self.cfg = cli.base_config("custom")
         self.cfg["owner"]["name"] = "Alex"
         self.cfg["timezone"] = "Europe/Berlin"

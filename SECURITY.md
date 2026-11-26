@@ -22,10 +22,15 @@ The approval file is always your profile's own `plugin-data/proactive-hermes/con
 
 ## Known limits
 
-- Scheduled jobs that read mail and web pages run as normal Hermes agent turns, each limited to the toolsets it needs: terminal, file and skills for every job, past chats for the promise tracker, web search for the look-ahead, and web plus the browser only for watches. Your enabled MCP connectors (Slack, Linear) are added by Hermes on top.
+- Scheduled jobs that read mail and web pages run as normal Hermes agent turns. Each asks for only the toolsets it needs: terminal, file and skills for every job, past chats for the promise tracker, web search for the look-ahead, web plus the browser only for watches, and `connections` (the Slack and Linear connectors) for every agent job when Slack, Linear or the daily call is set up.
+- These lists are a narrowing request, not a sandbox. Hermes applies your `agent.disabled_toolsets` on top of them, so a job never gets a toolset you disabled there. A job's own list does replace `platform_toolsets.cron` for that job, and Hermes has no public way for a plugin to read that setting, so setup does not narrow by it.
 - The terminal is still a terminal. The plugin enforces approvals inside its own scripts and tells every job to treat source text as data, but it does not sandbox what the agent could run there.
 - To restrict further, use Hermes's own toolset and approval settings. Run `hermes proactive setup` again after a plugin update so older jobs get their toolsets.
-- Desk messages reach Bot Chat as a scheduled turn your Bot answers. The Bot is told to repeat the message word for word; a message whose exact reply does not appear within 15 minutes is reported by the health check, never sent twice.
+- Desk messages reach Bot Chat as a scheduled turn your Bot answers. That turn is a normal Bot Chat turn with that Bot's tools. The desk keeps each message short, puts it between start and end markers, names the turn a relay your Bot must not review, act on or summarize, and asks for the text word for word. Hermes does not yet offer a tool-free or display-only delivery.
+- A message is never sent twice. The hourly health check notes a message whose reply has not appeared 15 minutes after it was handed over, and tells you in Bot Chat when that is still open 2 hours later. After 24 hours without a matching reply the message is marked unverified once and no longer looked for; the note clears a day later.
+- If the say job is changed to deliver anywhere but Bot Chat, it takes no message (they wait in the outbox). The health check sets it back to Bot Chat, never to local, and reports it.
+- Setup changes or removes only jobs it recorded in its own registry. When an update gives a job new toolsets, the new job is made before the old one is removed, a paused job stays paused, and the old job's saved runs are copied to the new one.
+- Hermes cannot archive sessions by job, so the tick archives finished scheduled runs by title (`Proactive ·`). A scheduled job of yours with such a name would be archived too. Archive only, never deleted.
 
 ## Untrusted text
 

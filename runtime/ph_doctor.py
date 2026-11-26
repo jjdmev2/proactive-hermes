@@ -10,7 +10,7 @@
 Every desk message is delivered as a real Bot reply in this profile's Bot Chat (Hermes Bot Mode): the plugin's
 no-agent job "Proactive · say" hands it over with Hermes's public cron Bot Chat delivery (`--deliver bot-chat`),
 which needs this profile's running gateway. Only public Hermes surfaces are used: `hermes gateway status`,
-`hermes cron list` and the read-only persistence reader.
+`hermes cron list`, cron.plugin_api.delivery_platforms and the read-only persistence reader.
 """
 from __future__ import annotations
 
@@ -34,7 +34,8 @@ FIX = {
     "bot_chat": "Turn on Bot Mode: in the Hermes desktop app open the Bots tab (on by default) and click this "
                 "profile's Bot once. Its Bot Chat is where every desk message lands. It is also created on the first delivery.",
     "say_job": "Run `hermes proactive setup`: it installs the \"Proactive · say\" job that hands desk messages to Bot Chat. "
-               "If it is paused, resume it with `hermes cron resume <id>`.",
+               "If it is paused, resume it with `hermes cron resume <id>`. If it delivers anywhere but Bot Chat, set it "
+               "back with `hermes cron edit <id> --deliver bot-chat` (the health check also does this).",
     "mobile": "Install the Hermes mobile app, sign in to the same Hermes, open this Bot's chat once, and share "
               "Reminders, Alarms, Location and Calendar in the app settings. Notifications for desk messages come from the app.",
     "decisions": "Set PROACTIVE_OPENAI_API_KEY: Settings -> Plugins -> Proactive Hermes -> OpenAI key for the decision "
@@ -80,16 +81,31 @@ def _hermes(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
                           env={**os.environ, "HERMES_HOME": str(phconf.hermes_home()), "NO_COLOR": "1"})
 
 
+_RUNNING = re.compile(r"\bgateway (?:service |process )?is running\b", re.IGNORECASE)
+
+
+def gateway_running(output: str) -> tuple[bool, str]:
+    """Read the whole `hermes gateway status` output: a manual run prints "Gateway is running (PID ...)", a
+    multiplexed profile "Gateway is running via the default-profile multiplexer", a systemd or launchd service
+    prints its status block first and then "User gateway service is running"."""
+    lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+    hit = next((line for line in lines if _RUNNING.search(line)), None)
+    if hit:
+        return True, "running"
+    return False, (next((line for line in lines if "not running" in line.lower()), None)
+                   or (lines[0] if lines else "gateway status unreadable"))[:160]
+
+
 def check_gateway(home: Path) -> tuple[bool, str]:
-    """`hermes gateway status` (public CLI): its first line says whether this profile's gateway runs."""
+    """`hermes gateway status` (public CLI), every line of it."""
     try:
         proc = _hermes("gateway", "status")
     except Exception as exc:
         return False, f"{type(exc).__name__}"[:80]
-    first = next((line.strip() for line in (proc.stdout or "").splitlines() if line.strip()), "")
-    if "Gateway is running" in first:
-        return True, "running"
-    return False, (first or (proc.stderr or "").strip() or "gateway status unreadable")[:160]
+    ok, note = gateway_running(proc.stdout or "")
+    if not ok and not (proc.stdout or "").strip():
+        note = ((proc.stderr or "").strip() or note)[:160]
+    return ok, note
 
 
 def check_bot_chat(home: Path) -> tuple[bool, str]:
@@ -107,7 +123,8 @@ def check_bot_chat(home: Path) -> tuple[bool, str]:
 
 
 def check_say_job() -> tuple[bool, str]:
-    """The say job is recorded by setup and listed by `hermes cron list --all` as active."""
+    """The say job is recorded by setup, listed by `hermes cron list --all` as active, and delivers to Bot Chat
+    and nowhere else (cron.plugin_api.delivery_platforms; the job takes nothing otherwise)."""
     import desk_say
     jid = desk_say.say_job_id()
     if not jid:
@@ -119,7 +136,10 @@ def check_say_job() -> tuple[bool, str]:
     m = re.search(rf"^[ \t]+{re.escape(jid)} \[([^\]\n]+)\]", out, re.MULTILINE)
     if not m:
         return False, f"job {jid} not found"
-    return (True, jid) if m.group(1) == "active" else (False, f"job {jid} is {m.group(1)}")
+    if m.group(1) != "active":
+        return False, f"job {jid} is {m.group(1)}"
+    problem = desk_say.route_problem(jid)
+    return (False, f"job {jid}: {problem}") if problem else (True, jid)
 
 
 def check_mobile(home: Path) -> tuple[bool, str]:
@@ -192,7 +212,8 @@ def send_test_message(wait_s: float = 60) -> dict:
         return row
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        if desk_say.confirm() and res.get("id") in desk_say.delivered_ids():
+        desk_say.confirm()   # the say job's own run may have confirmed it already: check the id either way
+        if res.get("id") in desk_say.delivered_ids():
             row["status"] = "delivered"
             return row
         time.sleep(3)

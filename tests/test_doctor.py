@@ -74,6 +74,43 @@ class DoctorTests(unittest.TestCase):
         self.assertNotIn("bot_live_delivery", source)
         self.assertIn("open_persistence_reader", source)
 
+    def test_gateway_check_reads_every_form_of_the_status_output(self):
+        systemd = ("\u25cf hermes-gateway.service - Hermes Agent Gateway\n"
+                   "     Loaded: loaded (/home/u/.config/systemd/user/hermes-gateway.service; enabled)\n"
+                   "     Active: active (running) since Thu 2026-11-26 10:00:00 -03; 2h ago\n\n"
+                   "\u2713 User gateway service is running\n")
+        launchd = "PID\tStatus\tLabel\n123\t0\tai.hermes.gateway\n\n\u2713 User gateway service is running\n"
+        multiplexed = ("\u2713 Gateway is running via the default-profile multiplexer\n"
+                       "  Manage it from the default profile: hermes gateway status\n")
+        manual = "\u2713 Gateway is running (PID: 4242)\n"
+        for name, out in (("systemd", systemd), ("launchd", launchd), ("multiplexed", multiplexed), ("manual", manual)):
+            with self.subTest(form=name):
+                self.assertEqual(ph_doctor.gateway_running(out), (True, "running"))
+        down = "\u25cf hermes-gateway.service - Hermes Agent Gateway\n     Active: inactive (dead)\n\u2717 Gateway is not running\n"
+        self.assertEqual(ph_doctor.gateway_running(down), (False, "\u2717 Gateway is not running"))
+        self.assertFalse(ph_doctor.gateway_running("")[0])
+
+    def test_send_test_counts_a_reply_another_worker_already_confirmed(self):
+        # The say job's own `next` run confirmed it first: confirm() finds nothing new, the id is delivered anyway.
+        fake = mock.Mock(deliver=mock.Mock(return_value={"status": "handed", "id": "abc"}),
+                         confirm=mock.Mock(return_value=0), delivered_ids=mock.Mock(return_value={"abc"}))
+        with mock.patch.dict(sys.modules, {"desk_say": fake}), mock.patch.object(ph_doctor.time, "sleep"):
+            self.assertEqual(ph_doctor.send_test_message(wait_s=5), {"status": "delivered", "id": "abc"})
+
+    def test_say_job_check_needs_bot_chat_as_its_only_target(self):
+        listing = mock.Mock(stdout="  0123456789ab [active]\n    Name:      Proactive \u00b7 say\n", stderr="")
+        fake = mock.Mock(say_job_id=mock.Mock(return_value="0123456789ab"),
+                         route_problem=mock.Mock(return_value=None))
+        with mock.patch.dict(sys.modules, {"desk_say": fake}), \
+                mock.patch.object(ph_doctor.subprocess, "run", return_value=listing):
+            self.assertEqual(ph_doctor.check_say_job(), (True, "0123456789ab"))
+            fake.route_problem.return_value = "say job delivers to local, not Bot Chat"
+            ok, note = ph_doctor.check_say_job()
+        self.assertFalse(ok)
+        self.assertIn("not Bot Chat", note)
+        fake.route_problem.assert_called_with("0123456789ab")
+        self.assertIn("--deliver bot-chat", ph_doctor.FIX["say_job"])
+
     def test_decisions_reports_what_scheduled_runs_see(self):
         import ea_decide
         with mock.patch.object(ph_doctor, "check_gateway", return_value=(True, "running")), \

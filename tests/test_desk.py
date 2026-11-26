@@ -149,7 +149,12 @@ class DeskTests(OfflineTestCase):
         super().setUp()
         self.patch_paths(desk, "SAID", "DIGEST", "HELD", "PING_LOG", "RUN_LOG", "LEDGER", "PENDING", "RESOLVE_WAIT")
         self.enterContext(patch.object(desk, "now", lambda: self.clock))
-        self.deliver = self.enterContext(patch.object(desk_say, "deliver", return_value={"status": "queued"}))
+        # compose queues with desk_say.enqueue (then records SAID) and kicks the say job after its lock.
+        self.deliver = self.enterContext(patch.object(desk_say, "enqueue", return_value={"status": "queued", "id": "m1"}))
+        self.kick = self.enterContext(patch.object(desk_say, "kick", return_value={"kick": "ok"}))
+        # "Reply N" binds to messages the owner received: here every logged message counts as delivered.
+        self.enterContext(patch.object(resolve, "_say_statuses", lambda: {
+            resolve._message_id(r): "delivered" for r in self.rows(desk.PING_LOG)}))
 
     @staticmethod
     def item(key, kind="action", **fields):
@@ -556,6 +561,23 @@ class ResolveGateTests(DeskTests):
         self.put("plain")
         self.assertEqual(self.cli(desk, "compose", "--job", "test", stdin=json.dumps([self.item("plain", act="send")])), SILENT)
         self.deliver.assert_called_once_with("Work on plain", key="test:plain", job="test", urgent=False)
+
+    def test_a_failed_enqueue_is_retried_not_marked_said(self):
+        self.enterContext(patch.object(desk_say, "quiet_now", return_value=False))
+        items = [self.item("bill", "action")]
+        self.deliver.side_effect = OSError("disk full")
+        self.assertEqual(self.cli(desk, "compose", "--job", "test", stdin=json.dumps(items), code=1), SILENT)
+        self.assertFalse(desk.SAID.exists() and "bill" in self.read_json(desk.SAID))
+        self.assertEqual(self.rows(desk.PING_LOG), [])
+        self.assertEqual([r["key"] for r in self.rows(desk.DIGEST)], ["bill"])   # rolled over for the next run
+        self.assertIn("enqueue failed", self.rows(desk.RUN_LOG)[-1]["error"])
+        self.kick.assert_not_called()
+        self.deliver.side_effect = None
+        self.assertEqual(self.cli(desk, "compose", "--job", "test", stdin=json.dumps(items)), SILENT)
+        self.assertEqual(self.deliver.call_count, 2)
+        self.assertIn("bill", self.read_json(desk.SAID))
+        self.assertEqual(self.rows(desk.PING_LOG)[-1]["say_id"], "m1")
+        self.kick.assert_called_once()
 
     def test_cli_uses_the_profile_state_without_patch(self):
         item = self.item("cli", act="send", urgent=True)

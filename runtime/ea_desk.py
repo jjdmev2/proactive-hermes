@@ -415,19 +415,31 @@ def compose(a, items: list[dict], *, flush=False) -> int:
                     print("[SILENT]")
                 return 0
         prepared = prepare_compose(a, items, t, wait, expired_wait, overflow_allowed)
-    if prepared is None:
-        print("[SILENT]")
-        return 0
-
-    ping, urgent = prepared
-    message = ping["text"]
-    receipt = {"status": "printed"}
-    if not print_only:
-        # The desk posts in Bot Chat as a Bot reply (the say job). The cron run stays private.
-        sys.path.insert(0, str(HERE))
-        import desk_say
-        receipt = desk_say.deliver(message, key=f"{a.job}:{','.join(ping['keys'])}", job=a.job, urgent=urgent)
-    append(PING_LOG, {**ping, "delivery": receipt.get("status"), "row_id": receipt.get("row_id")})
+        if prepared is None:
+            print("[SILENT]")
+            return 0
+        ping, urgent, said, speak = prepared
+        message = ping["text"]
+        receipt = {"status": "printed"}
+        if not print_only:
+            # The desk posts in Bot Chat as a Bot reply (the say job). Queue first, still under the compose lock:
+            # only a queued message is recorded as said. A failed enqueue rolls the items over for the next tick.
+            sys.path.insert(0, str(HERE))
+            import desk_say
+            try:
+                receipt = desk_say.enqueue(message, key=f"{a.job}:{','.join(ping['keys'])}", job=a.job, urgent=urgent)
+            except Exception as exc:
+                for it in speak:
+                    append(DIGEST, {"at": ping["at"], "job": a.job, **it, "overflow": True,
+                                    "first_seen": it.get("first_seen") or it.get("at") or ping["at"]})
+                append(RUN_LOG, {"at": ping["at"], "job": a.job, "error": f"enqueue failed: {type(exc).__name__}"[:200],
+                                 "rolled_over": ping["keys"]})
+                print("[SILENT]")
+                return 1
+        save_json(SAID, said)
+        append(PING_LOG, {**ping, "delivery": receipt.get("status"), "say_id": receipt.get("id")})
+    if not print_only and receipt.get("status") == "queued" and (urgent or not desk_say.quiet_now()):
+        desk_say.kick()   # after the compose lock: the say job runs now; its schedule is the safety net
     print(message if print_only else "[SILENT]")
     return 0
 
@@ -651,11 +663,11 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
     for it in speak:
         said[it["key"]] = {"fp": fp(it), "said_at": said_at,
                            "kind": it["kind"], "text": it["text"], "job": a.job}
-    save_json(SAID, said)
     drafts = {key: rec["status"] for key, rec in zip(keys_said, draft_rows) if rec is not None}
     ping = {"at": at, "kind": "desk_message", "job": a.job, "keys": keys_said,
             "refs": [i.get("ref") for i in speak], "text": message, "drafts": drafts}
-    return ping, any(i.get("urgent") for i in speak)
+    # SAID is saved by compose() only after the message is queued, so a failed enqueue is retried, never silenced.
+    return ping, any(i.get("urgent") for i in speak), said, speak
 
 
 def cmd_flush(a) -> int:

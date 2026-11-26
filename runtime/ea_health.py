@@ -82,19 +82,27 @@ SAY_JOB = ph_jobs.job_name("say")
 
 
 def check_local_delivery(jobs: list[dict]) -> None:
-    """Keep cron responses in the local lane; desk messages go out only through the say job, whose output (one
-    desk message) is the one thing delivered to Bot Chat."""
+    """Keep the plugin's own cron responses in the local lane; desk messages go out only through the say job, whose
+    output (one desk message) is the one thing delivered to Bot Chat. Only jobs the installer recorded are healed
+    (never another job because of its name). The say job is healed back to Bot Chat, never to local, and that
+    raises a fault: while it pointed elsewhere it took nothing (desk_say fails closed)."""
+    recorded = registry_ids()
+    say_id = recorded.get("say")
+    own = set(recorded.values())
     for job in jobs:
-        say = job.get("name") == SAY_JOB
+        if job.get("id") not in own:
+            continue
+        say = job.get("id") == say_id
         for field, flag in (("deliver", "--deliver"), ("failure_deliver", "--failure-deliver")):
             value = str(job.get(field) or "").strip()
-            if value == "local" or (not value and field == "failure_deliver"):
+            want = "bot-chat" if say and field == "deliver" else "local"
+            if value == want or (not value and field == "failure_deliver"):
                 continue
-            if say and field == "deliver" and value == "bot-chat":
-                continue
-            proc = subprocess.run(["hermes", "-p", phconf.profile_name(), "cron", "edit", job["id"], flag, "local"],
+            proc = subprocess.run(["hermes", "-p", phconf.profile_name(), "cron", "edit", job["id"], flag, want],
                                   capture_output=True, text=True, timeout=60)
-            log({"healed": f"{field}_to_local", "job_id": job["id"], "ok": proc.returncode == 0})
+            log({"healed": f"{field}_to_{want.replace('-', '_')}", "job_id": job["id"], "ok": proc.returncode == 0})
+            if say and field == "deliver":
+                fault("desk", f"the say job delivered to {value or 'nothing'}, not Bot Chat; set back to Bot Chat")
 
 
 def check_say_outbox() -> None:
@@ -106,37 +114,34 @@ def check_say_outbox() -> None:
         return
     stale = [r for r in rows if (t := parse_ts(r.get("queued_at"))) and now() - t > timedelta(hours=1)]
     if stale:
-        fault("desk", f"{len(stale)} desk message(s) not posted for over an hour")
+        fault("desk", f"{len({r.get('id') for r in stale})} desk message(s) not posted for over an hour")
+
+
+HANDED_FAULT_AFTER = timedelta(minutes=15)
+UNVERIFIED_FAULT_FOR = timedelta(hours=24)
 
 
 def check_say_receipts() -> None:
     """desk_say fails closed: a message handed to the say job is never printed again. Surface the ones whose Bot
-    reply was not seen in Bot Chat, so a message for the owner cannot vanish quietly (last status 'unverified',
-    or 'handed' or 'posting' for over 15 min)."""
-    path = STATE_DIR / "say_log.jsonl"
-    last: dict[str, dict] = {}
-    try:
-        for line in path.read_text().splitlines():
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(row.get("id"), str):
-                last[row["id"]] = row
-    except FileNotFoundError:
-        return
+    reply was not seen in Bot Chat, so a message for the owner cannot vanish quietly: 'handed' for over 15 min, or
+    marked 'unverified' (no matching reply within 24 h; desk_say then stops looking) in the last 24 h. Also the
+    say job's last route check, when it found the job not delivering to Bot Chat."""
     try:
         sys.path.insert(0, str(HERE))
         import desk_say
-        if any(r.get("status") == "handed" for r in last.values()) and desk_say.confirm():
-            return check_say_receipts()   # some were confirmed just now: read the log again
+        desk_say.confirm()   # also marks handed rows older than 24 h unverified, once
+        last = desk_say._last_status()
+        route = desk_say.route_status()
     except Exception:
-        pass
-    stuck = [r for r in last.values() if r.get("status") == "unverified"
-             or (r.get("status") in ("posting", "handed") and (t := parse_ts(r.get("at")))
-                 and now() - t > timedelta(minutes=15))]
+        return
+    t = now()
+    stuck = [r for r in last.values()
+             if (r.get("status") in ("posting", "handed") and (s := parse_ts(r.get("at"))) and t - s > HANDED_FAULT_AFTER)
+             or (r.get("status") == "unverified" and (s := parse_ts(r.get("at"))) and t - s <= UNVERIFIED_FAULT_FOR)]
     if stuck:
         fault("desk", f"{len(stuck)} desk message(s) with an unclear post, check say_log")
+    if route.get("route_problem") and (s := parse_ts(route.get("at"))) and t - s <= timedelta(hours=1):
+        fault("desk", f"desk messages held: {route['route_problem']}")
 
 
 def _resolve_rows(path: Path) -> Iterator[dict]:
@@ -428,7 +433,7 @@ def main() -> int:
         fault("desk", "cron jobs.json unreadable")
         jobs = []
     desk_jobs = [job for job in jobs if (job.get("name") or "").startswith(DESK_PREFIXES)]
-    steps = [lambda: check_local_delivery(desk_jobs), lambda: check_jobs(jobs),
+    steps = [lambda: check_local_delivery(jobs), lambda: check_jobs(jobs),
              lambda: check_contract(desk_jobs), check_say_outbox, check_say_receipts]
     if phconf.CFG["features"]["mail_radar"] and phconf.CFG["mail"]["himalaya_accounts"]:
         steps.append(check_cursor)
@@ -450,7 +455,7 @@ def main() -> int:
         import desk_say
         text = (f"{phconf.owner()}, the desk has a fault and may miss things until it's fixed: "
                 + "; ".join(lines[:2]))
-        # No push: internal faults don't require the owner's intervention.
+        # A desk fault goes to Bot Chat like any desk message (not urgent: it waits for the end of quiet hours).
         desk_say.deliver(text, key="health:" + "|".join(sorted(lines))[:200], job="health")
     return 0
 

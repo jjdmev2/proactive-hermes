@@ -6,7 +6,9 @@ Every test runs with DESK_SAY_DISABLE_DOOR=1 and run_say_job mocked: no test can
 import io
 import json
 import os
+import subprocess
 import sys
+import time
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
@@ -41,8 +43,10 @@ class DeskSayTests(unittest.TestCase):
             "owner": {"name": "Alex"}, "timezone": "Asia/Tokyo", "quiet_hours": {"start": 13, "end": 15},
         }))
         self.enterContext(patch.object(phconf, "CFG", phconf.load()))
-        self.enterContext(patch.multiple(say, STATE=tmp, OUTBOX=tmp / "say_outbox.jsonl", SAY_LOG=tmp / "say_log.jsonl"))
+        self.enterContext(patch.multiple(say, STATE=tmp, OUTBOX=tmp / "say_outbox.jsonl", SAY_LOG=tmp / "say_log.jsonl",
+                                         STATUS_LOG=tmp / "say_status.json"))
         self.job = self.enterContext(patch.object(say, "say_job_id", return_value=JID))
+        self.route = self.enterContext(patch.object(say, "say_route", return_value=("bot-chat",)))
         self.printed: list[str] = []
         # The say job as cron runs it: `desk_say.py next`, whose stdout cron hands to Bot Chat.
         self.runs = self.enterContext(patch.object(say, "run_say_job", side_effect=self._run_job))
@@ -57,7 +61,20 @@ class DeskSayTests(unittest.TestCase):
         return True
 
     def texts(self):
-        return [p.split("\n\n", 1)[1].removesuffix("\n") for p in self.printed]
+        """The messages between the start and end markers of each printed relay."""
+        out = []
+        for p in self.printed:
+            head, rest = p.split("\n" + say.START + "\n", 1)
+            self.assertTrue(head.startswith(say.RELAY_TAG))
+            self.assertTrue(rest.endswith("\n" + say.END + "\n"), rest)
+            out.append(rest.removesuffix("\n" + say.END + "\n"))
+        return out
+
+    @staticmethod
+    def relay(mid, text):
+        """The Bot Chat input turn for one say job run: Hermes's cron header, then the job's output."""
+        return ("user", '[Cronjob "Proactive · say" output — scheduled job, not the user. Review it, act on anything '
+                        'that needs action, and summarize for the chat.]\n\n' + say.job_output(text, mid))
 
     @staticmethod
     def rows(path):
@@ -77,19 +94,25 @@ class DeskSayTests(unittest.TestCase):
         receipt = say.deliver("Desk update", key="k", job="test")
         self.assertEqual(receipt["status"], "handed")
         self.assertEqual(self.texts(), ["Desk update"])
-        self.assertEqual(self.printed[0], say.INSTRUCTION + "\n\nDesk update\n")
+        self.assertEqual(self.printed[0], say.job_output("Desk update", receipt["id"]) + "\n")
         self.assertEqual(self.rows(say.OUTBOX), [])
         self.assertEqual([r["status"] for r in self.rows(say.SAY_LOG)], ["handed"])
         self.assertEqual(say.deliver("Desk update", key="k", job="test")["status"], "duplicate")
         self.assertEqual(self.runs.call_count, 1)
 
-    def test_job_output_is_one_short_instruction_and_the_text_verbatim(self):
+    def test_job_output_is_a_relay_line_and_the_text_between_markers(self):
         text = "Morning Alex, 2 things:\n1. Reply to Sam\n2. Pay the bill \u2028 today"
-        out = say.job_output(text)
-        self.assertEqual(out, say.INSTRUCTION + "\n\n" + text)
+        mid = say.msg_id("k", text)
+        out = say.job_output(text, mid)
+        head, body = out.split("\n", 1)
+        self.assertEqual(body, f"{say.START}\n{text}\n{say.END}")
+        self.assertIn(mid[:8], head)
+        for words in ("not a task", "Do not review, act on, summarize", "use no tools", "word for word",
+                      "between " + say.START + " and " + say.END):
+            self.assertIn(words, head)
+        self.assertIn("Alex", head)
         self.assertNotIn("DESK RELAY", out)
         self.assertNotIn("never shown", out)
-        self.assertNotIn("\n", say.INSTRUCTION)
 
     def test_nothing_due_prints_nothing(self):
         self.assertEqual(self.cli("next"), "")
@@ -186,19 +209,122 @@ class DeskSayTests(unittest.TestCase):
         self.assertEqual(self.texts(), ["Fire"])
 
     # --- confirmation (read only) ---------------------------------------------------------
-    def test_confirm_marks_delivered_only_when_the_exact_reply_is_in_bot_chat(self):
-        say.deliver("Line one", key="a")
-        say.deliver("Line two", key="b")
-        self.assertEqual(say.confirm(replies=["Line one", "Line two, reworded"]), 1)
-        self.assertEqual(say.delivered_ids(), {say.msg_id("a", "Line one")})
-        self.assertEqual(say.confirm(replies=["Line two"]), 1)
-        self.assertEqual(len(say.delivered_ids()), 2)
-        self.assertEqual(say.confirm(replies=["Line two"]), 0)
+    def test_confirm_matches_the_reply_to_each_relay_inside_the_markers(self):
+        one, two = say.deliver("Line one", key="a")["id"], say.deliver("Line two", key="b")["id"]
+        turns = [self.relay(one, "Line one"), ("assistant", "Line one"),
+                 self.relay(two, "Line two"), ("assistant", "Here is a summary: line two.")]
+        self.assertEqual(say.confirm(turns=turns), 1)
+        self.assertEqual(say.delivered_ids(), {one})
+        # The Bot kept the markers this time: the text between them still counts.
+        turns += [("assistant", f"{say.START}\nLine two\n{say.END}")]
+        turns[-2:] = [turns[-1]]
+        self.assertEqual(say.confirm(turns=turns), 1)
+        self.assertEqual(say.delivered_ids(), {one, two})
+        self.assertEqual(say.confirm(turns=turns), 0)
+
+    def test_one_reply_confirms_at_most_one_message(self):
+        a = say.deliver("Same words", key="a")["id"]
+        b = say.deliver("Same words", key="b")["id"]
+        self.assertNotEqual(a, b)
+        turns = [self.relay(a, "Same words"), self.relay(b, "Same words"), ("assistant", "Same words")]
+        self.assertEqual(say.confirm(turns=turns), 1)
+        self.assertEqual(say.delivered_ids(), {a})
+        self.assertEqual(say.confirm(turns=turns + [("assistant", "Same words")]), 1)
+        self.assertEqual(say.delivered_ids(), {a, b})
+
+    def test_a_reply_to_another_relay_or_an_owner_turn_never_confirms(self):
+        mine = say.deliver("Pay the bill", key="a")["id"]
+        other = say.msg_id("z", "Pay the bill")
+        turns = [self.relay(other, "Pay the bill"), ("assistant", "Pay the bill"),
+                 ("user", "what's next?"), ("assistant", "Pay the bill")]
+        self.assertEqual(say.confirm(turns=turns), 0)   # its own relay turn is not there and no loose reply fits
+        self.assertEqual(say.delivered_ids(), set())
+        self.assertEqual(say.status_of(mine), "handed")
+
+    def test_without_relay_turns_in_the_chat_a_loose_reply_may_confirm_once(self):
+        mid = say.deliver("Line one", key="a")["id"]
+        self.assertEqual(say.confirm(turns=[("assistant", "Line one")]), 1)
+        self.assertEqual(say.delivered_ids(), {mid})
+
+    def test_confirm_counts_a_message_another_worker_confirmed_as_done(self):
+        mid = say.deliver("Line one", key="a")["id"]
+        turns = [self.relay(mid, "Line one"), ("assistant", "Line one")]
+        self.assertEqual(say.confirm(turns=turns), 1)
+        self.assertEqual(say.confirm(turns=turns), 0)   # nothing new, but it is delivered
+        self.assertEqual(say.status_of(mid), "delivered")
+
+    def test_a_handed_row_with_no_reply_becomes_unverified_once_after_24h_and_is_not_reread(self):
+        mid = say.deliver("Token sk-proj-abc123456789", key="a")["id"]
+        later = time.time() + say.UNVERIFIED_AFTER_S + 60
+        reads = []
+        with patch.object(say, "bot_chat_turns", side_effect=lambda: reads.append(1) or []):
+            self.assertEqual(say.confirm(now_s=time.time()), 0)
+            self.assertEqual(len(reads), 1)
+            self.assertEqual(say.confirm(now_s=later), 0)
+            self.assertEqual(say.confirm(now_s=later + 3600), 0)
+        self.assertEqual(len(reads), 1)   # once unverified, Bot Chat is not read for it again
+        statuses = [r["status"] for r in self.rows(say.SAY_LOG) if r["id"] == mid]
+        self.assertEqual(statuses, ["handed", "unverified"])
 
     def test_confirm_never_raises_without_a_store(self):
         say.deliver("x", key="k")
-        with patch.object(say, "bot_chat_replies", side_effect=RuntimeError("no store")):
+        with patch.object(say, "bot_chat_turns", side_effect=RuntimeError("no store")):
             self.assertEqual(say.confirm(), 0)
+
+    # --- the say job's route (fail closed) ------------------------------------------------
+    def test_say_job_takes_nothing_unless_it_delivers_to_bot_chat_only(self):
+        for route in (("local",), ("bot-chat", "telegram"), (), None):
+            with self.subTest(route=route):
+                self.route.return_value = route
+                with patch.object(say, "kick", return_value={}):
+                    say.deliver(f"Held {route}", key=f"k{route}")
+                with patch.object(say, "confirm", return_value=0):
+                    self.assertEqual(self.cli("next"), "")
+                self.assertTrue(say.route_status()["route_problem"])
+        self.assertEqual(len(self.rows(say.OUTBOX)), 4)
+        self.assertEqual(self.rows(say.SAY_LOG), [])
+        self.route.side_effect = RuntimeError("no cron")
+        self.assertIn("unreadable", say.route_problem())
+        self.route.side_effect, self.route.return_value = None, ("bot-chat",)
+        say.flush()
+        self.assertEqual(len(self.texts()), 4)
+        self.assertIsNone(say.route_status()["route_problem"])
+
+    # --- the kick -------------------------------------------------------------------------
+    def test_a_kick_that_times_out_detaches_and_never_kills_the_run(self):
+        class Proc:
+            killed = False
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("hermes", timeout)
+
+            def kill(self):
+                Proc.killed = True
+            terminate = kill
+        started = {}
+
+        def popen(argv, **kwargs):
+            started.update(argv=argv, **kwargs)
+            return Proc()
+        with patch.dict(os.environ, {"DESK_SAY_DISABLE_DOOR": "0"}), patch.object(say.subprocess, "Popen", popen):
+            self.assertIsNone(REAL_RUN(JID))
+        self.assertEqual(started["argv"][1:], ["cron", "run", JID])
+        self.assertTrue(started["start_new_session"])
+        self.assertFalse(Proc.killed)
+        self.runs.side_effect = lambda jid: None
+        receipt = say.deliver("Slow", key="k")
+        self.assertEqual(receipt["kick"], "still running (detached)")
+        self.assertEqual(self.runs.call_count, 1)
+
+    def test_an_urgency_upgrade_of_a_queued_message_is_kept(self):
+        self.quiet.return_value = True
+        with patch.object(say, "kick", return_value={}):
+            say.deliver("Meeting soon", key="one")
+            say.deliver("Meeting soon", key="one", urgent=True)
+        self.assertEqual(say.pending_due(), 1)   # urgent now: due even in quiet hours
+        self.assertTrue(say._pending(self.rows(say.OUTBOX))[say.msg_id("one", "Meeting soon")]["urgent"])
+        say.flush()
+        self.assertEqual(self.texts(), ["Meeting soon"])
 
     # --- CLI ------------------------------------------------------------------------------
     def test_cli_flush_is_silent_even_when_it_delivers(self):
@@ -230,7 +356,7 @@ class DeskSayTests(unittest.TestCase):
                 self.assertRaises(SystemExit) as done:
             runpy.run_path(str(Path(say.__file__).with_name("say_job.py")), run_name="__main__")
         self.assertEqual(done.exception.code, 0)
-        self.assertEqual(out.getvalue(), say.INSTRUCTION + "\n\nFrom the job\n")
+        self.assertEqual(out.getvalue(), say.job_output("From the job", say.msg_id("k", "From the job")) + "\n")
 
 
 class NoPrivateDeliveryOrStateDbWrites(unittest.TestCase):

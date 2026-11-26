@@ -125,9 +125,63 @@ class ResolveTests(unittest.TestCase):
         ]
         (resolve.phconf.state_dir() / 'ping_log.jsonl').write_text('\n'.join(map(json.dumps, rows)), encoding='utf-8')
 
+    def delivered(self, extra=None):
+        """Every ping_log row counts as received by the owner, except the ids given as id=status."""
+        def statuses():
+            rows = [json.loads(line) for line in
+                    (resolve.phconf.state_dir() / 'ping_log.jsonl').read_text().splitlines() if line.strip()]
+            out = {resolve._message_id(r): 'delivered' for r in rows}
+            out.update(extra or {})
+            return out
+        return patch.object(resolve, '_say_statuses', statuses)
+
+    def log_messages(self, *rows):
+        (resolve.phconf.state_dir() / 'ping_log.jsonl').write_text('\n'.join(map(json.dumps, rows)), encoding='utf-8')
+
+    def test_reply_number_binds_to_the_latest_message_the_owner_received(self):
+        resolve.put(self.record)
+        at = lambda h: (self.clock - timedelta(hours=h)).isoformat()  # noqa: E731
+        received = {'at': at(2), 'kind': 'desk_message', 'job': 'radar', 'keys': ['sam'], 'drafts': {'sam': 'ready'},
+                    'text': 'Sam: questions in. Draft ready, reply 1.', 'say_id': 'a' * 24}
+        queued = {'at': at(1), 'kind': 'desk_message', 'job': 'radar', 'keys': ['other'],
+                  'drafts': {'other': 'ready'}, 'text': 'Other. Draft ready, reply 1.', 'say_id': 'b' * 24}
+        self.log_messages(received, queued)
+        statuses = {'a' * 24: 'delivered'}             # the newer one is still in the outbox
+        self.assertEqual(resolve.number_target(1, statuses=statuses), ('sam', 'ok'))
+        statuses['b' * 24] = 'handed'                 # handed to Bot Chat, reply not seen: the owner may have it
+        self.assertEqual(resolve.number_target(1, statuses=statuses), (None, resolve.AMBIGUOUS))
+        statuses['b' * 24] = 'unverified'
+        self.assertEqual(resolve.number_target(1, statuses=statuses), (None, resolve.AMBIGUOUS))
+        statuses['b' * 24] = 'delivered'
+        self.assertEqual(resolve.number_target(1, statuses=statuses), ('other', 'ok'))
+        # Never a message that was only queued, even when it is the only one.
+        self.assertEqual(resolve.number_target(1, statuses={}), (None, 'none'))
+
+    def test_show_asks_when_the_number_is_ambiguous(self):
+        resolve.put(self.record)
+        at = lambda h: (self.clock - timedelta(hours=h)).isoformat()  # noqa: E731
+        self.log_messages(
+            {'at': at(2), 'kind': 'desk_message', 'keys': ['plain', 'sam'], 'drafts': {'sam': 'ready'}, 'say_id': 'a' * 24},
+            {'at': at(1), 'kind': 'desk_message', 'keys': ['x', 'y'], 'drafts': {'y': 'ready'}, 'say_id': 'b' * 24})
+        with self.delivered({'b' * 24: 'handed'}):
+            code, out = self.cli('show', '--n', '2')
+        self.assertEqual(code, 0)
+        self.assertIn('Ask which item', out)
+        self.assertNotIn(self.record['draft'], out)
+        self.assertIsNone(resolve.get('sam').get('shown_at'))
+
+    def test_legacy_rows_get_the_id_desk_say_gave_them(self):
+        sys_path = str(Path(resolve.__file__).resolve().parent)
+        import sys
+        sys.path.insert(0, sys_path)
+        import desk_say
+        row = {'job': 'radar', 'keys': ['a', 'b'], 'text': 'Two things.\n'}
+        self.assertEqual(resolve._message_id(row), desk_say.msg_id('radar:a,b', 'Two things.'))
+
     def test_show_number_maps_display_position_and_marks_shown(self):
         resolve.put(self.record)
         self.say_fixture()
+        self.enterContext(self.delivered())
         code, out = self.cli('show', '--n', '2')
         self.assertEqual(code, 0)
         self.assertIn(self.record['draft'], out)
@@ -135,6 +189,7 @@ class ResolveTests(unittest.TestCase):
 
     def test_unknown_number_is_polite(self):
         self.say_fixture()
+        self.enterContext(self.delivered())
         self.assertEqual(self.cli('show', '--n', '1'), (0, 'No stored draft for that item.\n'))
         self.clock += timedelta(hours=36)
         self.assertIsNone(resolve.key_for_number(2))

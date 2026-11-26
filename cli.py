@@ -383,9 +383,10 @@ def handle_watch(args, jobs) -> int:
                 watches.append(watch)
         elif existing is not None:
             watches.remove(existing)
+        jobs.preflight()       # a Hermes without the public cron API leaves config.json unchanged
         jobs.runtime_paths()   # a refused runtime destination leaves config.json unchanged
         write_config(cfg)
-    except (ValueError, jobs.UnsafeRuntimeDestination) as exc:
+    except (ValueError, jobs.IncompatibleHermes, jobs.UnsafeRuntimeDestination) as exc:
         print(f"Watch: {exc}", file=sys.stderr)
         return 2
     try:
@@ -459,8 +460,9 @@ def handle(args) -> int:
                 print(f"  would {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
         return 0
     try:
+        jobs.preflight()       # the public cron API, before config.json is written: a refusal changes nothing
         jobs.runtime_paths()   # checked before config.json is written, so a refused install changes nothing
-    except jobs.UnsafeRuntimeDestination as exc:
+    except (jobs.IncompatibleHermes, jobs.UnsafeRuntimeDestination) as exc:
         print(f"Setup: {exc}", file=sys.stderr)
         return 1
     key_note = decisions_note(cfg)
@@ -470,7 +472,10 @@ def handle(args) -> int:
     phconf.CFG = cfg
     try:
         rows = jobs.apply(cfg)
-    except jobs.UnsafeRuntimeDestination as exc:   # changed since the check above: nothing was installed
+    except (jobs.IncompatibleHermes, jobs.UnsafeRuntimeDestination) as exc:   # changed since the check: nothing installed
+        print(f"Setup: {exc}", file=sys.stderr)
+        return 1
+    except RuntimeError as exc:   # a `hermes cron` step failed; the message says what is left to do
         print(f"Setup: {exc}", file=sys.stderr)
         return 1
     print(f"Config: {path}")
@@ -478,7 +483,8 @@ def handle(args) -> int:
     for row in rows:
         if row["action"] not in ("keep", "skip"):
             print(f"  {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
-    print(f"Jobs: {actions.count('create')} created, {actions.count('update')} updated, {actions.count('remove')} removed.")
+    print(f"Jobs: {actions.count('create')} created, {actions.count('update')} updated, {actions.count('replace')} replaced, "
+          f"{actions.count('remove')} removed.")
     print("Done. Desk messages arrive in this profile's Bot Chat as normal replies.")
     try:
         import ph_doctor

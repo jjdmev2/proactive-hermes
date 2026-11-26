@@ -211,11 +211,43 @@ def render_show(rec) -> str:
     return "\n\n".join(sections)
 
 
-def key_for_number(n, max_age_hours=36):
-    if n < 1:
+AMBIGUOUS = "ambiguous"
+
+
+def _say_statuses() -> dict[str, str]:
+    """{desk message id: last delivery status} from desk_say, after a confirm pass (read only on Bot Chat)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import desk_say
+    try:
+        desk_say.confirm()
+    except Exception:
+        pass
+    return {mid: str(row.get("status")) for mid, row in desk_say._last_status().items()}
+
+
+def _message_id(row: dict) -> str | None:
+    """The desk message id of a ping_log row: recorded since this release, else derived the way desk_say derives it
+    (sha256 of "<job>:<keys>" and the text)."""
+    if isinstance(row.get("say_id"), str):
+        return row["say_id"]
+    keys, text = row.get("keys"), row.get("text")
+    if not isinstance(keys, list) or not isinstance(text, str):
         return None
+    import hashlib
+    key = f"{row.get('job') or ''}:{','.join(str(k) for k in keys)}"
+    return hashlib.sha256(f"{key}\n{text.strip()}".encode()).hexdigest()[:24]
+
+
+def number_target(n, max_age_hours=36, statuses=None) -> tuple[str | None, str]:
+    """What "reply N" means: (key, "ok"), (None, "none") or (None, AMBIGUOUS).
+
+    N binds to the latest message with drafts that the owner has actually received: its Bot Chat delivery was
+    confirmed. A message still queued is ignored (the owner has not seen it). A newer message that was handed to
+    Bot Chat but not confirmed might be the one the owner means, so the answer is AMBIGUOUS: ask which item."""
+    if n < 1:
+        return None, "none"
     cutoff = _timestamp(now()) - timedelta(hours=max_age_hours)
-    latest = None
+    rows = []
     try:
         with (phconf.state_dir() / "ping_log.jsonl").open(encoding="utf-8") as log:
             for line in log:
@@ -226,17 +258,36 @@ def key_for_number(n, max_age_hours=36):
                 if not isinstance(row, dict) or row.get("kind") != "desk_message" or not row.get("drafts"):
                     continue
                 at = _timestamp(row.get("at"))
-                if at is not None and at >= cutoff and (latest is None or at >= latest[0]):
-                    latest = (at, row)
+                if at is not None and at >= cutoff:
+                    rows.append((at, row))
     except FileNotFoundError:
-        return None
-    if latest is not None:
-        keys, drafts = latest[1].get("keys"), latest[1]["drafts"]
-        if isinstance(keys, list) and isinstance(drafts, dict) and n <= len(keys):
-            k = keys[n - 1]
-            if isinstance(k, str) and k in drafts:
-                return k
-    return None
+        return None, "none"
+    if not rows:
+        return None, "none"
+    statuses = _say_statuses() if statuses is None else statuses
+    received, unclear = None, []
+    for at, row in sorted(rows, key=lambda pair: pair[0]):
+        state = statuses.get(_message_id(row))
+        if state == "delivered":
+            received, unclear = (at, row), []
+        elif state is None or state == "queued":
+            continue   # still in the outbox (or never queued): the owner has not seen it
+        else:
+            unclear.append((at, row))   # handed to Bot Chat or unverified: the owner may have it
+    if unclear:
+        return None, AMBIGUOUS
+    if received is None:
+        return None, "none"
+    keys, drafts = received[1].get("keys"), received[1]["drafts"]
+    if isinstance(keys, list) and isinstance(drafts, dict) and n <= len(keys):
+        k = keys[n - 1]
+        if isinstance(k, str) and k in drafts:
+            return k, "ok"
+    return None, "none"
+
+
+def key_for_number(n, max_age_hours=36, statuses=None):
+    return number_target(n, max_age_hours, statuses)[0]
 
 
 def _mark(key, fields, *, bind=False) -> dict:
@@ -342,6 +393,7 @@ def search_sessions(who, terms, days=14, db=None) -> list[dict]:
              WHERE messages_fts MATCH ? AND m.timestamp >= ?
                AND m.role IN ('user', 'assistant') AND s.source NOT IN ('cron', 'subagent')
                AND m.content <> '' AND m.content NOT LIKE 'DESK RELAY%'
+               AND m.content NOT LIKE '[Cronjob "Proactive%' AND m.content NOT LIKE '%Proactive Hermes desk message%'
                AND m.content NOT LIKE '%ea_resolve.py%' AND m.content NOT LIKE '%resolve-before-ask%'
              ORDER BY m.timestamp DESC, m.id DESC LIMIT 5
         """, (query, cutoff)).fetchall()
@@ -583,9 +635,12 @@ def main(argv=None) -> int:
     if a.cmd == "get":
         result = get(a.key)
     elif a.cmd == "show":
-        key = a.key if a.key is not None else key_for_number(a.n)
+        key, why = (a.key, "ok") if a.key is not None else number_target(a.n)
         row = get(key) if key is not None else None
-        if row is None:
+        if why == AMBIGUOUS:
+            print("Not sure which message that number belongs to: a newer desk message may not have reached the "
+                  "owner yet. Ask which item they mean before showing or sending anything.")
+        elif row is None:
             print("No stored draft for that item.")
         else:
             mark(key, shown_at=now().isoformat())

@@ -950,7 +950,8 @@ class RuntimeStamp(OfflineTestCase):
                     self.assertIn(str(link), note)
                     args = argparse.Namespace(proactive_command="setup", preset="custom", answers=str(answers),
                                               dry_run=False)
-                    with patch.object(sys, "stderr", io.StringIO()) as err, redirect_stdout(io.StringIO()):
+                    with patch.object(sys, "stderr", io.StringIO()) as err, redirect_stdout(io.StringIO()), \
+                            patch.object(jobs, "api_problem", return_value=None):
                         self.assertEqual(cli.handle(args), 1)
                     self.assertIn(str(link), err.getvalue())
                     self.assertEqual(phconf.config_path().read_text(), before)   # refused before config.json

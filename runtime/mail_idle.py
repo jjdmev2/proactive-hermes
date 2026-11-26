@@ -468,8 +468,26 @@ def _trigger_cli(job_id: str, popen=subprocess.Popen) -> bool | None:
     return True
 
 
+class Fence:
+    """Closed when its service is unloaded. A poke starts its `hermes cron run` only while holding the lock and
+    seeing the fence open, and unload closes it under the same lock: after stop_service() returns, no poke from that
+    service can start, even one already past its checks."""
+
+    def __init__(self, generation: int = 0):
+        self.lock = threading.Lock()
+        self.closed = False
+        self.generation = generation
+
+    def close(self) -> None:
+        with self.lock:
+            self.closed = True
+
+    def is_open(self) -> bool:
+        return not self.closed and self.generation == _GENERATION
+
+
 def poke_radar(*, dry_run: bool = False, job_id: str | None = None, cli=_trigger_cli,
-               job_state=None) -> bool | None:
+               job_state=None, fence: Fence | None = None) -> bool | None:
     jid = job_id or radar_job_id()
     if not jid:
         log.warning("no mail radar job registered, nothing to poke")
@@ -484,10 +502,20 @@ def poke_radar(*, dry_run: bool = False, job_id: str | None = None, cli=_trigger
     if job_paused(job):
         log.info("radar paused, poke skipped")
         return False
-    if dry_run:
-        log.info("dry-run: would poke the mail radar")
-        return True
-    ok = cli(jid)
+    if fence is None:
+        if dry_run:
+            log.info("dry-run: would poke the mail radar")
+            return True
+        ok = cli(jid)
+    else:
+        with fence.lock:
+            if not fence.is_open():
+                log.info("mail push unloaded, poke dropped")
+                return False
+            if dry_run:
+                log.info("dry-run: would poke the mail radar")
+                return True
+            ok = cli(jid)
     if ok is None:
         return None  # busy: the debouncer retries
     log.info("poked the mail radar: %s", "ok" if ok else "failed")
@@ -773,12 +801,16 @@ class Service:
                         for a in accounts]
         self._last_hb = 0.0
         self.thread: threading.Thread | None = None   # the service loop's own thread (start_in_gateway)
+        self.fence = Fence(_GENERATION)
 
     def start(self) -> None:
         for w in self.workers:
             w.start()
 
     def step(self) -> None:
+        if not self.fence.is_open():
+            self.stop.set()   # an older generation: retire without poking
+            return
         self.debouncer.tick()
         if self.status.changed or time.monotonic() - self._last_hb >= HEARTBEAT_EVERY:
             self.status.write()
@@ -808,6 +840,9 @@ class Service:
 
 _SERVICE: Service | None = None
 _LOCK = threading.Lock()
+_GENERATION = 0          # bumped by every start and stop; a service only pokes while its generation is current
+_RETIRING: list[threading.Thread] = []   # loop threads of stopped services that had not finished yet
+JOIN_S = 15.0            # how long a stop or a new start waits for an old loop thread to finish
 
 
 def enabled(cfg: dict | None = None) -> bool:
@@ -831,22 +866,45 @@ def build_service(ctx=None, *, dry_run: bool = False, secret=None) -> Service:
     accounts, skipped = load_accounts(plugin_settings(ctx), secret=secret)
     for label, reason in skipped.items():
         log.info("%s: 15 min checks only (%s)", label, REASONS.get(reason, reason))
-    return Service(accounts, skipped, lambda: poke_radar(dry_run=dry_run))
+    svc = Service(accounts, skipped, None)
+    svc.debouncer.poke = lambda: poke_radar(dry_run=dry_run, fence=svc.fence)
+    return svc
 
 
 def stop_service() -> None:
-    global _SERVICE
+    """ctx.on_unload: close the fence (no poke can start after this returns), stop the workers, then wait up to
+    JOIN_S for the loop thread; one still running is kept in _RETIRING and joined before a new start."""
+    global _SERVICE, _GENERATION
     with _LOCK:
         svc, _SERVICE = _SERVICE, None
-    if svc is not None:
-        svc.stop.set()
-        for w in svc.workers:
-            w.close()
+        _GENERATION += 1
+    if svc is None:
+        return
+    svc.fence.close()
+    svc.stop.set()
+    for w in svc.workers:
+        w.close()
+    thread = svc.thread
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(JOIN_S)
+        if thread.is_alive():
+            with _LOCK:
+                _RETIRING.append(thread)
+
+
+def _retire_old() -> bool:
+    """Join the loop threads of stopped services. False when one is still running after JOIN_S."""
+    for thread in list(_RETIRING):
+        thread.join(JOIN_S)
+        if thread.is_alive():
+            return False
+        _RETIRING.remove(thread)
+    return True
 
 
 def start_in_gateway(ctx, *, gateway: bool | None = None, secret=None) -> str:
     """Start mail push once per process, only inside the gateway. Returns what happened (for logs/tests)."""
-    global _SERVICE
+    global _SERVICE, _GENERATION
     if not phconf.config_path().exists():
         return "not set up"
     if not enabled():
@@ -856,6 +914,10 @@ def start_in_gateway(ctx, *, gateway: bool | None = None, secret=None) -> str:
     with _LOCK:
         if _SERVICE is not None:
             return "already running"
+        if not _retire_old():
+            log.warning("mail push not started: the previous one is still stopping")
+            return "previous still stopping"
+        _GENERATION += 1
         try:
             svc = build_service(ctx, secret=secret)
         except Exception as exc:
