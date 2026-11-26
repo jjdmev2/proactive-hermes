@@ -5,7 +5,11 @@ import json
 import os
 import re
 import subprocess
+import sys
+import types
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -15,6 +19,7 @@ import cli
 import jobs
 
 REAL_API_PROBLEM = jobs.api_problem
+REAL_TOOLSETS_SETTING = jobs.cron_toolsets_setting
 
 
 class FakeCron:
@@ -106,6 +111,8 @@ class JobSetupTests(unittest.TestCase):
         self.run = FakeCron()
         self.enterContext(patch.object(jobs, "_plugin_ensure", self.run.ensure))
         self.enterContext(patch.object(jobs, "api_problem", return_value=None))
+        self.enterContext(patch.object(jobs, "cron_toolsets_setting", return_value=None))   # never read a real config
+        self.enterContext(redirect_stdout(StringIO()))   # setup's progress lines; tests that read them capture their own
         self.cfg = cli.base_config("custom")
         self.cfg["timezone"] = "Europe/Berlin"
         self.cfg["features"].update({key: key == "health" for key in self.cfg["features"]})
@@ -177,6 +184,13 @@ class JobSetupTests(unittest.TestCase):
         self.assertEqual(self.run.ensured, [])
         self.assertEqual(self.run.toolsets[names["Proactive · mail radar"]], want["Proactive · mail radar"])
 
+    def kept(self, old, name):
+        """A saved run of the replaced job OLD, as kept in plugin-data/proactive-hermes/job-history/."""
+        return self.home / "plugin-data" / "proactive-hermes" / "job-history" / "mail_radar" / old / name
+
+    def registry(self):
+        return json.loads((self.home / "plugin-data" / "proactive-hermes" / "jobs.json").read_text())
+
     def _old_radar(self, state="active"):
         """A mail radar installed by a release before toolsets (2f7c535b): no toolsets recorded, one saved run."""
         self.cfg["features"]["mail_radar"] = True
@@ -208,8 +222,10 @@ class JobSetupTests(unittest.TestCase):
         steps = [(a[2], a[3] if len(a) > 3 else "") for a in self.run.calls if a[2] != "list"]
         self.assertLess(steps.index(("pause", old)), steps.index(("edit", new)))
         self.assertLess(steps.index(("edit", new)), steps.index(("remove", old)))
-        # The old job's saved runs are kept with the new job (`hermes cron remove` deletes the old folder).
-        self.assertTrue((self.home / "cron" / "output" / new / "2026-11-20_08-00-00.md").is_file())
+        # The old job's saved runs are kept in plugin-data (`hermes cron remove` deletes the old folder), never
+        # written into Hermes's own cron/output.
+        self.assertEqual(self.kept(old, "2026-11-20_08-00-00.md").read_text(), "## Response\n[SILENT]\n")
+        self.assertFalse((self.home / "cron" / "output" / new).exists())
 
     def test_a_paused_job_stays_paused_through_the_replace(self):
         path, old = self._old_radar(state="paused")
@@ -221,7 +237,8 @@ class JobSetupTests(unittest.TestCase):
         self.assertNotIn(("pause", old), steps)            # already paused: left as it was until removed
         self.assertNotIn(("resume", old), steps)
         self.assertLess(steps.index(("pause", new)), steps.index(("edit", new)))   # paused before its real schedule
-        self.assertTrue((self.home / "cron" / "output" / new / "2026-11-20_08-00-00.md").is_file())
+        self.assertTrue(self.kept(old, "2026-11-20_08-00-00.md").is_file())
+        self.assertFalse((self.home / "cron" / "output" / new).exists())
 
     def test_a_failed_replace_leaves_the_old_job_as_it_was(self):
         path, old = self._old_radar()
@@ -238,6 +255,255 @@ class JobSetupTests(unittest.TestCase):
         self.assertEqual(self.run.states[old], "active")           # resumed
         self.assertEqual([j for j in self.run.live if self.run.names[j].startswith("Proactive · mail radar")], [old])
         self.assertTrue((self.home / "cron" / "output" / old / "2026-11-20_08-00-00.md").is_file())
+        self.assertNotIn("replacing", self.registry())   # a swap that failed cleanly leaves no record behind
+
+    # --- run history stays in plugin-data; Hermes's cron/output is only read ---------------------------------------
+
+    def tree(self, root):
+        return sorted((str(f.relative_to(root)), f.read_bytes()) for f in root.rglob("*") if f.is_file()) \
+            if root.exists() else []
+
+    def test_replace_copies_old_runs_to_plugin_data_and_never_writes_into_cron_output(self):
+        path, old = self._old_radar()
+        sub = self.home / "cron" / "output" / old / "extra"
+        sub.mkdir()
+        (sub / "2026-11-21_08-00-00.md").write_text("second run")
+        (self.home / "cron" / "output" / old / "link.md").symlink_to(sub / "2026-11-21_08-00-00.md")
+        before = self.tree(self.home / "cron")
+        said = StringIO()
+        with redirect_stdout(said):
+            jobs.apply(self.cfg, run=self.run)
+        new = self.registry()["mail_radar"]["id"]
+        self.assertNotEqual(new, old)
+        self.assertEqual(self.tree(self.home / "cron"), before)   # Hermes's own folder: not one byte written
+        self.assertEqual(sorted(p.name for p in (self.home / "cron" / "output").iterdir()), [old])
+        history = self.kept(old, "2026-11-20_08-00-00.md").parent
+        self.assertEqual(self.tree(history), [("2026-11-20_08-00-00.md", b"## Response\n[SILENT]\n"),
+                                              ("extra/2026-11-21_08-00-00.md", b"second run")])   # symlink skipped
+        for folder in (history, history.parent, history.parent.parent, history / "extra"):
+            self.assertEqual(folder.stat().st_mode & 0o777, 0o700, folder)
+        # Said once, with the place and the reason.
+        lines = [ln for ln in said.getvalue().splitlines() if ln.startswith("Run history:")]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("2 saved run file(s)", lines[0])
+        self.assertIn(str(history.parent.parent), lines[0])
+        self.assertIn("never writes into it", lines[0])
+        # Nothing to say when nothing is replaced, and a second pass copies nothing and overwrites nothing.
+        again = StringIO()
+        with redirect_stdout(again):
+            jobs.apply(self.cfg, run=self.run)
+        self.assertNotIn("Run history", again.getvalue())
+        self.assertEqual(jobs._keep_history("mail_radar", old), 0)
+
+    def test_history_folder_names_are_safe_for_any_job_key(self):
+        old = "0123456789ab"
+        root = self.home / "plugin-data" / "proactive-hermes" / "job-history"
+        self.assertEqual(jobs._history_dir("mail_radar", old), root / "mail_radar" / old)
+        for key in ("watch:../../etc/x y", "watch:Drop/It", "watch:", ".."):
+            folder = jobs._history_dir(key, old)
+            self.assertEqual(folder.parent.parent, root, key)
+            self.assertRegex(folder.parent.name, r"^[A-Za-z0-9_.-]+$")
+        self.assertNotEqual(jobs._history_dir("watch:a b", old), jobs._history_dir("watch:a/b", old))
+
+    def test_nothing_in_jobs_py_writes_under_cron_output(self):
+        source = (Path(jobs.__file__)).read_text()
+        self.assertEqual(re.findall(r"_output_dir\(([^)]*)\)", source), ["jid: str", "old"])   # its def, and the one read
+        self.assertNotIn("output_dir(new", source)
+
+    # --- an interrupted replace is finished or undone by the next run ------------------------------------------
+
+    def interrupt_on(self, action, *, when):
+        """A `hermes cron` runner that dies with KeyboardInterrupt (a Ctrl-C, no cleanup) on the first ACTION call for
+        which WHEN(argv) is true; everything else goes to the fake."""
+        real = self.run.__call__
+        fired = []
+
+        def run(argv, **kwargs):
+            if argv[2] == action and when(argv) and not fired:
+                fired.append(argv)
+                raise KeyboardInterrupt
+            return real(argv, **kwargs)
+        run.fired = fired
+        return run
+
+    def setup_names(self):
+        return [self.run.names[j] for j in self.run.live if "(setup " in self.run.names[j]]
+
+    def settle(self, *, run=None):
+        said = StringIO()
+        with redirect_stdout(said):
+            jobs.apply(self.cfg, run=run or self.run)
+        return said.getvalue()
+
+    def assert_swapped_cleanly(self, old, *, active):
+        reg = self.registry()
+        new = reg["mail_radar"]["id"]
+        self.assertNotIn("replacing", reg)
+        self.assertNotEqual(new, old)
+        self.assertNotIn(old, self.run.live)
+        self.assertEqual(self.run.toolsets[new], ["terminal", "file", "skills"])
+        self.assertEqual(self.run.states.get(new, "active"), "active" if active else "paused")
+        self.assertEqual(self.setup_names(), [])   # no leftover "(setup ...)" job
+        self.assertEqual([self.run.names[j] for j in self.run.live if "mail radar" in self.run.names[j]],
+                         ["Proactive · mail radar"])
+        return new
+
+    def test_interrupt_after_the_pause_then_rerun_leaves_an_active_radar_active(self):
+        path, old = self._old_radar()   # active
+        with patch.object(jobs, "_plugin_ensure", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            jobs.apply(self.cfg, run=self.run)
+        # Left half swapped: the old job is paused, and the registry says why.
+        self.assertEqual(self.run.states[old], "paused")
+        reg = self.registry()
+        self.assertEqual(reg["mail_radar"]["id"], old)
+        self.assertEqual((reg["replacing"]["mail_radar"]["old"], reg["replacing"]["mail_radar"]["was_active"]),
+                         (old, True))
+        said = self.settle()
+        self.assertIn("undid an interrupted job swap for mail_radar", said)
+        new = self.assert_swapped_cleanly(old, active=True)   # not paused: the half-swapped state is not the truth
+        self.assertEqual(self.run.states.get(new, "active"), "active")
+        self.assertTrue(self.kept(old, "2026-11-20_08-00-00.md").is_file())
+        self.run.calls.clear()
+        self.settle()   # and now a no-op
+        self.assertEqual([a[2] for a in self.run.calls], ["list"])
+
+    def test_interrupt_while_the_new_job_is_half_made_removes_the_setup_temp_job(self):
+        path, old = self._old_radar()
+        dying = self.interrupt_on("edit", when=lambda argv: argv[3] != old)
+        with self.assertRaises(KeyboardInterrupt):
+            jobs.apply(self.cfg, run=dying)
+        self.assertEqual(len(self.setup_names()), 1)               # the temp job is still there
+        temp = self.registry()["replacing"]["mail_radar"]
+        self.assertEqual(self.run.names[temp["new"]], temp["temp"])
+        self.assertRegex(temp["temp"], r" \(setup [0-9a-f]+\)$")
+        self.assertEqual(self.run.states[old], "paused")
+        self.settle()
+        self.assert_swapped_cleanly(old, active=True)
+
+    def test_interrupt_after_the_registry_points_at_the_new_job_finishes_the_swap(self):
+        path, old = self._old_radar()
+        dying = self.interrupt_on("remove", when=lambda argv: argv[3] == old)
+        with self.assertRaises(KeyboardInterrupt):
+            jobs.apply(self.cfg, run=dying)
+        reg = self.registry()
+        new = reg["mail_radar"]["id"]
+        self.assertNotEqual(new, old)
+        self.assertIn(old, self.run.live)                          # old, paused, not yet removed
+        self.assertEqual(reg["replacing"]["mail_radar"]["new"], new)
+        said = self.settle()
+        self.assertIn("finished an interrupted job swap for mail_radar", said)
+        self.assertEqual(self.assert_swapped_cleanly(old, active=True), new)   # the new job is kept, the old one goes
+        self.assertTrue(self.kept(old, "2026-11-20_08-00-00.md").is_file())
+
+    def test_a_paused_radar_stays_paused_after_an_interrupted_replace(self):
+        path, old = self._old_radar(state="paused")
+        dying = self.interrupt_on("edit", when=lambda argv: argv[3] != old)
+        with self.assertRaises(KeyboardInterrupt):
+            jobs.apply(self.cfg, run=dying)
+        self.assertFalse(self.registry()["replacing"]["mail_radar"]["was_active"])
+        self.run.calls.clear()
+        self.settle()
+        self.assert_swapped_cleanly(old, active=False)
+        self.assertNotIn(("resume", old), [(a[2], a[3]) for a in self.run.calls if len(a) > 3])
+
+    def test_an_undo_that_cannot_resume_the_old_job_keeps_the_record_and_stops_setup(self):
+        path, old = self._old_radar()
+        with patch.object(jobs, "_plugin_ensure", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            jobs.apply(self.cfg, run=self.run)
+        real = self.run.__call__
+        broken = lambda argv, **kw: (subprocess.CompletedProcess(argv, 1, stdout="", stderr="no")  # noqa: E731
+                                     if argv[2] == "resume" else real(argv, **kw))
+        with self.assertLogs(jobs.logger, "WARNING") as logged, self.assertRaisesRegex(RuntimeError, "could not put it back"):
+            jobs.apply(self.cfg, run=broken)
+        self.assertIn("could not resume", logged.output[0])
+        self.assertIn("mail_radar", self.registry()["replacing"])
+        self.assertEqual(self.run.states[old], "paused")
+        self.settle()   # cron works again: the record is still there and still right
+        self.assert_swapped_cleanly(old, active=True)
+
+    def test_remove_all_also_removes_the_jobs_of_an_interrupted_swap(self):
+        path, old = self._old_radar()
+        dying = self.interrupt_on("edit", when=lambda argv: argv[3] != old)
+        with self.assertRaises(KeyboardInterrupt):
+            jobs.apply(self.cfg, run=dying)
+        self.run.live["abcdef123456"] = ["someone else's job"]
+        self.run.names["abcdef123456"] = "Proactive · mail radar (setup of somebody else)"
+        jobs.remove_all(run=self.run)
+        self.assertEqual(set(self.run.live), {"abcdef123456"})
+        self.assertEqual(self.registry(), {})
+
+    # --- the toolset warning ----------------------------------------------------------------------------------
+
+    def test_toolset_warning_is_one_line_naming_the_extra_toolsets(self):
+        self.cfg["features"].update(mail_radar=True, promises=True, lookahead=True)
+        self.cfg["mail"]["gmail_api"] = True
+        line = jobs.toolset_warning(self.cfg, ["terminal", "file", "skills"])
+        self.assertNotIn("\n", line)
+        self.assertTrue(line.startswith("Warning:"))
+        self.assertIn("platform_toolsets.cron = [terminal, file, skills]", line)
+        self.assertIn("2 Proactive Hermes job(s) also ask for session_search, web", line)
+        self.assertIn("agent.disabled_toolsets", line)
+        # Nothing beyond the setting, no setting, or nothing to ask for: no warning.
+        self.assertIsNone(jobs.toolset_warning(self.cfg, ["terminal", "file", "skills", "session_search", "web"]))
+        self.assertIsNone(jobs.toolset_warning(self.cfg, None))
+        self.cfg["features"].update({key: False for key in self.cfg["features"]})
+        self.assertIsNone(jobs.toolset_warning(self.cfg, ["terminal"]))   # only no-agent jobs: no toolsets asked
+        # A Slack setup asks for connections on every agent job.
+        self.cfg["features"]["morning_brief"] = True
+        self.cfg["slack"]["enabled"] = True
+        self.assertIn("1 Proactive Hermes job(s) also ask for connections",
+                      jobs.toolset_warning(self.cfg, ["terminal", "file", "skills"]))
+
+    def test_setup_prints_the_toolset_warning_once_and_dry_run_prints_none(self):
+        self.cfg["features"].update(promises=True, lookahead=True)
+        self.cfg["mail"]["gmail_api"] = True
+        with patch.object(jobs, "cron_toolsets_setting", return_value=["terminal", "file", "skills"]):
+            said = StringIO()
+            with redirect_stdout(said):
+                jobs.apply(self.cfg, run=self.run)
+            self.assertEqual(len([ln for ln in said.getvalue().splitlines() if ln.startswith("Warning:")]), 1)
+            dry = StringIO()
+            with redirect_stdout(dry):
+                jobs.apply(self.cfg, dry_run=True, run=self.run)
+            self.assertNotIn("Warning", dry.getvalue())
+        quiet = StringIO()
+        with redirect_stdout(quiet):
+            jobs.apply(self.cfg, run=self.run)   # setUp's default: no setting readable
+        self.assertNotIn("Warning", quiet.getvalue())
+
+    def test_cron_toolsets_setting_reads_hermes_config_through_the_readonly_loader(self):
+        def with_config(config=None, *, boom=False):
+            module = types.ModuleType("hermes_cli.config")
+
+            def load_config_readonly():
+                if boom:
+                    raise RuntimeError("unreadable")
+                return config
+            module.load_config_readonly = load_config_readonly
+            return patch.dict(sys.modules, {"hermes_cli.config": module, "hermes_cli": types.ModuleType("hermes_cli")})
+        read = REAL_TOOLSETS_SETTING
+        with with_config({"platform_toolsets": {"cron": ["terminal", " file ", "", "web"]}}):
+            self.assertEqual(read(), ["terminal", "file", "web"])
+        for config in ({}, {"platform_toolsets": {}}, {"platform_toolsets": {"cron": []}},
+                       {"platform_toolsets": {"cron": "terminal"}}, {"platform_toolsets": None}, None,
+                       {"platform_toolsets": {"cron": ["hermes-cron"]}},
+                       {"platform_toolsets": {"cron": ["terminal", "hermes-cli"]}}):
+            with self.subTest(config=config), with_config(config):
+                self.assertIsNone(read())
+        with with_config(boom=True):
+            self.assertIsNone(read())
+
+    # --- the manifest floor ------------------------------------------------------------------------------------
+
+    def test_the_manifest_loads_on_the_last_release_and_preflight_is_the_gate(self):
+        manifest = (Path(jobs.HERE) / "plugin.yaml").read_text()
+        self.assertRegex(manifest, r'(?m)^requires_hermes: ">=0\.23\.4"$')   # v0.23.5 does not exist
+        self.assertNotIn("0.23.5", manifest)
+        self.assertIn("cron.plugin_api", jobs.NEEDS_HERMES)
+        for needle in ("current main or canary", "the next release"):
+            self.assertIn(needle, jobs.NEEDS_HERMES)
+        readme = (Path(jobs.HERE) / "README.md").read_text()
+        self.assertNotIn("0.23.5", readme)
 
     def test_unrecorded_job_with_the_same_name_is_never_adopted_or_touched(self):
         self.cfg["features"]["mail_radar"] = True
@@ -289,7 +555,7 @@ class JobSetupTests(unittest.TestCase):
         # The real check: a bare python with no Hermes on its path cannot import cron.plugin_api.
         with patch.object(jobs.phconf, "agent_root", return_value=self.home / "no-hermes"), \
                 patch.dict("sys.modules", {"cron": None, "cron.plugin_api": None}):
-            self.assertRegex(REAL_API_PROBLEM() or "", "needs Hermes " + re.escape(jobs.MIN_HERMES))
+            self.assertRegex(REAL_API_PROBLEM() or "", "needs a Hermes build that includes `cron.plugin_api`")
 
     def test_cli_setup_refuses_before_writing_config(self):
         import argparse

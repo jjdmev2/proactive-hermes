@@ -9,6 +9,9 @@ on or summarize it but to repeat the text between the markers word for word. Cro
 The job's own schedule (every 2 minutes, around the clock) and desk_tick's flush are the safety net when a kick
 fails. Non-urgent messages wait in the outbox during quiet hours; urgent ones go at once, day or night.
 
+A line of the message that starts with a marker gets a backslash in front (neutralize), so mail-derived text cannot close
+the fence early; confirmation compares the text with and without that backslash.
+
 Before it takes a message, `next` checks with Hermes's public cron.plugin_api.delivery_platforms that the say job
 still delivers to Bot Chat and nowhere else; otherwise it takes nothing (fail closed) and the health check reports it.
 
@@ -280,10 +283,27 @@ def tag_for(mid: str) -> str:
     return mid[:8]
 
 
+_MARKER_LINE = re.compile(r"^([ \t]*)(?=" + re.escape(START) + "|" + re.escape(END) + ")")
+_ESCAPED_MARKER_LINE = re.compile(r"^([ \t]*)\\(?=" + re.escape(START) + "|" + re.escape(END) + ")")
+
+
+def neutralize(text: str) -> str:
+    """TEXT with a backslash in front of every line that starts with the start or end marker (after any indent), so
+    mail-derived text can never close the fence early or open a second one. Lines are split the way a reader sees
+    them (also at a carriage return or U+2028). Text without such a line comes back unchanged."""
+    return "".join(_MARKER_LINE.sub(r"\1\\", line) for line in text.splitlines(keepends=True))
+
+
+def _unescape(text: str) -> str:
+    """The reverse of neutralize, so a reply that kept the backslash and one that dropped it compare equal."""
+    return "".join(_ESCAPED_MARKER_LINE.sub(r"\1", line) for line in text.splitlines(keepends=True))
+
+
 def job_output(text: str, mid: str = "") -> str:
-    """The say job's whole output: the relay line, then the message between the start and end markers."""
+    """The say job's whole output: the relay line, then the message between the start and end markers. A line of
+    the message that starts with a marker is neutralized (neutralize); the message id still comes from TEXT."""
     head = INSTRUCTION.format(tag=tag_for(mid or msg_id("", text)), owner=phconf.owner())
-    return f"{head}\n{START}\n{text}\n{END}"
+    return f"{head}\n{START}\n{neutralize(text)}\n{END}"
 
 
 def next_output() -> str | None:
@@ -375,8 +395,9 @@ def bot_chat_replies(home: Path | None = None) -> list[str] | None:
 
 
 def _norm(text: str) -> str:
-    """Compare text the way it reads: markers the Bot may have kept, and whitespace, do not count."""
-    text = text.strip()
+    """Compare text the way it reads: markers the Bot may have kept, whitespace and the backslash neutralize puts in
+    front of a marker line do not count. Applied to the reply and to the queued text alike."""
+    text = _unescape(text).strip()
     if text.startswith(START):
         text = text[len(START):]
     if text.endswith(END):
