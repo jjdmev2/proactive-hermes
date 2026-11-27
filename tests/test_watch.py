@@ -83,7 +83,9 @@ class WatchTests(unittest.TestCase):
         self.run.calls.clear()
         result = jobs.apply(cli.phconf.load(), run=self.run)
         self.assertEqual([row["action"] for row in result if row["job"].startswith("Proactive · watch:")], ["keep"])
-        self.assertEqual([a[2] for a in self.run.calls], ["list"])
+        edits = [a for a in self.run.calls if a[2] != "list"]
+        self.assertCountEqual([a[2:4] for a in edits], [["edit", owned] for owned in self.run.live])
+        self.assertTrue(all("--schedule" not in a and "--timezone" not in a for a in edits))
         self.run.live["abcdef123456"] = ["unrelated job"]
         self.assertEqual(self.command(["watch", "remove", "--name", "Card drop"])[0], 0)
         self.assertEqual(set(self.run.live), {"abcdef123456"})   # no watch and nothing else: no say job either
@@ -207,7 +209,7 @@ class WatchTests(unittest.TestCase):
         cfg["authority"]["never"].append("alarms")
         self.run.calls.clear()
         jobs.apply(cfg, run=self.run)
-        self.assertEqual([a[2] for a in self.run.calls if a[2] != "list"], ["pause", "edit", "resume"])
+        self.assertEqual([a[2] for a in self.run.calls if a[2] != "list" and a[3] == jid], ["pause", "edit", "resume"])
         self.assertEqual(self.run.job("Proactive · watch: Card drop"), jid)
         argv = self.run.live[jid]
         updated = argv[argv.index("--prompt") + 1]

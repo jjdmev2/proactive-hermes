@@ -715,11 +715,13 @@ class JobTests(unittest.TestCase):
         self.assertTrue((self.home / "scripts" / "proactive-hermes" / "lookahead_gate.py").is_file())
         self.assertTrue((self.home / "scripts" / "proactive-hermes" / "ea_lookahead.py").is_file())
 
-    def test_reapply_is_a_no_op_and_installed_contract_has_the_sections(self):
+    def test_reapply_does_not_reschedule_and_installed_contract_has_the_sections(self):
         jobs.apply(self.cfg, run=self.run)
         self.run.calls.clear()
         jobs.apply(self.cfg, run=self.run)
-        self.assertFalse([argv for argv in self.run.calls if argv[2] != "list"])
+        edits = [argv for argv in self.run.calls if argv[2] != "list"]
+        self.assertCountEqual([argv[2:4] for argv in edits], [["edit", jid] for jid in self.run.live])
+        self.assertTrue(all("--schedule" not in argv and "--timezone" not in argv for argv in edits))
         contract = (self.home / "scripts" / "proactive-hermes" / "desk-contract.md").read_text()
         for heading in ("### Closing items", "### Look ahead like Dots"):
             self.assertIn(heading, contract)
@@ -730,7 +732,7 @@ class JobTests(unittest.TestCase):
         self.cfg["schedule"]["lookahead"] = "*/15 8-20 * * *"
         self.run.calls.clear()
         jobs.apply(self.cfg, run=self.run)
-        (edit,) = [argv for argv in self.run.calls if argv[2] == "edit"]
+        (edit,) = [argv for argv in self.run.calls if argv[2] == "edit" and "--schedule" in argv]
         self.assertEqual(edit[edit.index("--schedule") + 1], "*/15 8-20 * * *")
         self.assertIn("proactive-hermes:proactive-desk", [edit[i + 1] for i, a in enumerate(edit) if a == "--skill"])
 

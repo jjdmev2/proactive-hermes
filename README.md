@@ -125,7 +125,9 @@ First you pick a starting point:
 
 Hermes starts from what it already knows (your name, timezone, connected mail, calendar, Slack, Linear, OpenAI key) and asks only what is missing, one question at a time: quiet hours, holiday countries, channels to watch, when your team's daily is. It also asks what it may do without asking you (see [approval levels](#approval-levels)) and suggests two or three first watches.
 
-You see every job and its times before anything is created. At the end it sends a test message. Run setup again any time; it updates the same jobs.
+You see every job and its times before anything is created. At the end it sends a test message.
+
+Setup resets the Proactive jobs it owns to the plugin's settings. Pause and resume are the only manual cron edits it keeps. Change behavior through `hermes proactive setup`. Desk schedules must recur: use an interval or a cron expression, not a delay or a date.
 
 ### Instant mail push (optional)
 
@@ -343,7 +345,7 @@ Everything the plugin touches outside its own folder:
 - **Other Hermes files, read only:** the cron job list and job output (health checks, and the saved runs of a job setup replaces, see "Your jobs"), your `USER.md` memory (your name, at setup) and `config.yaml` (plugin settings, and the `platform_toolsets.cron` list for one warning line at setup).
 - **Files it writes outside the plugin folder:** `scripts/proactive-hermes/`, `plugin-data/proactive-hermes/` and `logs/proactive-hermes-mail-push.log`, all in your Hermes home.
 - **Shell commands:** `himalaya`, the google-workspace skill’s scripts, `hermes cron` (including public list and execution history), and `hermes gateway status` (doctor). The desk does not auto-archive sessions: Hermes’s `--title` filter matches substrings, not job ownership.
-- **Your jobs.** Setup journals a unique staging name before creating a job, records its ID before arming its final settings, and resumes interrupted creation without adopting a same-name job. Setup preserves manual pauses and repairs drift visible in `hermes cron list --all`. It removes the script-only say, health and tick jobs without archiving their output. For retired agent jobs, it saves the listed attempts and verifies the size and checksum of copied output in `plugin-data/proactive-hermes/job-history/`. If Hermes caps the list at 500 or the copy cannot be verified, the old job stays paused and the replacement does not wait for it. Setup, remove and watch changes are serialized per profile.
+- **Your jobs.** Setup journals a unique staging name before creating a job, records its ID before arming its final settings, and resumes interrupted creation without adopting a same-name job. It removes the script-only say, health and tick jobs without archiving their output. For retired agent jobs, it saves the listed attempts and verifies the size and checksum of copied output in `plugin-data/proactive-hermes/job-history/`. If Hermes caps the list at 500 or the copy cannot be verified, the old job stays paused and the replacement does not wait for it. Setup, remove and watch changes are serialized per profile.
 - **Slack and Linear** through your Hermes connectors. Sending waits for your yes.
 - **A logged-in browser** for watches on the sites you signed in to yourself, and for bookings you approve. Scheduled jobs are instructed not to book or pay and have no booking or payment authority by default.
 

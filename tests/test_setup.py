@@ -81,7 +81,47 @@ class FakeCron:
                 result += "    Mode:      no-agent (script stdout delivered directly)\n"
             if timezone := self.option(jid, '--timezone'):
                 result += f"    Timezone:  {timezone}\n"
+            for label, flags in (("Monitor", ("--monitor-script", "--monitor-url")), ("Python", ("--interpreter",)),
+                                 ("Workdir", ("--workdir",)), ("Grace", ("--grace-minutes",))):
+                if value := next((self.option(jid, flag) for flag in flags if self.option(jid, flag)), None):
+                    result += f"    {label}:  {value}\n"
         return result + "\n"
+
+    def edit_options(self, jid, flags):
+        """Merge an edit like Hermes: omitting a flag leaves its old value alone."""
+        before = self.live[jid]
+        groups = ({"--agent", "--no-agent"}, {"--wrap-response", "--no-wrap-response", "--inherit-wrap-response"},
+                  {"--continuity", "--no-continuity"})
+        switches = set().union(*groups, {"--clear-skills", "--pin", "--unpin"})
+        if before[2:3] != ["edit"]:
+            cut = before.index("--")
+            start = 3 if before[2:3] == ["create"] else 1
+            before = [*before[start:cut], "--schedule", before[cut + 1], "--prompt", before[-1]]
+            if "--paused" in before:
+                before.remove("--paused")
+        else:
+            before = before[4:]
+
+        def pairs(args):
+            it = iter(args)
+            return [(flag, None if flag in switches else next(it)) for flag in it]
+
+        options = dict(pairs(before))
+        options.pop("--skill", None)
+        for flag, value in pairs(flags):
+            if group := next((group for group in groups if flag in group), None):
+                for other in group:
+                    options.pop(other, None)
+            if flag in {"--pin", "--unpin"}:
+                options.update({"--model": "fixture-model" if flag == "--pin" else "",
+                                "--provider": "nous" if flag == "--pin" else ""})
+            elif flag in {"--skill", "--add-skill", "--remove-skill", "--clear-skills"}:
+                continue  # skills are stored separately below, including repeated flags
+            else:
+                options[flag] = value
+        self.live[jid] = ["hermes", "cron", "edit", jid, *(
+            item for flag, value in options.items() for item in ((flag,) if value is None else (flag, value)))]
+        self.names[jid] = options["--name"]
 
     def manual_edit(self, jid, **options):
         argv = self.live[jid].copy()
@@ -131,16 +171,25 @@ class FakeCron:
             stdout = f"Created job: {jid}\n  Name: Proactive · fixture\n  ⚠  Scheduler is not ready.\n"
         elif action == "edit":
             jid = argv[3]
-            if "--name" in argv:
-                self.live[jid] = argv   # an edit keeps enabled_toolsets (verified against Hermes)
-                self.names[jid] = argv[argv.index("--name") + 1]
-            else:
-                self.manual_edit(jid, **{flag[2:]: value for flag, value in zip(argv[4::2], argv[5::2])})
+            self.edit_options(jid, argv[4:])  # edits keep enabled_toolsets
             supplied_skills = [argv[i + 1] for i, arg in enumerate(argv[4:], 4) if arg == "--skill"]
             if "--clear-skills" in argv:
                 self.skills.pop(jid, None)
             elif supplied_skills:
                 self.skills[jid] = supplied_skills
+            elif "--add-skill" in argv or "--remove-skill" in argv:
+                current = self.skills.get(jid, []).copy()
+                for i, arg in enumerate(argv[4:], 4):
+                    if arg == "--add-skill" and argv[i + 1] not in current:
+                        current.append(argv[i + 1])
+                    elif arg == "--remove-skill" and argv[i + 1] in current:
+                        current.remove(argv[i + 1])
+                if current:
+                    self.skills[jid] = current
+                else:
+                    self.skills.pop(jid, None)
+            for skill in self.skills.get(jid, []):
+                self.live[jid].extend(("--skill", skill))
             if "--repeat" in argv:
                 self.set_repeat(jid, int(argv[argv.index("--repeat") + 1]))
             stdout = f"Updated job: {jid}\n"
@@ -185,7 +234,7 @@ class JobSetupTests(unittest.TestCase):
     def by_name(self):
         return {self.run.option(jid, "--name"): jid for jid in self.run.live}
 
-    def test_first_apply_creates_local_script_jobs_then_second_apply_is_read_only(self):
+    def test_first_apply_creates_local_script_jobs_then_second_apply_edits_in_place(self):
         self.assertEqual([r["action"] for r in jobs.apply(self.cfg, run=self.run)].count("create"), 3)
         for name, jid in self.by_name().items():
             script = self.SCRIPTS[name]
@@ -202,10 +251,12 @@ class JobSetupTests(unittest.TestCase):
         self.assertTrue((self.home / "plugin-data" / "proactive-hermes" / "jobs.json").is_file())
         self.run.calls.clear()
         jobs.apply(self.cfg, run=self.run)
-        self.assertFalse([argv for argv in self.run.calls if argv[2] != "list"])
+        edits = [argv for argv in self.run.calls if argv[2] != "list"]
+        self.assertCountEqual([argv[2:4] for argv in edits], [["edit", jid] for jid in self.run.live])
+        self.assertTrue(all("--schedule" not in argv and "--timezone" not in argv for argv in edits))
         self.assertEqual(len(self.run.live), 3)
 
-    def test_equivalent_listed_schedules_need_no_cron_write(self):
+    def test_equivalent_listed_schedules_get_flags_only_edits(self):
         for saved, listed in (("10m", "every 10m"), ("every 2h", "every 120m"),
                               ("7 * * * *", "7  *\t* * *")):
             with self.subTest(saved=saved, listed=listed):
@@ -218,7 +269,70 @@ class JobSetupTests(unittest.TestCase):
                 kept = {row["job"] for row in rows if row["action"] == "keep"}
                 self.assertEqual(kept, {jobs.ph_jobs.job_name(key) for key in jobs.ph_jobs.expected(self.cfg)})
                 self.assertLessEqual({row["action"] for row in rows}, {"keep", "skip"})
-                self.assertTrue(all(argv[2] == "list" for argv in self.run.calls), self.run.calls)
+                edits = [argv for argv in self.run.calls if argv[2] != "list"]
+                self.assertCountEqual([argv[2:4] for argv in edits], [["edit", jid] for jid in self.run.live])
+                self.assertTrue(all("--schedule" not in argv and "--timezone" not in argv for argv in edits))
+
+    def test_repeat_count_at_new_limit_does_not_override_public_pause(self):
+        jobs.apply(self.cfg, run=self.run)
+        say = self.run.job("Proactive · say")
+        self.run.states[say] = "paused"
+        self.run.repeats[say] = "1/1"
+        jobs.apply(self.cfg, run=self.run)
+        self.assertEqual(self.run.job("Proactive · say"), say)
+        self.assertEqual(self.run.states[say], "paused")
+        self.assertNotIn(say, self.run.repeats)
+
+    def test_equivalent_saved_schedule_preserves_fingerprint_and_needs_no_timing_edit(self):
+        self.cfg["schedule"]["say"] = "every 2h"
+        jobs.apply(self.cfg, run=self.run, publish=lambda: cli.write_config(self.cfg))
+        first = self.registry()["say"]
+        self.cfg["schedule"]["say"] = "every 120m"
+        self.run.calls.clear()
+        jobs.apply(self.cfg, run=self.run, publish=lambda: cli.write_config(self.cfg))
+        self.assertEqual(self.registry()["say"], first)
+        calls = [a for a in self.run.calls if a[3:4] == [first["id"]]]
+        self.assertEqual([a[2] for a in calls], ["edit"])
+        self.assertNotIn("--schedule", calls[0])
+        self.assertNotIn("--timezone", calls[0])
+        self.assertEqual(cli.phconf.load()["schedule"]["say"], "every 120m")
+
+    def test_upgrade_old_schedule_digest_does_not_reanchor_the_same_interval(self):
+        self.cfg["schedule"]["say"] = "every 2h"
+        jobs.apply(self.cfg, run=self.run, publish=lambda: cli.write_config(self.cfg))
+        original = self.registry()
+        old = self.registry()
+        fields, _ = jobs._fields_by_key(self.cfg)["say"]
+        old["say"]["spec"] = jobs._fingerprint(fields)  # round 10 hashed the raw schedule
+        self.assertNotEqual(original["say"]["spec"], old["say"]["spec"])
+        jobs._save_registry(old)
+        self.cfg["schedule"]["say"] = "every 120m"
+        self.run.calls.clear()
+        jobs.apply(self.cfg, run=self.run, publish=lambda: cli.write_config(self.cfg))
+        self.assertEqual(self.registry(), original)
+        edits = [a for a in self.run.calls if a[3:4] == [original["say"]["id"]]]
+        self.assertEqual([a[2] for a in edits], ["edit"])
+        self.assertNotIn("--schedule", edits[0])
+        self.assertNotIn("--timezone", edits[0])
+
+    def test_setup_cli_rejects_one_shot_infrastructure_schedules_before_publish(self):
+        parser = argparse.ArgumentParser()
+        cli.setup_parser(parser)
+        path = self.home / "answers.json"
+        apply = jobs.apply
+        for key, value in (("say", "in 2h"), ("health", "2099-01-01T12:00:00+00:00"),
+                           ("tick", "2099-01-01"), ("mail_radar", "IN 5m"), ("morning_brief", "in 10m")):
+            path.write_text(json.dumps({"schedule": {key: value}}))
+            for flags in ([], ["--dry-run"]):
+                with self.subTest(key=key, flags=flags), redirect_stderr(StringIO()) as err:
+                    args = parser.parse_args(["setup", "--preset", "custom", "--answers", str(path), *flags])
+                    with patch.object(jobs, 'apply', wraps=lambda cfg, **kw: apply(cfg, run=self.run, **kw)):
+                        rc = cli.handle(args)
+                    self.assertEqual(rc, 2)
+                    self.assertIn(f"schedule.{key} must be recurring", err.getvalue())
+                    self.assertFalse(cli.phconf.config_path().exists())
+                    self.assertFalse(jobs._registry().exists())
+                    self.assertEqual(self.run.calls, [])
 
     def test_recurring_repeat_and_skills_drift_preserve_only_manual_pause(self):
         jobs.apply(self.cfg, run=self.run)
@@ -850,12 +964,14 @@ class JobSetupTests(unittest.TestCase):
         self.assertEqual(self.run.states.get(new, "active"), "active")
         self.assertTrue(self.kept(old, "2026-11-20_08-00-00.md").is_file())
         self.run.calls.clear()
-        self.settle()   # and now a no-op
-        self.assertEqual([a[2] for a in self.run.calls], ["list"])
+        self.settle()  # edit the same IDs without moving their schedules
+        edits = [a for a in self.run.calls if a[2] != "list"]
+        self.assertCountEqual([a[2:4] for a in edits], [["edit", jid] for jid in self.run.live])
+        self.assertTrue(all("--schedule" not in a and "--timezone" not in a for a in edits))
 
     def test_interrupt_while_the_new_job_is_half_made_removes_the_setup_temp_job(self):
         path, old = self._old_radar()
-        dying = self.interrupt_on("edit", when=lambda argv: argv[3] != old)
+        dying = self.interrupt_on("edit", when=lambda argv: "Proactive · mail radar" in argv and argv[3] != old)
         with self.assertRaises(KeyboardInterrupt):
             jobs.apply(self.cfg, run=dying)
         self.assertEqual(len(self.setup_names()), 1)               # the temp job is still there
@@ -883,7 +999,7 @@ class JobSetupTests(unittest.TestCase):
 
     def test_a_paused_radar_stays_paused_after_an_interrupted_replace(self):
         path, old = self._old_radar(state="paused")
-        dying = self.interrupt_on("edit", when=lambda argv: argv[3] != old)
+        dying = self.interrupt_on("edit", when=lambda argv: "Proactive · mail radar" in argv and argv[3] != old)
         with self.assertRaises(KeyboardInterrupt):
             jobs.apply(self.cfg, run=dying)
         self.assertFalse(self.registry()["replacing"]["mail_radar"]["was_active"])
@@ -971,7 +1087,7 @@ class JobSetupTests(unittest.TestCase):
 
     def test_remove_all_also_removes_the_jobs_of_an_interrupted_swap(self):
         path, old = self._old_radar()
-        dying = self.interrupt_on("edit", when=lambda argv: argv[3] != old)
+        dying = self.interrupt_on("edit", when=lambda argv: "Proactive · mail radar" in argv and argv[3] != old)
         with self.assertRaises(KeyboardInterrupt):
             jobs.apply(self.cfg, run=dying)
         self.run.live["abcdef123456"] = ["someone else's job"]
@@ -1284,7 +1400,7 @@ class JobSetupTests(unittest.TestCase):
         jobs.apply(self.cfg, run=self.run)
         edits = [argv for argv in self.run.calls if argv[2] == "edit"]
         self.assertEqual({argv[3] for argv in edits}, managed)
-        self.assertTrue(any(argv[argv.index("--schedule") + 1] == "13 * * * *" for argv in edits))
+        self.assertTrue(any("--schedule" in argv and argv[argv.index("--schedule") + 1] == "13 * * * *" for argv in edits))
         for argv in edits:
             self.assertEqual(argv[argv.index("--timezone") + 1], "Asia/Tokyo")
         self.assertEqual(set(self.run.live), managed)
@@ -1297,7 +1413,9 @@ class JobSetupTests(unittest.TestCase):
         del self.run.live[first]
         self.run.calls.clear()
         jobs.apply(self.cfg, run=self.run)
-        self.assertEqual([a[2] for a in self.run.calls if a[2] != "list"], ["create", "edit", "resume"])
+        mutations = [a for a in self.run.calls if a[2] != "list"]
+        self.assertEqual([a[2] for a in mutations if a[2] != "edit" or a[3] not in rest], ["create", "edit", "resume"])
+        self.assertCountEqual([a[3] for a in mutations if a[2] == "edit" and a[3] in rest], rest)
         for jid in rest:
             self.assertIn(jid, self.run.live)
         self.assertNotIn(first, self.run.live)
@@ -1319,7 +1437,9 @@ class JobSetupTests(unittest.TestCase):
         self.assertEqual({key: entry["id"] for key, entry in json.loads(path.read_text()).items()}, ids)
         self.run.calls.clear()
         jobs.apply(self.cfg, run=self.run)
-        self.assertEqual([argv[2] for argv in self.run.calls], ["list"])
+        edits = [a for a in self.run.calls if a[2] != "list"]
+        self.assertCountEqual([a[2:4] for a in edits], [["edit", jid] for jid in ids.values()])
+        self.assertTrue(all("--schedule" not in a and "--timezone" not in a for a in edits))
 
     def test_parse_created_id(self):
         self.assertEqual(jobs._created_job_id("notice\nCreated job: 2ec52da04420\n  Name: x\n"), "2ec52da04420")

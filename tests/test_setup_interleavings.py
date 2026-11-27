@@ -21,6 +21,18 @@ SEEDS = (0x8FECE, 0x2701, 0x2702, 0x2703, 0x2704, 0x2705, 0x2706)
 STEPS = 360
 BAD_SCHEDULE = 'not a schedule'
 WATCHES = ('Coffee beans', 'Card drop', 'Spare parts')
+# The public cron edit surface, including alternate ways to modify the same field.
+PUBLIC_EDITS = (
+    ('--name', 'Owner renamed this job'), ('--schedule', '9 9 * * *'), ('--schedule', 'in 2h'),
+    ('--prompt', 'Owner prompt'), ('--deliver', 'local'), ('--failure-deliver', 'bot-chat'),
+    ('--repeat', '3'), ('--catch-up', 'on'), ('--wrap-response',), ('--inherit-wrap-response',),
+    ('--skill', 'fixture-skill'), ('--add-skill', 'fixture-extra'), ('--clear-skills',),
+    ('--remove-skill', 'proactive-hermes:proactive-desk'), ('--script', 'fixture.py'),
+    ('--continuity',), ('--monitor-script', 'fixture.py'), ('--monitor-url', 'https://example.com/monitor'),
+    ('--workdir', '/fixture'), ('--pin',), ('--model', 'fixture-model'), ('--provider', 'nous'),
+    ('--reasoning-effort', 'high'), ('--interpreter', '/fixture/python'), ('--timezone', 'Asia/Tokyo'),
+    ('--grace-minutes', '0'), ('--agent',), ('--no-agent', '--script', 'fixture.py'),
+)
 
 
 class FaultCron(FakeCron):
@@ -100,6 +112,24 @@ class FenceInterleavings(unittest.TestCase):
         self.assertEqual(self.host.skills.get(jid, []), fields.get('skills', []))
         self.assertNotIn(jid, self.host.repeats)
 
+    def check_public_spec(self, jid, fields):
+        self.check_job(jid, fields)
+        options = {
+            '--failure-deliver': 'local', '--catch-up': 'off', '--script': fields['script'] or '',
+            '--timezone': fields['timezone'] or '', '--monitor-script': '', '--monitor-url': '',
+            '--workdir': '', '--model': '', '--provider': '', '--reasoning-effort': '',
+            '--interpreter': '', '--grace-minutes': '',
+        }
+        for flag, expected in options.items():
+            self.assertEqual(self.host.option(jid, flag) or '', expected, (jid, flag))
+        argv = self.host.live[jid]
+        self.assertIn('--no-wrap-response', argv)
+        self.assertNotIn('--wrap-response', argv)
+        self.assertNotIn('--inherit-wrap-response', argv)
+        self.assertIn('--no-continuity', argv)
+        self.assertNotIn('--continuity', argv)
+        self.assertEqual('--no-agent' in argv, fields['no_agent'])
+
     def assert_invariant(self, *, removed=False):
         config = cli.phconf.load()
         wanted = {} if removed else self.wanted(config)
@@ -141,6 +171,58 @@ class FenceInterleavings(unittest.TestCase):
         for seed in SEEDS:
             with self.subTest(seed=hex(seed)), temporary_home():
                 self.run_seed(seed)
+
+    def test_seeded_public_edits_are_all_reset_except_pause_and_resume(self):
+        for seed in SEEDS:
+            with self.subTest(seed=hex(seed)), temporary_home():
+                cfg = self.reset_world()
+                cfg = cli.apply_answers(cfg, {'features': {'lookahead': True}, 'mail': {'gmail_api': True}})
+                wanted = self.wanted(cfg)
+                self.apply_config(cfg)
+                ids = {key: jobs._load_registry()[key]['id'] for key in wanted}
+                rng = random.Random(seed ^ 0xC20A)
+                edits = list(PUBLIC_EDITS)
+                rng.shuffle(edits)
+                exercised = Counter()
+                pauses = set()
+                for flags in edits:
+                    flag = flags[0]
+                    allowed = list(wanted)
+                    if flag in {'--monitor-script', '--monitor-url', '--clear-skills', '--remove-skill',
+                                '--no-agent', '--deliver', '--continuity'}:
+                        allowed = ['lookahead'] if flag != '--deliver' else ['say']
+                    elif flag == '--agent':
+                        allowed = ['say']
+                        flags = (*flags, '--prompt', 'Owner prompt while agent is enabled')
+                    key = rng.choice(allowed)
+                    jid = ids[key]
+                    with self.subTest(flag=flag, key=key):
+                        if rng.randrange(2):
+                            if jid in pauses:
+                                self.host(['hermes', 'cron', 'resume', jid], env=os.environ)
+                                pauses.remove(jid)
+                                exercised['resume'] += 1
+                            else:
+                                self.host(['hermes', 'cron', 'pause', jid], env=os.environ)
+                                pauses.add(jid)
+                                exercised['pause'] += 1
+                        self.host(['hermes', 'cron', 'edit', jid, *flags], env=os.environ)
+                        # These one-shot edits may derive a finite repeat limit in the host.
+                        if flags == ('--schedule', 'in 2h'):
+                            self.host.set_repeat(jid, 1)
+                        self.apply_config(cfg)
+                        self.assert_invariant()
+                        for current_key, (fields, spec) in wanted.items():
+                            entry = jobs._load_registry()[current_key]
+                            current = ids[current_key]
+                            self.assertEqual(entry, {'id': current, **spec})
+                            self.assertEqual(self.host.states[current], 'paused' if current in pauses else 'active')
+                            self.check_public_spec(current, fields)
+                        exercised[flag] += 1
+                self.assertEqual({edit[0] for edit in edits}, exercised.keys() - {'pause', 'resume'})
+                self.assertGreater(exercised['pause'], 0)
+                self.assertGreater(exercised['resume'], 0)
+                print(f'\npublic edits seed={seed:#x} exercised={dict(sorted(exercised.items()))}', file=self.report)
 
     def run_seed(self, seed):
         self.reset_world()

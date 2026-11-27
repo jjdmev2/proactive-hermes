@@ -478,8 +478,13 @@ def handle(args) -> int:
         print("No terminal and no --answers file: run the setup skill in chat, or pass --answers.")
         return 2
     if args.dry_run:
+        try:
+            rows = jobs.apply(cfg, dry_run=True)
+        except jobs.OneShotSchedule as exc:
+            print(f"Setup: {exc}", file=sys.stderr)
+            return 2
         print(json.dumps(cfg, indent=1))
-        for row in jobs.apply(cfg, dry_run=True):
+        for row in rows:
             if row["action"] not in ("keep", "skip"):
                 print(f"  would {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
         return 0
@@ -503,6 +508,9 @@ def handle(args) -> int:
         with jobs.registry_lock():   # one setup, remove or watch change at a time: config.json and the jobs together
             cfg["watches"] = phconf.load()["watches"]   # a watch added while the questions were open is kept
             rows = jobs.apply(cfg, publish=publish)
+    except jobs.OneShotSchedule as exc:
+        print(f"Setup: {exc}", file=sys.stderr)
+        return 2
     except (jobs.IncompatibleHermes, jobs.UnsafeRuntimeDestination) as exc:
         print(f"Setup: {exc}", file=sys.stderr)
         return 1

@@ -3,9 +3,10 @@
 Each job is owned by the plugin: its id is recorded in <plugin-data>/jobs.json and its name starts
 with "Proactive ·". `apply()` installs the runtime scripts under HERMES_HOME/scripts/proactive-hermes
 (cron gate scripts must live under HERMES_HOME/scripts), renders the prompts from config.json, and
-creates, updates or removes jobs so the set always matches the enabled features. Running it twice
-changes nothing. Only jobs recorded in jobs.json are ever edited, replaced or removed; a job is never
-adopted because its name or settings match. Before any change it checks that Hermes's public cron API
+creates, updates or removes jobs so the set always matches the enabled features. Setup re-applies
+each job's public settings, preserving an owner's pause. Only jobs recorded in jobs.json are ever edited,
+replaced or removed; a job is never adopted because its name or settings match. Before any change it
+checks that Hermes's public cron API
 for plugins (cron.plugin_api) is there, and the say job is created first. A job swap (new toolsets) is written
 to the registry as a `replacing` record before the old job is touched. Recovery applies the current config
 before archiving saved runs of retired jobs under <plugin-data>/job-history/.
@@ -15,6 +16,7 @@ from __future__ import annotations
 import fcntl
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime
 import json
 import logging
 import os
@@ -654,7 +656,8 @@ def _job_listing(run) -> dict[str, dict]:
         end = headers[i + 1].start() if i + 1 < len(headers) else len(output)
         block = re.split(r"^    (?:Last run|Dispatch|Execution):", output[header.end():end], maxsplit=1, flags=re.M)[0]
         rows[jid] = {"state": state, **dict(re.findall(
-            r"^    (Name|Schedule|Repeat|Deliver|Skills|Script|Mode|Timezone|Prompt|Toolsets|Enabled toolsets): +([^\n]*)",
+            r"^    (Name|Schedule|Repeat|Deliver|Skills|Script|Mode|Timezone|Monitor|Grace|Workdir|Python|"
+            r"Prompt|Toolsets|Enabled toolsets): +([^\n]*)",
             block, re.M))}
     if not rows and not re.search(r"^No scheduled jobs\b", output, re.M):
         raise RuntimeError("Could not read job IDs from `hermes cron list --all`.")
@@ -673,7 +676,7 @@ def _canonical_schedule(schedule: str) -> str:
     if duration:
         amount, unit = duration.groups()
         return f"every {int(amount or '1') * {'m': 1, 'h': 60, 'd': 1440}[unit[0]]}m"
-    return text
+    return text.lower()  # named cron fields and weekday phrases are case-insensitive
 
 
 def _repeat_count(live: dict) -> tuple[int, int] | None:
@@ -682,38 +685,40 @@ def _repeat_count(live: dict) -> tuple[int, int] | None:
     return None
 
 
-def _completed(live: dict) -> bool:
-    repeat = _repeat_count(live)
-    return live["state"] == "completed" or (repeat is not None and repeat[0] >= repeat[1])
+def _timing_options(live: dict, fields: dict) -> list[str]:
+    """Both flags recompute next_run_at in Hermes, even when given the existing value."""
+    argv = []
+    if _canonical_schedule(live.get("Schedule", "")) != _canonical_schedule(fields["schedule"]):
+        argv.extend(["--schedule", fields["schedule"]])
+    if live.get("Timezone", "").strip() != (fields["timezone"] or ""):
+        argv.extend(["--timezone", fields["timezone"] or ""])
+    return argv
 
 
 def _live_drift(live: dict, fields: dict) -> str | None:
-    """Compare what the public listing exposes. Current Hermes omits prompt and toolsets.
-
-    A manual pause is intentional; setup edits a paused job without arming it. An optional
-    row absent from an otherwise complete block (e.g. Script) means it is not configured.
-    """
+    """Recognize visible drift for fencing and preview, never to skip the full edit."""
     if not live:
         return None
-    if live["state"] not in {"active", "paused"} or _completed(live):
+    # Only the public state distinguishes a real pause from a terminal job. A paused
+    # job may show a historical count at or above a newly edited repeat limit.
+    if live["state"] not in {"active", "paused"}:
         return "replace"
     if (label := next((key for key in ("Enabled toolsets", "Toolsets") if key in live), None)) is not None:
         observed = {value.strip() for value in live[label].split(",") if value.strip()}
         if observed != set(fields.get("enabled_toolsets") or ()):
             return "replace"  # cron edit cannot change the immutable toolset list
-    if _repeat_count(live) is not None:
+    if _repeat_count(live) is not None or any(live.get(label) for label in ("Monitor", "Grace", "Workdir", "Python")):
         return "update"
     for label, key in (("Name", "name"), ("Deliver", "deliver"), ("Prompt", "prompt")):
         if label in live and live[label].strip() != fields[key].strip():
             return "update"
     if "Schedule" in live:
-        if _canonical_schedule(live["Schedule"]) != _canonical_schedule(fields["schedule"]):
+        if _timing_options(live, fields):
             return "update"
         skills = [skill.strip() for skill in live.get("Skills", "").split(",") if skill.strip()]
         if skills != fields.get("skills", []):
             return "update"
-        if any(live.get(label, "").strip() != (fields[key] or "").strip()
-               for label, key in (("Script", "script"), ("Timezone", "timezone"))):
+        if live.get("Script", "").strip() != (fields["script"] or ""):
             return "update"
         if live.get("Mode", "").startswith("no-agent ") != fields["no_agent"]:
             return "update"
@@ -813,15 +818,22 @@ def _resume(run, jid: str) -> None:
 
 def _options(fields: dict, *, edit: bool) -> list[str]:
     argv = ["--name", fields["name"], "--deliver", fields["deliver"],
-            "--failure-deliver", fields["failure_deliver"], "--no-wrap-response", "--catch-up", "off"]
+            "--failure-deliver", fields["failure_deliver"],
+            "--wrap-response" if fields["wrap_response"] else "--no-wrap-response",
+            "--catch-up", "on" if fields["catch_up"] else "off", "--repeat", "0"]
     if edit:
-        argv.extend(["--repeat", "0"])  # the CLI's unlimited repeat count
+        # Explicitly reset every optional override the CLI can clear. The empty
+        # model and provider together release a pin; continuity only clears self.
+        for flag in ("monitor-script", "monitor-url", "workdir", "model", "provider",
+                     "reasoning-effort", "interpreter", "grace-minutes"):
+            argv.extend([f"--{flag}", ""])
+        argv.append("--no-continuity")
         if not fields.get("skills"):
             argv.append("--clear-skills")
     for skill in fields.get("skills", []):
         argv.extend(["--skill", skill])
-    if fields["timezone"] or edit:
-        argv.extend(["--timezone", fields["timezone"] or ""])
+    if fields["timezone"] and not edit:
+        argv.extend(["--timezone", fields["timezone"]])
     if fields["script"] or edit:
         argv.extend(["--script", fields["script"] or ""])
     if fields["no_agent"]:
@@ -831,8 +843,8 @@ def _options(fields: dict, *, edit: bool) -> list[str]:
     return argv
 
 
-def _edit(run, jid: str, fields: dict) -> None:
-    output = _cron(run, "edit", jid, "--schedule", fields["schedule"], "--prompt", fields["prompt"],
+def _edit(run, jid: str, fields: dict, live: dict) -> None:
+    output = _cron(run, "edit", jid, *_timing_options(live, fields), "--prompt", fields["prompt"],
                    *_options(fields, edit=True))
     if not re.search(rf"^Updated job: {re.escape(jid)}[ \t]*$", output, re.MULTILINE):
         raise RuntimeError(f"`hermes cron edit` did not confirm updating {jid}.")
@@ -1024,7 +1036,8 @@ def _finish_create(run, ensure, reg: dict, key: str, fields: dict, spec: dict, d
         record = reg.setdefault(CREATING, {})[key] = _stage_record(fields)
         reg.pop(key, None)  # any previous current id was missing from Hermes
         _save_registry(reg)
-    states = _job_states(run)
+    listing = _job_listing(run)
+    states = {jid: job["state"] for jid, job in listing.items()}
     matches = _candidates(run, record, states)
     if len(matches) > 1:
         raise RuntimeError(f"Multiple staged jobs for {fields['name']!r}; no job activated.")
@@ -1035,7 +1048,9 @@ def _finish_create(run, ensure, reg: dict, key: str, fields: dict, spec: dict, d
     if not (_job_id(reg.get(key)) == jid and _matches_spec(reg[key], spec) and not drift):
         if (states.get(jid, "active" if toolsets is not None else "paused")) not in _FENCED_STATES:
             _pause(run, jid)
-        _publish_edit(run, reg, key, jid, fields, spec)
+        _publish_edit(run, reg, key, jid, fields, spec, listing.get(jid, {}))
+    else:
+        _edit(run, jid, fields, listing[jid])
     if _job_states(run).get(jid) == "paused":
         _resume(run, jid)
     _drop_record(reg, CREATING, key)
@@ -1105,7 +1120,7 @@ def _candidates(run, record: dict, states: dict) -> set[str]:
 
 
 def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True, paused=None, drift=None,
-                previously_active=()) -> dict[str, str]:
+                refresh=None, previously_active=()) -> dict[str, str]:
     """One scheduling fence for ordinary registry entries, swaps and first installs.
 
     Checkpoint intended re-arming before the first pause. An exception during the phase is
@@ -1126,10 +1141,19 @@ def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True, paused=None, dri
         observed = _live_drift(listing.get(jid, {}), wanted[key][0]) if spec is not None else None
         if observed and drift is not None:
             drift[key] = observed
-        matches = spec is not None and _matches_spec(entry, spec) and not observed
+        matches = spec is not None and _matches_spec(entry, spec)
         swap = swaps.get(key, {})
         stage = staged.get(key, {})
         retired = _retired_ids(swap)
+        live = listing.get(jid) if jid is not None else None
+        settled = not stage and (not swap or (jid == swap.get("new") and "arm" not in swap))
+        if (refresh is not None and matches and settled and jid not in retired and live and observed != "replace"
+                and not _timing_options(live, wanted[key][0])):
+            # Same policy and timing: a flags-only edit fixes drift atomically. Pausing and
+            # resuming just to change an override would re-anchor a future interval slot.
+            assert jid is not None
+            refresh[key] = (jid, live)
+        matches = matches and (not observed or (refresh is not None and key in refresh))
         candidates = _candidates(run, swap, states) | _candidates(run, stage, states)
         current = matches and jid not in retired and (not swap or jid == swap.get("new"))
         if stage:
@@ -1142,8 +1166,8 @@ def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True, paused=None, dri
                 reg[key] = {field: value for field, value in entry.items() if field != "spec"}
                 changed = True
             if remember and not stage and jid not in retired:
-                completed = _completed(listing[jid])
-                arm = states[jid] != "paused" or completed or jid in previously_active
+                completed = states[jid] == "completed"
+                arm = states[jid] != "paused" or jid in previously_active
                 if not swap:
                     # A content-only change can keep the same job. A toolset change cannot.
                     if spec is None or (observed != "replace" and spec.get("toolsets") ==
@@ -1177,20 +1201,23 @@ def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True, paused=None, dri
 def _safety_fence(run, wanted: dict, *, previously_active=()) -> None:
     # Retry from disk: the failed host call may have completed before reporting its failure.
     reg = _load_registry()
+    _upgrade_schedule_fingerprints(reg, wanted)
     try:
         _fence_jobs(run, reg, wanted, previously_active=previously_active)
     except OSError:
-        _fence_jobs(run, _load_registry(), wanted, remember=False)
+        reg = _load_registry()
+        _upgrade_schedule_fingerprints(reg, wanted)
+        _fence_jobs(run, reg, wanted, remember=False)
 
 
-def _publish_edit(run, reg: dict, key: str, jid: str, fields: dict, spec: dict) -> None:
+def _publish_edit(run, reg: dict, key: str, jid: str, fields: dict, spec: dict, live: dict) -> None:
     # An edit can succeed on the host and lose its receipt. Withdraw the old fingerprint
     # first, and publish the actual spec only after the edit was confirmed, before resuming.
     entry = reg.get(key)
     if isinstance(entry, dict) and "spec" in entry:
         reg[key] = {field: value for field, value in entry.items() if field != "spec"}
         _save_registry(reg)
-    _edit(run, jid, fields)
+    _edit(run, jid, fields, live)
     reg[key] = {"id": jid, **spec}
     _save_registry(reg)
 
@@ -1211,7 +1238,8 @@ def _retire_swap(run, reg: dict, key: str) -> None:
 def _configure_swap(run, ensure, reg: dict, key: str, fields: dict, spec: dict, drift=None) -> None:
     """Apply current policy to the fenced key, independently of its retired jobs' history."""
     record = reg[REPLACING][key]
-    states = _job_states(run)
+    listing = _job_listing(run)
+    states = {jid: job["state"] for jid, job in listing.items()}
     _old, new = _swap_ids(record)
     entry = reg.get(key)
     current = new in states and new not in _retired_ids(record) and _job_id(entry) == new
@@ -1232,7 +1260,10 @@ def _configure_swap(run, ensure, reg: dict, key: str, fields: dict, spec: dict, 
             if spec.get("toolsets") is not None:
                 _pause(run, new)
         assert new is not None
-        _publish_edit(run, reg, key, new, fields, spec)
+        _publish_edit(run, reg, key, new, fields, spec, listing.get(new, {}))
+    else:
+        assert new is not None
+        _edit(run, new, fields, listing[new])
     if "arm" in record:
         if new and record["arm"] and _job_states(run).get(new) == "paused":
             _resume(run, new)
@@ -1317,11 +1348,37 @@ def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None, 
     """Make the plugin's jobs match CFG. Only jobs recorded in the plugin's own registry (<plugin-data>/jobs.json)
     are ever edited, replaced or removed; a job is never adopted because its name or settings match. One run at a
     time per profile (registry_lock); a dry run only reads."""
+    _require_recurring_schedules(cfg)
     if dry_run:
         return _apply(cfg, True, run=run, ensure=ensure)
     preflight()   # before any change: no runtime, no job, no registry write on a Hermes without cron.plugin_api
     with registry_lock():
         return _apply(cfg, False, run=run, ensure=ensure, publish=publish)
+
+
+class OneShotSchedule(ValueError):
+    """A schedule intended to run only once cannot keep desk infrastructure running."""
+
+
+def _require_recurring_schedules(cfg: dict) -> None:
+    for job in JOBS:
+        key = job["key"]
+        schedule = cfg["schedule"][key].strip()
+        relative = schedule.lower().startswith(("in ", "once "))
+        timestamp = False
+        if "T" in schedule or re.match(r"^\d{4}-\d{2}-\d{2}", schedule):
+            try:
+                datetime.fromisoformat(schedule)
+                timestamp = True
+            except ValueError:
+                pass  # let the host report invalid syntax for other schedules
+        if relative or timestamp:
+            raise OneShotSchedule(f"schedule.{key} must be recurring, not {schedule!r}. "
+                                  "Use an interval like 'every 2h' or a cron expression.")
+
+
+def _fingerprint(fields: dict) -> str:
+    return sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
 
 def _job_fields(cfg: dict, job: dict) -> tuple[dict, dict]:
@@ -1344,7 +1401,8 @@ def _job_fields(cfg: dict, job: dict) -> tuple[dict, dict]:
     if toolsets is not None:
         fields["enabled_toolsets"] = toolsets
     # Cache the last applied spec, not the private prompt text.
-    spec: dict = {"spec": sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()}
+    canonical = {**fields, "schedule": _canonical_schedule(fields["schedule"])}
+    spec: dict = {"spec": _fingerprint(canonical)}
     if toolsets is not None:
         spec["toolsets"] = toolsets
     return fields, spec
@@ -1353,6 +1411,27 @@ def _job_fields(cfg: dict, job: dict) -> tuple[dict, dict]:
 def _fields_by_key(cfg: dict) -> dict:
     desired = JOBS + [watch_job(watch) for watch in cfg.get("watches", [])]
     return {job["key"]: _job_fields(cfg, job) for job in desired}
+
+
+def _upgrade_schedule_fingerprints(reg: dict, wanted: dict) -> bool:
+    """Recognize the old raw-schedule digest without pausing an equivalent cadence on upgrade."""
+    candidates = [key for key in wanted if isinstance(reg.get(key), dict) and reg[key].get("spec")
+                  and not _matches_spec(reg[key], wanted[key][1])]
+    if not candidates:
+        return False
+    saved = phconf.load()
+    schedules = {**saved["schedule"], **{f"watch:{watch['name']}": watch["schedule"] for watch in saved["watches"]}}
+    changed = False
+    for key in candidates:
+        fields, spec = wanted[key]
+        entry = reg[key]
+        old_schedule = schedules.get(key)
+        if (isinstance(old_schedule, str) and entry.get("toolsets") == spec.get("toolsets")
+                and _canonical_schedule(old_schedule) == _canonical_schedule(fields["schedule"])
+                and entry["spec"] == _fingerprint({**fields, "schedule": old_schedule})):
+            reg[key] = {**entry, **spec}
+            changed = True
+    return changed
 
 
 def _saved_config_bytes() -> bytes | None:
@@ -1370,6 +1449,7 @@ def _restore_before_publish(run, original: dict, paused: set[str]) -> None:
     fields = _fields_by_key(saved)
     wanted = {key: fields[key] for key in ph_jobs.expected(saved)}
     _safety_fence(run, wanted, previously_active=paused)
+    _upgrade_schedule_fingerprints(original, wanted)
     if not paused:
         return
     listing = _job_listing(run)
@@ -1388,7 +1468,9 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure, publish=None) -> list[dict]
     awaiting_publish = not dry_run and publish is not None
     original = deepcopy(reg) if awaiting_publish else {}
     saved = _saved_config_bytes() if awaiting_publish else None
+    upgraded = _upgrade_schedule_fingerprints(reg, wanted)
     paused, drift = set(), {}
+    refresh: dict[str, tuple[str, dict] | None] = {}
     try:
         if dry_run:
             listing = _job_listing(run) if reg else {}
@@ -1396,7 +1478,14 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure, publish=None) -> list[dict]
             drift = {key: _live_drift(listing.get(_job_id(reg.get(key)), {}), fields)
                      for key, (fields, _) in wanted.items()}
         else:
-            states = _fence_jobs(run, reg, wanted, paused=paused, drift=drift)
+            states = _fence_jobs(run, reg, wanted, paused=paused, drift=drift, refresh=refresh)
+            # A visibly drifted job already meant to follow this exact policy can
+            # be repaired without an intermediate pause. Do it before publishing.
+            for key in tuple(refresh):
+                if key in drift and (pending_edit := refresh[key]):
+                    jid, live = pending_edit
+                    _edit(run, jid, wanted[key][0], live)
+                    refresh[key] = None  # already repaired before policy publication
         removed_watches = {key for key, entry in reg.items()
                            if key.startswith("watch:") and key not in wanted and _job_id(entry) in states}
         actions = {key: _action(reg, key, wanted, states, drift.get(key)) for key in fields_by_key}
@@ -1408,7 +1497,9 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure, publish=None) -> list[dict]
             warning = toolset_warning(cfg, cron_toolsets_setting())
             if warning:
                 print(warning)
-            _apply_fenced(run, ensure, reg, wanted, states, drift)
+            _apply_fenced(run, ensure, reg, wanted, states, drift, refresh=refresh)
+            if upgraded:
+                _save_registry(reg)
     except BaseException:
         if awaiting_publish and _saved_config_bytes() == saved:
             _restore_before_publish(run, original, paused)
@@ -1452,7 +1543,7 @@ def _action(reg: dict, key: str, wanted: dict, states: dict, drift: str | None) 
     return "update" if spec.get("toolsets") == (entry.get("toolsets") if isinstance(entry, dict) else None) else "replace"
 
 
-def _apply_fenced(run, ensure, reg: dict, wanted: dict, states: dict, drift: dict) -> None:
+def _apply_fenced(run, ensure, reg: dict, wanted: dict, states: dict, drift: dict, *, refresh=None) -> None:
     for key in list(reg.get(CREATING, {})):
         if key not in wanted:
             _retire_stage(run, reg, key)
@@ -1470,7 +1561,11 @@ def _apply_fenced(run, ensure, reg: dict, wanted: dict, states: dict, drift: dic
     # Say first: every desk message reaches Bot Chat through this worker.
     for key in sorted(wanted, key=lambda key: key != "say"):
         fields, spec = wanted[key]
-        if key in reg.get(CREATING, {}):
+        if refresh is not None and key in refresh:
+            if pending_edit := refresh[key]:
+                jid, live = pending_edit
+                _edit(run, jid, fields, live)
+        elif key in reg.get(CREATING, {}):
             _finish_create(run, ensure, reg, key, fields, spec, drift.get(key))
         elif key in ph_jobs.pending_swaps(reg):
             _configure_swap(run, ensure, reg, key, fields, spec, drift.get(key))
