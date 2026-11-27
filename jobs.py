@@ -1348,7 +1348,6 @@ def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None, 
     """Make the plugin's jobs match CFG. Only jobs recorded in the plugin's own registry (<plugin-data>/jobs.json)
     are ever edited, replaced or removed; a job is never adopted because its name or settings match. One run at a
     time per profile (registry_lock); a dry run only reads."""
-    _require_recurring_schedules(cfg)
     if dry_run:
         return _apply(cfg, True, run=run, ensure=ensure)
     preflight()   # before any change: no runtime, no job, no registry write on a Hermes without cron.plugin_api
@@ -1360,7 +1359,15 @@ class OneShotSchedule(ValueError):
     """A schedule intended to run only once cannot keep desk infrastructure running."""
 
 
-def _require_recurring_schedules(cfg: dict) -> None:
+def require_recurring_schedules(cfg: dict) -> None:
+    problems = recurring_schedule_problems(cfg)
+    if problems:
+        raise OneShotSchedule(" ".join(problems))
+
+
+def recurring_schedule_problems(cfg: dict) -> list[str]:
+    """Diagnose legacy schedules without blocking status or policy revocation."""
+    problems = []
     for job in JOBS:
         key = job["key"]
         schedule = cfg["schedule"][key].strip()
@@ -1373,8 +1380,9 @@ def _require_recurring_schedules(cfg: dict) -> None:
             except ValueError:
                 pass  # let the host report invalid syntax for other schedules
         if relative or timestamp:
-            raise OneShotSchedule(f"schedule.{key} must be recurring, not {schedule!r}. "
-                                  "Use an interval like 'every 2h' or a cron expression.")
+            problems.append(f"schedule.{key} must be recurring, not {schedule!r}. "
+                            "Use an interval like 'every 2h' or a cron expression.")
+    return problems
 
 
 def _fingerprint(fields: dict) -> str:
@@ -1514,8 +1522,10 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure, publish=None) -> list[dict]
             _archive_swap(run, reg, key, retirement)
             if key in pending_before and key not in ph_jobs.pending_swaps(reg):
                 print(f"Setup: finished an interrupted job swap for {key}.")
+    # "keep" describes identity and detected drift, not a no-op: its settings were edited too.
     out = [{"job": fields["name"], "action": actions[key], "schedule": fields["schedule"],
-            "timezone": fields["timezone"]} for key, (fields, _) in fields_by_key.items()]
+            "timezone": fields["timezone"], "reapplied": not dry_run and actions[key] in ("keep", "update")}
+           for key, (fields, _) in fields_by_key.items()]
     for key in sorted(removed_watches - fields_by_key.keys()):
         out.append({"job": ph_jobs.job_name(key), "action": "remove", "schedule": "", "timezone": cfg.get("timezone")})
     if retirement.copied:

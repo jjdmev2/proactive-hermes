@@ -101,6 +101,31 @@ class ResolveHealthTests(unittest.TestCase):
             ("desk", "desk job missing: " + ", ".join("Proactive · " + name for name in missing)),
         ])
 
+    def test_manual_pause_without_a_reason_is_not_a_health_fault(self):
+        rows = [{"id": key, "name": health.ph_jobs.job_name(key)}
+                for key in health.ph_jobs.expected(health.phconf.CFG)]
+        job = next(row for row in rows if row["id"] == "morning_brief")
+        job.update(enabled=False, state="paused", paused_reason=None, last_status="failed", failure_streak=3)
+        health.check_jobs(rows)
+        self.assertEqual(health.faults, {})
+        # A stale reason isn't an intentional pause if the public state is disabled.
+        job.update(state="scheduled", paused_reason="old reason")
+        health.check_jobs(rows)
+        self.assertEqual(list(health.faults.values()), [("desk", "Proactive · morning brief: disabled")])
+
+    def test_completed_job_is_only_ignored_once_its_replacement_is_live(self):
+        rows = [{"id": key, "name": health.ph_jobs.job_name(key)}
+                for key in health.ph_jobs.expected(health.phconf.CFG)]
+        old = {"id": "old", "name": "Proactive · morning brief", "state": "completed", "enabled": False}
+        replacement = next(row for row in rows if row["id"] == "morning_brief")
+        registry = {"morning_brief": {"id": replacement["id"], "spec": "current"},
+                    health.ph_jobs.REPLACING: {"morning_brief": {"old": old["id"], "new": replacement["id"]}}}
+        with patch.object(health, "_job_registry", return_value=registry):
+            health.check_jobs([*rows, old])
+            self.assertEqual(health.faults, {})
+            health.check_jobs([row for row in [*rows, old] if row is not replacement])
+        self.assertIn(("desk", "Proactive · morning brief: disabled"), health.faults.values())
+
     def test_reminders_disabled_skips_bridge_database(self):
         with patch.object(health.reminders, "bridge") as bridge:
             health.check_device()

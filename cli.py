@@ -440,6 +440,8 @@ def handle(args) -> int:
         cfg = phconf.load()
         print(f"Config: {phconf.config_path()} ({'found' if phconf.config_path().exists() else 'not set up yet'})")
         print(f"Preset: {cfg.get('preset')}  Owner: {cfg['owner'].get('name')}  Timezone: {cfg.get('timezone')}")
+        for problem in jobs.recurring_schedule_problems(cfg):
+            print(f"  Problem: {problem}")
         for row in jobs.apply(cfg, dry_run=True):
             action = "installed" if row["action"] == "keep" else row["action"]
             print(f"  {row['job']}: {action}  {row['schedule']}")
@@ -479,6 +481,7 @@ def handle(args) -> int:
         return 2
     if args.dry_run:
         try:
+            jobs.require_recurring_schedules(cfg)
             rows = jobs.apply(cfg, dry_run=True)
         except jobs.OneShotSchedule as exc:
             print(f"Setup: {exc}", file=sys.stderr)
@@ -507,6 +510,7 @@ def handle(args) -> int:
     try:
         with jobs.registry_lock():   # one setup, remove or watch change at a time: config.json and the jobs together
             cfg["watches"] = phconf.load()["watches"]   # a watch added while the questions were open is kept
+            jobs.require_recurring_schedules(cfg)
             rows = jobs.apply(cfg, publish=publish)
     except jobs.OneShotSchedule as exc:
         print(f"Setup: {exc}", file=sys.stderr)
@@ -522,8 +526,11 @@ def handle(args) -> int:
     for row in rows:
         if row["action"] not in ("keep", "skip"):
             print(f"  {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
-    print(f"Jobs: {actions.count('create')} created, {actions.count('update')} updated, {actions.count('replace')} replaced, "
-          f"{actions.count('remove')} removed.")
+    checked = len(rows) - actions.count("skip")
+    reapplied = sum(bool(row.get("reapplied")) for row in rows)
+    print(f"Jobs: {checked} jobs checked, settings reapplied to {reapplied} in place "
+          f"({actions.count('update')} detected changes); {actions.count('create')} created, "
+          f"{actions.count('replace')} replaced, {actions.count('remove')} removed.")
     print("Done. Setup saved.")
     try:
         import ph_doctor

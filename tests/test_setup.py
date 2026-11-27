@@ -334,6 +334,28 @@ class JobSetupTests(unittest.TestCase):
                     self.assertFalse(jobs._registry().exists())
                     self.assertEqual(self.run.calls, [])
 
+    def test_setup_reports_reapplication_of_settings_hidden_from_cron_list(self):
+        parser = argparse.ArgumentParser()
+        cli.setup_parser(parser)
+        path = self.home / "answers.json"
+        path.write_text(json.dumps({"features": self.cfg["features"]}))
+        args = parser.parse_args(["setup", "--preset", "custom", "--answers", str(path)])
+        apply = jobs.apply
+        with patch.object(jobs, "apply", side_effect=lambda cfg, **kw: apply(cfg, run=self.run, **kw)), \
+                patch("ph_doctor.report", return_value={"checks": {}, "ready": False}):
+            self.assertEqual(cli.handle(args), 0)
+            health = self.run.job("Proactive · health")
+            self.run.manual_edit(health, failure_deliver="bot-chat", catch_up="on")
+            self.run.calls.clear()
+            with redirect_stdout(StringIO()) as out:
+                self.assertEqual(cli.handle(args), 0)
+        self.assertEqual(self.run.option(health, "--failure-deliver"), "local")
+        self.assertEqual(self.run.option(health, "--catch-up"), "off")
+        self.assertCountEqual([a[2:4] for a in self.run.calls if a[2] != "list"],
+                              [["edit", jid] for jid in self.run.live])
+        self.assertIn("3 jobs checked, settings reapplied to 3 in place (0 detected changes)", out.getvalue())
+        self.assertNotIn("0 updated", out.getvalue())
+
     def test_recurring_repeat_and_skills_drift_preserve_only_manual_pause(self):
         jobs.apply(self.cfg, run=self.run)
         say = self.run.job("Proactive · say")
@@ -1415,7 +1437,10 @@ class JobSetupTests(unittest.TestCase):
         jobs.apply(self.cfg, run=self.run)
         mutations = [a for a in self.run.calls if a[2] != "list"]
         self.assertEqual([a[2] for a in mutations if a[2] != "edit" or a[3] not in rest], ["create", "edit", "resume"])
-        self.assertCountEqual([a[3] for a in mutations if a[2] == "edit" and a[3] in rest], rest)
+        survivors = [a for a in mutations if a[2] == "edit" and a[3] in rest]
+        self.assertCountEqual([a[3] for a in survivors], rest)
+        for argv in survivors:
+            self.assertFalse({"--schedule", "--timezone"}.intersection(argv[4:]), argv)
         for jid in rest:
             self.assertIn(jid, self.run.live)
         self.assertNotIn(first, self.run.live)

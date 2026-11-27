@@ -92,6 +92,39 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(json.loads(self.registry.read_text()), {})
         self.assertEqual(json.loads(self.config.read_text())["watches"], [])
 
+    def test_legacy_one_shot_is_reported_but_does_not_block_removal(self):
+        cfg = cli.phconf.load()
+        cfg["features"]["health"] = True
+        cli.write_config(cfg)
+        self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
+        watch = self.run.job("Proactive · watch: Card drop")
+        health = self.run.job("Proactive · health")
+        cfg = cli.phconf.load()
+        cfg["schedule"]["health"] = "in 2h"
+        cli.write_config(cfg)
+        self.run.manual_edit(health, schedule="once in 2h")
+        self.run.repeats[health] = "0/1"
+        fields, _ = jobs._fields_by_key(cfg)["health"]
+        registry = json.loads(self.registry.read_text())
+        registry["health"] = {"id": health, "spec": jobs._fingerprint(fields)}
+        self.registry.write_text(json.dumps(registry))
+        self.run.calls.clear()
+
+        rc, output = self.command(["status"])
+        self.assertEqual(rc, 0)
+        self.assertIn("schedule.health must be recurring, not 'in 2h'", output)
+        self.assertIn("Proactive · watch: Card drop: installed", output)
+        self.assertTrue(all(a[2] == "list" for a in self.run.calls), self.run.calls)
+        self.assertEqual(self.command(["watch", "remove", "--name", "Card drop"])[0], 0)
+        self.assertNotIn(watch, self.run.live)
+        self.assertNotIn("watch:Card drop", json.loads(self.registry.read_text()))
+        self.assertEqual(cli.phconf.load()["watches"], [])
+        self.assertEqual(cli.phconf.load()["schedule"]["health"], "in 2h")
+        remove_all = jobs.remove_all
+        with patch.object(jobs, "remove_all", side_effect=lambda: remove_all(run=self.run)):
+            self.assertEqual(self.command(["remove"])[0], 0)
+        self.assertEqual(self.run.live, {})
+
     def test_publication_is_between_fencing_and_arming(self):
         self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
         old = self.run.job("Proactive · watch: Card drop")
@@ -207,9 +240,15 @@ class WatchTests(unittest.TestCase):
 
         cfg = cli.phconf.load()
         cfg["authority"]["never"].append("alarms")
+        say = self.run.job("Proactive · say")
         self.run.calls.clear()
         jobs.apply(cfg, run=self.run)
-        self.assertEqual([a[2] for a in self.run.calls if a[2] != "list" and a[3] == jid], ["pause", "edit", "resume"])
+        self.assertEqual([a[2:4] for a in self.run.calls],
+                         [["list", "--all"], ["pause", jid], ["edit", say], ["list", "--all"],
+                          ["edit", jid], ["list", "--all"], ["resume", jid], ["list", "--all"]])
+        sibling_edit = self.run.calls[2]
+        self.assertFalse({"--schedule", "--timezone"}.intersection(sibling_edit[4:]), sibling_edit)
+        self.assertEqual(self.run.states.get(say, "active"), "active")
         self.assertEqual(self.run.job("Proactive · watch: Card drop"), jid)
         argv = self.run.live[jid]
         updated = argv[argv.index("--prompt") + 1]

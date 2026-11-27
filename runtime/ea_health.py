@@ -190,7 +190,7 @@ def registry_ids(*, reg: dict | None = None, allow_pending: bool = False) -> dic
             if (jid := ph_jobs.recorded_job_id(reg, key, allow_pending=allow_pending))}
 
 
-def missing_jobs(live: list[dict]) -> list[str]:
+def missing_jobs(live: list[dict], *, reg: dict | None = None) -> list[str]:
     """Names of the managed jobs the installer keeps for this config (ph_jobs.expected, the installer's own rule:
     only flags that are jobs, only when the connection is there, one per watch) that no live job carries, matched
     one to one by identity. First every expected job with an id the installer recorded claims the live job with that
@@ -198,7 +198,7 @@ def missing_jobs(live: list[dict]) -> list[str]:
     live job counts for at most one expected job, so a duplicate or a misnamed job never stands in for another.
     LIVE is every cron job, not only the ones named with the desk prefix: a renamed job keeps its recorded id."""
     expected = ph_jobs.expected(phconf.CFG)
-    reg = _job_registry()
+    reg = _job_registry() if reg is None else reg
     recorded = registry_ids(reg=reg, allow_pending=True)
     pending = ph_jobs.pending_swaps(reg)
     used: set[int] = set()
@@ -228,14 +228,21 @@ def check_jobs(jobs: list[dict]) -> None:
     except Exception:
         croniter = None
     desk = [j for j in jobs if (j.get("name") or "").startswith(DESK_PREFIXES)]
-    missing = missing_jobs(jobs)   # all live jobs: ids are matched before the prefix filter
+    reg = _job_registry()
+    missing = missing_jobs(jobs, reg=reg)   # all live jobs: ids are matched before the prefix filter
     if missing:
         fault("desk", "desk job missing: " + ", ".join(missing))
+    live_ids = {job.get("id") for job in jobs}
+    current = registry_ids(reg=reg, allow_pending=True)
+    replaced = {jid for key, swap in ph_jobs.pending_swaps(reg).items()
+                if isinstance(swap, dict) and current.get(key) and current[key] in live_ids
+                for jid in (swap.get("old"), *(swap.get("retired") or ())) if jid}
     for job in desk:
         name = job.get("name") or job["id"]
-        if not job.get("enabled", True) or job.get("state") == "paused":
-            if job.get("paused_reason"):
-                continue  # paused on purpose (rebuild, seasonal); not a fault
+        state = job.get("state")
+        if state == "paused" or (state == "completed" and job.get("id") in replaced):
+            continue  # an explicit pause or a superseded completion isn't a fault
+        if not job.get("enabled", True) or state in ("disabled", "completed"):
             fault("desk", f"{name}: disabled")
             continue
         status = (job.get("last_status") or "").lower()
