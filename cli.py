@@ -405,13 +405,25 @@ def _change_watch(args, jobs) -> int:
         path = write_config(cfg)
 
     try:
-        jobs.apply(cfg, publish=publish)
+        revoke_watch = name if args.watch_command == "remove" else None
+        rows = jobs.apply(cfg, publish=publish, revoke_watch=revoke_watch)
     except (OSError, RuntimeError) as exc:
         prefix = "Watch config saved, but cron reconciliation failed" if path else "Watch reconciliation failed"
         print(f"{prefix}: {exc}", file=sys.stderr)
         return 1
-    print(f"Watch {name!r}: {'installed' if args.watch_command == 'add' else 'removed'}.")
+    action = "installed" if revoke_watch is None else "revoked" if any(row["deferred"] for row in rows) else "removed"
+    print(f"Watch {name!r}: {action}.")
+    if revoke_watch is not None:
+        print(f"Jobs: {_removal_summary(rows)}.")
     return 0
+
+
+def _removal_summary(rows) -> str:
+    return _removal_counts(sum(row["removed"] for row in rows), sum(row["deferred"] for row in rows))
+
+
+def _removal_counts(removed: int, deferred: int) -> str:
+    return f"removed {removed}, deferred {deferred}" + (" (paused, history kept)" if deferred else "")
 
 
 def handle(args) -> int:
@@ -452,7 +464,8 @@ def handle(args) -> int:
         except (OSError, RuntimeError) as exc:   # registry persistence, lock or a cron step failed
             print(f"Remove: {exc}", file=sys.stderr)
             return 1
-        print(f"Removed {len(result.removed)} job(s). Config and private state kept in {phconf.data_dir()}.")
+        print(f"Jobs: {_removal_counts(len(result.removed), len(result.paused))}. "
+              f"Config and private state kept in {phconf.data_dir()}.")
         if result.paused:
             print(f"uninstall incomplete: {len(result.paused)} jobs paused, run `hermes proactive remove` again later",
                   file=sys.stderr)
@@ -530,7 +543,7 @@ def handle(args) -> int:
     reapplied = sum(bool(row.get("reapplied")) for row in rows)
     print(f"Jobs: {checked} jobs checked, settings reapplied to {reapplied} in place "
           f"({actions.count('update')} detected changes); {actions.count('create')} created, "
-          f"{actions.count('replace')} replaced, {actions.count('remove')} removed.")
+          f"{actions.count('replace')} replaced, {_removal_summary(rows)}.")
     print("Done. Setup saved.")
     try:
         import ph_doctor

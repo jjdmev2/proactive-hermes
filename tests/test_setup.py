@@ -356,6 +356,32 @@ class JobSetupTests(unittest.TestCase):
         self.assertIn("3 jobs checked, settings reapplied to 3 in place (0 detected changes)", out.getvalue())
         self.assertNotIn("0 updated", out.getvalue())
 
+    def test_setup_feature_revocation_reports_real_deletions_and_deferrals(self):
+        self.cfg = cli.base_config("custom")
+        self.cfg["features"] = dict.fromkeys(self.cfg["features"], False)
+        self.cfg["features"].update(health=True, promises=True, mail_radar=True)
+        cli.write_config(self.cfg)
+        jobs.apply(self.cfg, run=self.run)
+        old = self.registry()["promises"]["id"]
+        radar = self.registry()["mail_radar"]["id"]
+        self.run.executions[old] = [(f"{i:032x}", "completed") for i in range(500)]
+        path = self.home / "answers.json"
+        path.write_text(json.dumps({"features": {**self.cfg["features"], "promises": False, "mail_radar": False}}))
+        parser = argparse.ArgumentParser()
+        cli.setup_parser(parser)
+        args = parser.parse_args(["setup", "--preset", "custom", "--answers", str(path)])
+        apply = jobs.apply
+        self.run.calls.clear()
+        with patch.object(jobs, "apply", side_effect=lambda cfg, **kw: apply(cfg, run=self.run, **kw)), \
+                patch("ph_doctor.report", return_value={"checks": {}, "ready": False}), redirect_stdout(StringIO()) as out:
+            self.assertEqual(cli.handle(args), 0)
+        self.assertIn("removed 1, deferred 1 (paused, history kept)", out.getvalue())
+        self.assertEqual(self.run.states[old], "paused")
+        self.assertNotIn(radar, self.run.live)
+        self.assertEqual(self.registry()["replacing"]["promises"]["retired"], [old])
+        self.assertCountEqual([a[2:4] for a in self.run.calls if a[2] not in ("list", "runs")],
+                              [["pause", old], ["pause", radar], ["remove", radar]])
+
     def test_recurring_repeat_and_skills_drift_preserve_only_manual_pause(self):
         jobs.apply(self.cfg, run=self.run)
         say = self.run.job("Proactive · say")
@@ -394,7 +420,7 @@ class JobSetupTests(unittest.TestCase):
                 with patch.object(jobs, "_keep_history", wraps=jobs._keep_history) as archive:
                     rc, report = self.remove_command()
                 self.assertEqual(rc, 0, report)
-                self.assertIn("Removed 3 job(s)", report)
+                self.assertIn("removed 3, deferred 0", report)
                 self.assertEqual(self.run.live, {})
                 self.assertFalse(any(args[2] == "runs" for args in self.run.calls))
                 archive.assert_not_called()
@@ -442,7 +468,8 @@ class JobSetupTests(unittest.TestCase):
                 live_count = len(self.run.live)
                 rc, report = self.remove_command()
                 self.assertEqual(rc, int(count >= 500), report)
-                self.assertIn(f"Removed {live_count - int(count >= 500)} job(s)", report)
+                deferred = int(count >= 500)
+                self.assertIn(f"removed {live_count - deferred}, deferred {deferred}", report)
                 if count >= 500:
                     self.assertIn("uninstall incomplete: 1 jobs paused, run `hermes proactive remove` again later", report)
                     self.assertEqual(self.run.live.keys(), {old})
