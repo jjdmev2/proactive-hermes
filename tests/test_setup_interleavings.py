@@ -17,7 +17,7 @@ import cli
 import jobs
 from tests.test_setup import FakeCron
 
-SEED = 0x8FECE
+SEEDS = (0x8FECE, 0x2701, 0x2702, 0x2703, 0x2704, 0x2705, 0x2706)
 STEPS = 360
 BAD_SCHEDULE = 'not a schedule'
 WATCHES = ('Coffee beans', 'Card drop', 'Spare parts')
@@ -49,7 +49,7 @@ class FaultCron(FakeCron):
 
     def __call__(self, argv, **kwargs):
         def command():
-            if argv[2] == 'edit' and argv[argv.index('--schedule') + 1] == BAD_SCHEDULE:
+            if argv[2] == 'edit' and '--schedule' in argv and argv[argv.index('--schedule') + 1] == BAD_SCHEDULE:
                 self.rejections += 1
                 return subprocess.CompletedProcess(argv, 1, '', 'fixture rejected schedule')
             return super(FaultCron, self).__call__(argv, **kwargs)
@@ -97,6 +97,8 @@ class FenceInterleavings(unittest.TestCase):
         self.assertEqual(self.host.prompt_of(jid), fields['prompt'])
         self.assertEqual(self.host.option(jid, '--deliver'), fields['deliver'])
         self.assertEqual(self.host.toolsets.get(jid), fields.get('enabled_toolsets'))
+        self.assertEqual(self.host.skills.get(jid, []), fields.get('skills', []))
+        self.assertNotIn(jid, self.host.repeats)
 
     def assert_invariant(self, *, removed=False):
         config = cli.phconf.load()
@@ -136,10 +138,15 @@ class FenceInterleavings(unittest.TestCase):
             return cli.handle(self.parser.parse_args(args))
 
     def test_seeded_config_changes_and_failures(self):
-        self.enterContext(temporary_home())
+        for seed in SEEDS:
+            with self.subTest(seed=hex(seed)), temporary_home():
+                self.run_seed(seed)
+
+    def run_seed(self, seed):
         self.reset_world()
-        rng = random.Random(SEED)
-        extra = random.Random(SEED ^ 0x500)
+        rng = random.Random(seed)
+        extra = random.Random(seed ^ 0x500)
+        drift_rng = random.Random(seed ^ 0xD12F7)
         exercised = Counter()
         for step in range(STEPS):
             cfg = cli.phconf.load() if cli.phconf.config_path().exists() else self.initial_config()
@@ -172,6 +179,15 @@ class FenceInterleavings(unittest.TestCase):
                     if jid in self.host.live and self.host.states.get(jid) == 'active':
                         self.host(['hermes', 'cron', 'edit', jid, '--schedule', '9 9 * * *'], env=os.environ)
                         exercised['external_edit'] += 1
+                        mutation = drift_rng.choice(('skills', 'repeat', 'completed'))
+                        if mutation == 'skills':
+                            self.host(['hermes', 'cron', 'edit', jid, '--skill', 'fixture-drift'], env=os.environ)
+                        elif mutation == 'repeat':
+                            self.host(['hermes', 'cron', 'edit', jid, '--repeat', '3'], env=os.environ)
+                        else:
+                            self.host(['hermes', 'cron', 'edit', jid, '--repeat', '1'], env=os.environ)
+                            self.host.finish_occurrence(jid)
+                        exercised[mutation] += 1
                         break
             write_count = 0
             reject_write = rng.randint(1, 5)
@@ -213,7 +229,7 @@ class FenceInterleavings(unittest.TestCase):
                 exercised['busy'] += ('runs' in self.host.trace and fault == 'busy'
                                       and busy in self.host.live and self.host.states.get(busy) == 'paused')
         for kind in ('archive', 'busy', 'parser', 'registry', 'interrupt', 'add', 'remove', 'uninstall', 'recovery',
-                     'capped_archive', 'external_edit'):
+                     'capped_archive', 'external_edit', 'repeat', 'completed', 'skills'):
             self.assertGreater(exercised[kind], 0, exercised)
         self.host.reset_faults()
         self.host.executions.clear()
@@ -221,7 +237,29 @@ class FenceInterleavings(unittest.TestCase):
         self.assert_invariant(removed=True)
         self.assertEqual(jobs._load_registry(), {})
         self.assertEqual(set(self.host.live), {self.unrelated})
-        print(f'\nseed={SEED:#x} steps={STEPS} exercised={dict(sorted(exercised.items()))}', file=self.report)
+        print(f'\nseed={seed:#x} steps={STEPS} exercised={dict(sorted(exercised.items()))}', file=self.report)
+
+    def test_drifted_watch_unfingerprinted_when_earlier_edit_fails(self):
+        self.enterContext(temporary_home())
+        cfg = self.reset_world()
+        cfg['features']['mail_radar'] = True
+        cfg['watches'] = [{'name': WATCHES[0], 'schedule': '*/30 * * * *',
+                           'check': 'Fixture', 'when': 'Matches', 'then': 'tell'}]
+        self.apply_config(cfg)
+        key = 'watch:' + WATCHES[0]
+        jid = jobs._load_registry()[key]['id']
+        cfg['schedule']['mail_radar'] = BAD_SCHEDULE
+        self.host(['hermes', 'cron', 'edit', jid, '--schedule', '9 9 * * *'], env=os.environ)
+        with self.assertRaisesRegex(RuntimeError, 'fixture rejected schedule'):
+            self.apply_config(cfg)
+        self.assertEqual(self.host.states[jid], 'paused')
+        self.assertEqual(self.host.schedule_of(jid), '9 9 * * *')
+        self.assertNotIn('spec', jobs._load_registry()[key])
+        self.assert_invariant()
+        cfg['schedule']['mail_radar'] = '*/17 * * * *'
+        self.apply_config(cfg)
+        self.assertEqual(self.host.states[jid], 'active')
+        self.assert_invariant()
 
     def test_interrupt_before_and_after_every_cron_call(self):
         def case(scenario, cut=None, when='before'):

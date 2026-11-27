@@ -654,7 +654,7 @@ def _job_listing(run) -> dict[str, dict]:
         end = headers[i + 1].start() if i + 1 < len(headers) else len(output)
         block = re.split(r"^    (?:Last run|Dispatch|Execution):", output[header.end():end], maxsplit=1, flags=re.M)[0]
         rows[jid] = {"state": state, **dict(re.findall(
-            r"^    (Name|Schedule|Deliver|Script|Mode|Timezone|Prompt|Toolsets|Enabled toolsets): +([^\n]*)",
+            r"^    (Name|Schedule|Repeat|Deliver|Skills|Script|Mode|Timezone|Prompt|Toolsets|Enabled toolsets): +([^\n]*)",
             block, re.M))}
     if not rows and not re.search(r"^No scheduled jobs\b", output, re.M):
         raise RuntimeError("Could not read job IDs from `hermes cron list --all`.")
@@ -665,6 +665,28 @@ def _job_states(run) -> dict[str, str]:
     return {jid: job["state"] for jid, job in _job_listing(run).items()}
 
 
+def _canonical_schedule(schedule: str) -> str:
+    """Match the public CLI's minute-based display for recurring durations, not one-shots."""
+    text = " ".join(schedule.split())
+    duration = re.fullmatch(r"(?:every )?(\d*) *(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)",
+                            text.lower())
+    if duration:
+        amount, unit = duration.groups()
+        return f"every {int(amount or '1') * {'m': 1, 'h': 60, 'd': 1440}[unit[0]]}m"
+    return text
+
+
+def _repeat_count(live: dict) -> tuple[int, int] | None:
+    if count := re.fullmatch(r"([0-9]+)/([1-9][0-9]*)", live.get("Repeat", "").strip()):
+        return int(count[1]), int(count[2])
+    return None
+
+
+def _completed(live: dict) -> bool:
+    repeat = _repeat_count(live)
+    return live["state"] == "completed" or (repeat is not None and repeat[0] >= repeat[1])
+
+
 def _live_drift(live: dict, fields: dict) -> str | None:
     """Compare what the public listing exposes. Current Hermes omits prompt and toolsets.
 
@@ -673,16 +695,23 @@ def _live_drift(live: dict, fields: dict) -> str | None:
     """
     if not live:
         return None
-    if live["state"] not in {"active", "paused"}:
+    if live["state"] not in {"active", "paused"} or _completed(live):
         return "replace"
     if (label := next((key for key in ("Enabled toolsets", "Toolsets") if key in live), None)) is not None:
         observed = {value.strip() for value in live[label].split(",") if value.strip()}
         if observed != set(fields.get("enabled_toolsets") or ()):
             return "replace"  # cron edit cannot change the immutable toolset list
-    for label, key in (("Name", "name"), ("Schedule", "schedule"), ("Deliver", "deliver"), ("Prompt", "prompt")):
+    if _repeat_count(live) is not None:
+        return "update"
+    for label, key in (("Name", "name"), ("Deliver", "deliver"), ("Prompt", "prompt")):
         if label in live and live[label].strip() != fields[key].strip():
             return "update"
     if "Schedule" in live:
+        if _canonical_schedule(live["Schedule"]) != _canonical_schedule(fields["schedule"]):
+            return "update"
+        skills = [skill.strip() for skill in live.get("Skills", "").split(",") if skill.strip()]
+        if skills != fields.get("skills", []):
+            return "update"
         if any(live.get(label, "").strip() != (fields[key] or "").strip()
                for label, key in (("Script", "script"), ("Timezone", "timezone"))):
             return "update"
@@ -785,6 +814,10 @@ def _resume(run, jid: str) -> None:
 def _options(fields: dict, *, edit: bool) -> list[str]:
     argv = ["--name", fields["name"], "--deliver", fields["deliver"],
             "--failure-deliver", fields["failure_deliver"], "--no-wrap-response", "--catch-up", "off"]
+    if edit:
+        argv.extend(["--repeat", "0"])  # the CLI's unlimited repeat count
+        if not fields.get("skills"):
+            argv.append("--clear-skills")
     for skill in fields.get("skills", []):
         argv.extend(["--skill", skill])
     if fields["timezone"] or edit:
@@ -1071,7 +1104,8 @@ def _candidates(run, record: dict, states: dict) -> set[str]:
     return ({new} if new in states else set(_temp_jobs(run, record))) & states.keys()
 
 
-def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True, paused=None, drift=None) -> dict[str, str]:
+def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True, paused=None, drift=None,
+                previously_active=()) -> dict[str, str]:
     """One scheduling fence for ordinary registry entries, swaps and first installs.
 
     Checkpoint intended re-arming before the first pause. An exception during the phase is
@@ -1102,19 +1136,25 @@ def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True, paused=None, dri
             current = current and jid == stage.get("new") and "toolsets" in stage and stage["toolsets"] == spec.get("toolsets")
         if not current and jid in states:
             candidates.add(jid)
-            if remember and not stage and "arm" not in swap and jid not in retired:
-                was_active = states[jid] not in _FENCED_STATES
+            if remember and observed and isinstance(entry, dict) and "spec" in entry:
+                # A later repair can fail before reaching this job. Do not retain a
+                # fingerprint for a job that we already know differs from the spec.
+                reg[key] = {field: value for field, value in entry.items() if field != "spec"}
+                changed = True
+            if remember and not stage and jid not in retired:
+                completed = _completed(listing[jid])
+                arm = states[jid] != "paused" or completed or jid in previously_active
                 if not swap:
                     # A content-only change can keep the same job. A toolset change cannot.
                     if spec is None or (observed != "replace" and spec.get("toolsets") ==
                                         (entry.get("toolsets") if isinstance(entry, dict) else None)):
-                        swap = {"new": jid, "arm": was_active}
+                        swap = {"new": jid, "arm": arm}
                     else:
-                        swap = {"old": jid, "was_active": was_active}
+                        swap = {"old": jid, "was_active": arm}
                     reg.setdefault(REPLACING, {})[key] = swap
                     changed = True
-                elif jid == swap.get("new"):
-                    swap["arm"] = was_active
+                elif jid == swap.get("new") and ("arm" not in swap or (completed and not swap["arm"])):
+                    swap["arm"] = arm
                     changed = True
         fenced.update(retired | (candidates - ({jid} if current else set())))
     if changed:
@@ -1134,11 +1174,11 @@ def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True, paused=None, dri
     return states
 
 
-def _safety_fence(run, wanted: dict) -> None:
+def _safety_fence(run, wanted: dict, *, previously_active=()) -> None:
     # Retry from disk: the failed host call may have completed before reporting its failure.
     reg = _load_registry()
     try:
-        _fence_jobs(run, reg, wanted)
+        _fence_jobs(run, reg, wanted, previously_active=previously_active)
     except OSError:
         _fence_jobs(run, _load_registry(), wanted, remember=False)
 
@@ -1326,12 +1366,12 @@ def _restore_before_publish(run, original: dict, paused: set[str]) -> None:
     """Undo this attempt's checkpoint and re-arm only previously active, still-valid jobs."""
     if _load_registry() != original:
         _save_registry(original)
-    if not paused:
-        return
     saved = phconf.load()
     fields = _fields_by_key(saved)
     wanted = {key: fields[key] for key in ph_jobs.expected(saved)}
-    _safety_fence(run, wanted)
+    _safety_fence(run, wanted, previously_active=paused)
+    if not paused:
+        return
     listing = _job_listing(run)
     for key, (fields, spec) in wanted.items():
         jid = ph_jobs.recorded_job_id(original, key, allow_pending=True)

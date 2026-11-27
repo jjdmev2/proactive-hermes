@@ -33,6 +33,8 @@ class FakeCron:
         self.names = {}
         self.ensured = []
         self.states = {}
+        self.repeats = {}
+        self.skills = {}
         self.executions = {}
         self.next_id = 0
 
@@ -70,6 +72,9 @@ class FakeCron:
         result = f"  {jid} [{self.states.get(jid, 'active')}]\n    Name:      {self.names.get(jid, '(unnamed)')}\n"
         if "--" in argv or "--schedule" in argv:
             result += f"    Schedule:  {self.schedule_of(jid)}\n    Deliver:   {self.option(jid, '--deliver') or 'local'}\n"
+            result += f"    Repeat:    {self.repeats.get(jid, '∞')}\n"
+            if skills := self.skills.get(jid):
+                result += f"    Skills:    {', '.join(skills)}\n"
             if script := self.option(jid, '--script'):
                 result += f"    Script:    {script}\n"
             if '--no-agent' in argv:
@@ -87,6 +92,19 @@ class FakeCron:
             else:
                 argv.extend((flag, value))
         self.live[jid] = argv
+
+    def set_repeat(self, jid, limit):
+        count = self.repeats.get(jid, '0/0').split('/')[0]
+        if limit:
+            self.repeats[jid] = f"{count}/{limit}"
+        else:
+            self.repeats.pop(jid, None)
+
+    def finish_occurrence(self, jid):
+        count, limit = map(int, self.repeats[jid].split('/'))
+        self.repeats[jid] = f"{count + 1}/{limit}"
+        if count + 1 >= limit:
+            self.states[jid] = 'completed'
 
     def __call__(self, argv, *, env, **kwargs):
         assert argv[:2] == ["hermes", "cron"], argv
@@ -118,11 +136,20 @@ class FakeCron:
                 self.names[jid] = argv[argv.index("--name") + 1]
             else:
                 self.manual_edit(jid, **{flag[2:]: value for flag, value in zip(argv[4::2], argv[5::2])})
+            supplied_skills = [argv[i + 1] for i, arg in enumerate(argv[4:], 4) if arg == "--skill"]
+            if "--clear-skills" in argv:
+                self.skills.pop(jid, None)
+            elif supplied_skills:
+                self.skills[jid] = supplied_skills
+            if "--repeat" in argv:
+                self.set_repeat(jid, int(argv[argv.index("--repeat") + 1]))
             stdout = f"Updated job: {jid}\n"
         elif action == "remove":
             jid = argv[3]
             del self.live[jid]
             self.states.pop(jid, None)
+            self.repeats.pop(jid, None)
+            self.skills.pop(jid, None)
             stdout = f"Removed job: Proactive · fixture ({jid})\n"
         elif action in ("pause", "resume"):
             jid = argv[3]
@@ -177,6 +204,42 @@ class JobSetupTests(unittest.TestCase):
         jobs.apply(self.cfg, run=self.run)
         self.assertFalse([argv for argv in self.run.calls if argv[2] != "list"])
         self.assertEqual(len(self.run.live), 3)
+
+    def test_equivalent_listed_schedules_need_no_cron_write(self):
+        for saved, listed in (("10m", "every 10m"), ("every 2h", "every 120m"),
+                              ("7 * * * *", "7  *\t* * *")):
+            with self.subTest(saved=saved, listed=listed):
+                self.cfg["schedule"]["health"] = saved
+                jobs.apply(self.cfg, run=self.run)
+                jid = self.run.job("Proactive · health")
+                self.run.manual_edit(jid, schedule=listed)
+                self.run.calls.clear()
+                rows = jobs.apply(self.cfg, run=self.run)
+                kept = {row["job"] for row in rows if row["action"] == "keep"}
+                self.assertEqual(kept, {jobs.ph_jobs.job_name(key) for key in jobs.ph_jobs.expected(self.cfg)})
+                self.assertLessEqual({row["action"] for row in rows}, {"keep", "skip"})
+                self.assertTrue(all(argv[2] == "list" for argv in self.run.calls), self.run.calls)
+
+    def test_recurring_repeat_and_skills_drift_preserve_only_manual_pause(self):
+        jobs.apply(self.cfg, run=self.run)
+        say = self.run.job("Proactive · say")
+        tick = self.run.job("Proactive · tick")
+        self.run.set_repeat(say, 1)
+        self.run.finish_occurrence(say)
+        self.run.set_repeat(tick, 3)
+        self.run.skills[tick] = ["fixture-drift"]
+        self.run.states[tick] = "paused"
+        actions = {row["job"]: row["action"] for row in jobs.apply(self.cfg, run=self.run)}
+        current = self.run.job("Proactive · say")
+        self.assertEqual(actions["Proactive · say"], "replace")
+        self.assertNotEqual(current, say)
+        self.assertEqual(self.run.states[current], "active")
+        self.assertNotIn(current, self.run.repeats)
+        self.assertEqual(actions["Proactive · tick"], "update")
+        self.assertEqual(self.run.job("Proactive · tick"), tick)
+        self.assertEqual(self.run.states[tick], "paused")
+        self.assertNotIn(tick, self.run.repeats)
+        self.assertNotIn(tick, self.run.skills)
 
     def test_script_workers_remove_and_reinstall_without_reading_history(self):
         import desk_say

@@ -516,12 +516,12 @@ def handle(args) -> int:
             print(f"  {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
     print(f"Jobs: {actions.count('create')} created, {actions.count('update')} updated, {actions.count('replace')} replaced, "
           f"{actions.count('remove')} removed.")
-    print("Done. Desk messages arrive in this profile's Bot Chat as normal replies.")
+    print("Done. Setup saved.")
     try:
         import ph_doctor
         rep = ph_doctor.report()
         for name, row in rep["checks"].items():
-            if not row["ok"] and name in ("gateway", "bot_chat", "mobile"):
+            if not row["ok"] and name in ("gateway", "bot_chat", "mobile", "say_job"):
                 print(f"  To do ({name}): {row['fix']}")
         if rep["ready"]:
             print("Check it now: `hermes proactive doctor --send-test` posts a test message to your Bot Chat and phone.")
