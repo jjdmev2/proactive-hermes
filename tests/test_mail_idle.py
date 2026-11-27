@@ -517,6 +517,23 @@ class GatewayStartTests(Base):
 
 
 class DoctorTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.registry = phconf.data_dir() / "jobs.json"
+        self.registry.parent.mkdir(parents=True)
+        self.registry.write_text(json.dumps({"mail_radar": "abcdef012345"}))
+
+    def test_no_registered_radar_reports_mail_not_scheduled(self):
+        self.registry.write_text(json.dumps({"say": "123456abcdef"}))
+        hb = self.tmp / "hb.json"
+        now = datetime(2026, 11, 25, 12, tzinfo=timezone.utc)
+        hb.write_text(json.dumps({"updated": now.isoformat(), "accounts": {"acct#1": {"state": "idle"}}}))
+        cfg = phconf.load()
+        cfg["mail"]["gmail_api"] = True
+        rep = mi.push_report(cfg, now=now, path=hb)
+        for key in ("Mailbox 1 (gmail.com)", "Gmail API", "himalaya account icloud"):
+            self.assertEqual(rep[key], {"mode": "not scheduled", "next": "Run `hermes proactive setup`."})
+
     def test_instant_push_and_15_min_reasons_with_next_steps(self):
         now = datetime(2026, 11, 25, 12, tzinfo=timezone.utc)
         hb = self.tmp / "hb.json"

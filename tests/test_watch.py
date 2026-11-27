@@ -63,26 +63,97 @@ class WatchFixture(unittest.TestCase):
         apply = jobs.apply
 
         def apply_fake(cfg, **kwargs):
-            return apply(cfg, run=self.cron, **kwargs)
+            kwargs.setdefault("run", self.cron)
+            return apply(cfg, **kwargs)
 
         with patch.object(jobs, "apply", side_effect=apply_fake), redirect_stdout(out), redirect_stderr(err):
             result = cli.handle(args)
         return result, out.getvalue() + err.getvalue()
 
 
+class SetupAnswersWatchTests(WatchFixture):
+    watch = {"name": "Card drop", "schedule": "*/30 * * * *", "check": "shop page",
+             "when": "preorders open", "then": "tell"}
+
+    def setup_answers(self, **answers):
+        path = self.home / "answers.json"
+        path.write_text(json.dumps({"decisions.enabled": "n", **answers}))
+        return self.command(["setup", "--preset", "custom", "--answers", str(path)])
+
+    def assert_setup_ok(self, **answers):
+        rc, output = self.setup_answers(**answers)
+        self.assertEqual(rc, 0, output)
+
+    def assert_watches(self, names):
+        self.assertEqual([watch["name"] for watch in cli.phconf.load()["watches"]], names)
+        self.assertEqual({key for key in jobs._load_registry() if key.startswith("watch:")},
+                         {f"watch:{name}" for name in names})
+
+    def test_explicit_list_installs_watch_on_fresh_desk(self):
+        self.assert_setup_ok(watches=[self.watch])
+        self.assert_watches(["Card drop"])
+        self.assertEqual(cli.phconf.load()["watches"], [self.watch])
+        self.assertIn(self.cron.job("Proactive · watch: Card drop"), self.cron.live)
+
+    def test_explicit_empty_list_removes_installed_watch(self):
+        self.assert_setup_ok()
+        self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
+        jid = self.cron.job("Proactive · watch: Card drop")
+        self.assert_setup_ok(watches=[])
+        self.assert_watches([])
+        self.assertNotIn(jid, self.cron.live)
+
+    def test_omission_preserves_watch_changes_after_preview(self):
+        self.assert_setup_ok()
+        self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
+
+        def change_watches(_):
+            self.assertEqual(self.command(["watch", "remove", "--name", "Card drop"])[0], 0)
+            self.assertEqual(self.command(ADD[:3] + ["Another drop"] + ADD[4:] + ["--then", "tell"])[0], 0)
+            return ""
+
+        with patch.object(cli, "decisions_note", side_effect=change_watches):
+            self.assert_setup_ok()
+        self.assert_watches(["Another drop"])
+
+    def test_conflicting_watch_change_refuses_without_applying(self):
+        self.assert_setup_ok()
+        before = None
+
+        def change_watches(_):
+            nonlocal before
+            self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
+            before = self.config.read_bytes(), self.registry.read_bytes(), self.cron.live.copy()
+            self.cron.calls.clear()
+            return ""
+
+        with patch.object(cli, "decisions_note", side_effect=change_watches):
+            rc, output = self.setup_answers(watches=[])
+        self.assertNotEqual(rc, 0, output)
+        self.assertIn("watches changed during setup", output)
+        self.assertEqual((self.config.read_bytes(), self.registry.read_bytes(), self.cron.live), before)
+        self.assertEqual(self.cron.calls, [])
+
+
 class UninstalledWatchTests(WatchFixture):
     def test_staged_watch_does_not_start_mail_push_until_setup(self):
         commands = []
+        first_idle = None
         idling = threading.Event()
 
         class ImapStub(StreamRequestHandler):
             def handle(self):
+                nonlocal first_idle
+                connection_commands = []
                 self.request.settimeout(6)
                 self.wfile.write(b"* OK fixture IMAP ready\r\n")
                 for line in self.rfile:
                     tag, command, *_ = line.split()
                     commands.append(command)
+                    connection_commands.append(command)
                     if command == b"IDLE":
+                        if first_idle is None:
+                            first_idle = tuple(connection_commands)
                         self.wfile.write(b"+ idling\r\n")
                         idling.set()
                         return
@@ -133,8 +204,8 @@ class UninstalledWatchTests(WatchFixture):
                 self.assertEqual(mail_idle.start_in_gateway(ctx, gateway=True, secret=credentials), "started")
                 self.assertTrue(idling.wait(5), commands)
                 # Some versions of imaplib issue their own CAPABILITY right after LOGIN.
-                self.assertIn(commands, ([b"CAPABILITY", b"LOGIN", b"CAPABILITY", b"EXAMINE", b"IDLE"],
-                                         [b"CAPABILITY", b"LOGIN", b"CAPABILITY", b"CAPABILITY", b"EXAMINE", b"IDLE"]))
+                self.assertIn(first_idle, ((b"CAPABILITY", b"LOGIN", b"CAPABILITY", b"EXAMINE", b"IDLE"),
+                                           (b"CAPABILITY", b"LOGIN", b"CAPABILITY", b"CAPABILITY", b"EXAMINE", b"IDLE")))
                 credentials.assert_called_once_with("PROACTIVE_MAIL_1_PASSWORD")
             finally:
                 mail_idle.stop_service()

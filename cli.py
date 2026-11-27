@@ -506,11 +506,17 @@ def handle(args) -> int:
         print("Proactive Hermes setup.\n  1. Juan's setup (proven defaults: briefs, promise tracker, drafts first, work recap)\n  2. My own (start from scratch)")
         preset = "juan" if input("Pick 1 or 2 [1] ").strip() in ("", "1") else "custom"
     cfg = base_config(preset)
-    # Watches are user-defined, not preset defaults. Keep them across setup updates.
-    cfg["watches"] = phconf.load()["watches"]
+    # Watches are user-defined, not preset defaults. Remember what setup previewed.
+    preview_watches = phconf.load()["watches"]
+    cfg["watches"] = preview_watches
+    explicit_watches = False
     if args.answers:
         try:
-            cfg = apply_answers(cfg, json.loads(Path(args.answers).read_text()))
+            answers = json.loads(Path(args.answers).read_text())
+            explicit_watches = "watches" in answers
+            if explicit_watches and not isinstance(answers["watches"], list):
+                raise ValueError("watches must be a list")
+            cfg = apply_answers(cfg, answers)
         except (OSError, ValueError, KeyError) as exc:
             print(f"Setup answers: {exc}", file=sys.stderr)
             return 2
@@ -548,7 +554,12 @@ def handle(args) -> int:
 
     try:
         with jobs.registry_lock():   # one setup, remove or watch change at a time: config.json and the jobs together
-            cfg["watches"] = phconf.load()["watches"]   # a watch added while the questions were open is kept
+            current_watches = phconf.load()["watches"]
+            if not explicit_watches:
+                cfg["watches"] = current_watches
+            elif current_watches != preview_watches and current_watches != cfg["watches"]:
+                print("Setup: watches changed during setup; review the current watches and retry.", file=sys.stderr)
+                return 1
             rows = jobs.apply(cfg, publish=publish)
     except jobs.OneShotSchedule as exc:
         print(f"Setup: {exc}", file=sys.stderr)

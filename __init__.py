@@ -3,9 +3,9 @@
 Registers the `hermes proactive` CLI (setup, status, remove, questions), the `/proactive` slash command,
 and three bundled skills: `proactive-setup` (the guided interview), `proactive-desk` (how to work
 the desk in chat: drafts, close-outs, promises) and `browser-bookings` (approval-gated rides, tickets,
-food). The scheduled jobs and runtime scripts are installed only by `hermes proactive setup`; loading the plugin
-never writes them. After a plugin update, `hermes proactive doctor` reports `runtime out of date: run hermes
-proactive setup` until setup runs again.
+food). Setup installs the scheduled jobs and runtime scripts. Watch changes on an installed desk also install
+or refresh them; loading the plugin never writes them. After a plugin update, `hermes proactive doctor`
+reports `runtime out of date: run hermes proactive setup` until the runtime is refreshed.
 """
 from __future__ import annotations
 

@@ -992,14 +992,24 @@ def _next(reason: str, n: int, every: str = "15 min checks") -> str:
 
 def push_report(cfg: dict | None = None, *, now: datetime | None = None, path: Path | None = None,
                 settings: dict | None = None, secret=None) -> dict[str, dict]:
-    """One row per mailbox: {"mode": "instant push" | "<N> min checks", "reason": ..., "next": ...}.
+    """One row per mailbox: instant push, scheduled checks, or not scheduled, with next steps as needed.
     Rows are named "Mailbox N (domain)" for the slots, never by address; the radar's other mailboxes get one
     row each ("himalaya account <name>", "Gmail API"). Passwords are only checked for presence."""
     cfg = cfg or phconf.CFG
-    now = now or datetime.now(timezone.utc)
-    every = radar_every(cfg)
     settings = plugin_settings() if settings is None else settings
     slots = filled_slots(settings)
+    labels = {n: f"Mailbox {n} ({domain})" for n, domain in slots.items()}
+    mail = cfg.get("mail") or {}
+    himalaya = [name for acc in (mail.get("himalaya_accounts") or [])
+                if (name := str((acc.get("account") if isinstance(acc, dict) else acc) or "").strip())]
+    if not radar_job_id():
+        keys = [*labels.values(), *(f"himalaya account {name}" for name in himalaya)]
+        if mail.get("gmail_api"):
+            keys.append("Gmail API")
+        return {key: {"mode": "not scheduled", "next": "Run `hermes proactive setup`."}
+                for key in keys or ["all"]}
+    now = now or datetime.now(timezone.utc)
+    every = radar_every(cfg)
     out: dict[str, dict] = {}
     feats = cfg.get("features") or {}
     push_on = feats.get("mail_push", True) and feats.get("mail_radar", True)
@@ -1014,8 +1024,8 @@ def push_report(cfg: dict | None = None, *, now: datetime | None = None, path: P
         _, skipped = load_accounts(settings, secret=secret)
     except Exception:
         skipped = {}
-    for n, domain in slots.items():
-        label, key = slot_label(n), f"Mailbox {n} ({domain})"
+    for n, key in labels.items():
+        label = slot_label(n)
         row = rows.get(label) if isinstance(rows, dict) else None
         if not push_on:
             reason = "feature_off"
@@ -1047,14 +1057,11 @@ def push_report(cfg: dict | None = None, *, now: datetime | None = None, path: P
     hint = (f"If this mailbox is not one of the Mailbox slots above: make an app password and fill Mailbox "
             f"{free[0]} address and app password in {SETTINGS}, then {RESTART}. Optional." if free else
             "All six Mailbox slots are used.")
-    mail = cfg.get("mail") or {}
     if mail.get("gmail_api"):
         out["Gmail API"] = {"mode": every, "reason": "no push slot (read through Google's API)", "next": hint}
-    for acc in mail.get("himalaya_accounts") or []:
-        name = str((acc.get("account") if isinstance(acc, dict) else acc) or "").strip()
-        if name:
-            out[f"himalaya account {name}"] = {"mode": every, "reason": "no push slot, unless it is one of the Mailbox slots above",
-                                               "next": hint}
+    for name in himalaya:
+        out[f"himalaya account {name}"] = {"mode": every, "reason": "no push slot, unless it is one of the Mailbox slots above",
+                                           "next": hint}
     return out
 
 
