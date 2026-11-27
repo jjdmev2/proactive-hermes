@@ -165,7 +165,7 @@ hermes proactive watch add --name "Card drop" --schedule "*/15 * * * *" \
   --check "the shop page for the new card set" --when "preorders open" --then alarm --urgent
 ```
 
-`--then` is what happens when the condition is true: `tell` (a line in chat), `reminder`, `alarm` (urgent only), `draft` (prepared and waiting for your yes) or `act` (done on its own; needs `--act "<exact action>"` and watch actions allowed in setup; a watch never pays, books or enters card details). `hermes proactive watch list` and `watch remove --name` manage them.
+`--then` is what happens when the condition is true: `tell` (a line in chat), `reminder`, `alarm` (urgent only), `draft` (prepared and waiting for your yes) or `act` (done on its own; needs `--act "<exact action>"` and watch actions allowed in setup). Scheduled jobs are instructed not to book or pay and have no booking or payment authority by default. `hermes proactive watch list` and `watch remove --name` manage them.
 
 | Command | What it does |
 | :--- | :--- |
@@ -174,9 +174,9 @@ hermes proactive watch add --name "Card drop" --schedule "*/15 * * * *" \
 | `hermes proactive status` | Your settings and the jobs the plugin owns |
 | `hermes proactive doctor [--send-test]` | Check delivery to your Bot Chat and phone, and which mailboxes have instant push |
 | `hermes proactive watch add ...` | Add a watch (see above) |
-| `hermes proactive remove` | Remove every job the plugin created (settings and history stay) |
+| `hermes proactive remove` | Pause and remove managed jobs; agent history is retained |
 
-To uninstall completely: `hermes proactive remove`, then `hermes plugins remove proactive-hermes`, then delete `plugin-data/proactive-hermes/`, `scripts/proactive-hermes` and `scripts/.proactive-hermes-gen/` in your Hermes home (`~/.hermes`, or `~/.hermes/profiles/<name>`).
+To uninstall completely: run `hermes proactive remove` until it succeeds, then `hermes plugins remove proactive-hermes`, then delete `plugin-data/proactive-hermes/`, `scripts/proactive-hermes` and `scripts/.proactive-hermes-gen/` in your Hermes home (`~/.hermes`, or `~/.hermes/profiles/<name>`).
 
 ## How it works
 
@@ -312,13 +312,13 @@ Works with sites that book on the web: Uber (m.uber.com), most rail operators, W
 
 **Connect once:** Hermes opens the site in its browser and you sign in yourself, codes included. Hermes never sees or stores your password.
 
-**Account risk.** Uber's terms forbid automated access. Every ride here has a human approving it and the volume stays human, but the risk to your account is yours. To skip it, never sign in to those sites; without a login Hermes cannot book anything.
+**Account risk.** Uber's terms forbid automated access. Every ride here has a human approving it and the volume stays human, but the risk to your account is yours. To skip it, leave those sites disconnected.
 
 ## Privacy and safety
 
-- **Approval first.** The desk only does on its own what you allowed in setup (in Juan's setup: blocks, reminders, alarms, leave times and cleanup of its own items). Sending, replying, registering, buying and booking wait for your yes to that exact action, unless you let a specific watch act on its own. Hermes never enters card details or passwords, and nothing is paid without your yes to an exact quote.
+- **Approval first.** The desk only does on its own what you allowed in setup (in Juan's setup: blocks, reminders, alarms, leave times and cleanup of its own items). Sending, replying, registering and buying wait for your yes to that exact action, except for a specific watch action you authorized. Bookings require your approval of the exact quote in live chat. Hermes never enters card details or passwords, and nothing is paid without your yes to an exact quote.
 - **Local.** Settings, drafts, promises and logs stay in your Hermes home, in a folder only your user can read. We run no server and collect no telemetry.
-- **Least tools.** Each scheduled job runs with only the toolsets it needs (see [How it works](#how-it-works)). Only watches get the browser. Scheduled jobs are instructed not to book or pay and have no booking or payment authority by default; this is not a technical guarantee. A job's own toolset list replaces your `platform_toolsets.cron` setting for that job, so if that setting is narrower than what a job asks for, setup prints one warning line (see [SECURITY.md](SECURITY.md#known-limits)).
+- **Least tools.** Each scheduled job runs with only the toolsets it needs (see [How it works](#how-it-works)). Only watches get the browser. Scheduled jobs are instructed not to book or pay and have no booking or payment authority by default. This is not a technical guarantee. A job's own toolset list replaces your `platform_toolsets.cron` setting for that job, so if that setting is narrower than what a job asks for, setup prints one warning line (see [SECURITY.md](SECURITY.md#known-limits)).
 - **Public Hermes surfaces only.** Desk messages go out through Hermes's documented scheduled Bot Chat delivery, jobs are run with `hermes cron run`, and the plugin never writes Hermes's chat database.
 - **Your Bot's model sees what the desk reads.** Mail, Slack and calendar text go to the model provider of your Bot's profile, as in any Hermes chat.
 - **What goes to OpenAI** (only with a key, only to the Decisions API): for mail, the sender, subject and first 600 characters of the body; for Slack, the message being judged; for promises and the work recap, the message or call item and the Linear title it is matched against; for your replies, the reply and the numbered list it answers; and the text of anything checked for prompt injection. Nothing else, and no files. OpenAI offers zero data retention for eligible accounts.
@@ -343,9 +343,9 @@ Everything the plugin touches outside its own folder:
 - **Other Hermes files, read only:** the cron job list and job output (health checks, and the saved runs of a job setup replaces, see "Your jobs"), your `USER.md` memory (your name, at setup) and `config.yaml` (plugin settings, and the `platform_toolsets.cron` list for one warning line at setup).
 - **Files it writes outside the plugin folder:** `scripts/proactive-hermes/`, `plugin-data/proactive-hermes/` and `logs/proactive-hermes-mail-push.log`, all in your Hermes home.
 - **Shell commands:** `himalaya`, the google-workspace skill’s scripts, `hermes cron` (including public list and execution history), and `hermes gateway status` (doctor). The desk does not auto-archive sessions: Hermes’s `--title` filter matches substrings, not job ownership.
-- **Your jobs.** Setup journals a unique staging name before creating a job, records its ID before arming its final settings, and resumes interrupted creation without adopting a same-name job. When new toolsets require replacement, setup keeps the owner’s pause state and verifies the size and checksum of each saved run copied into `plugin-data/proactive-hermes/job-history/<job>/<old id>/` before removing the old job. On a mismatch it keeps the old job. Setup, remove and watch changes are serialized per profile.
+- **Your jobs.** Setup journals a unique staging name before creating a job, records its ID before arming its final settings, and resumes interrupted creation without adopting a same-name job. Setup preserves manual pauses and repairs drift visible in `hermes cron list --all`. It removes the script-only say, health and tick jobs without archiving their output. For retired agent jobs, it saves the listed attempts and verifies the size and checksum of copied output in `plugin-data/proactive-hermes/job-history/`. If Hermes caps the list at 500 or the copy cannot be verified, the old job stays paused and the replacement does not wait for it. Setup, remove and watch changes are serialized per profile.
 - **Slack and Linear** through your Hermes connectors. Sending waits for your yes.
-- **A logged-in browser** for watches on the sites you signed in to yourself, and for bookings you approve. Scheduled jobs never book or pay.
+- **A logged-in browser** for watches on the sites you signed in to yourself, and for bookings you approve. Scheduled jobs are instructed not to book or pay and have no booking or payment authority by default.
 
 Found a security problem? See [SECURITY.md](SECURITY.md).
 

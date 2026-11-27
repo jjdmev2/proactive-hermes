@@ -13,6 +13,8 @@ before archiving saved runs of retired jobs under <plugin-data>/job-history/.
 from __future__ import annotations
 
 import fcntl
+from copy import deepcopy
+from dataclasses import dataclass, field
 import json
 import logging
 import os
@@ -97,7 +99,7 @@ JOBS: list[dict] = [
              "drafts shown vs sent (`python3 {{SCRIPTS}}/ea_resolve.py list`). At most 5 items, the ones that need {{OWNER}} next week. "
              "Header: --header \"Your week, <N> things:\"."},
     {"key": "lookahead", "name": ph_jobs.NAMES["lookahead"], "job": "lookahead", "flags": "", "script": "lookahead_gate.py",
-     # No browser-bookings here: a scheduled job reads untrusted mail and must never book. Booking lives in the chat reply flow.
+     # No browser-bookings here: booking requires the owner's approval in live chat.
      "skills": ["proactive-hermes:proactive-desk"], "body_file": "lookahead.md"},
     {"key": "meeting_prep", "name": ph_jobs.NAMES["meeting_prep"], "job": "meeting-prep", "flags": "", "script": "meeting_prep_gate.py",
      "skills": ["proactive-hermes:proactive-desk"], "body_file": "meeting_prep.md"},
@@ -124,7 +126,7 @@ BASE_TOOLSETS = ["terminal", "file", "skills"]
 CONNECTORS = "connections"
 TOOLSETS: dict[str, list[str]] = {
     "promises": BASE_TOOLSETS + ["session_search"],   # "what they told you in chat" reads past chats
-    "lookahead": BASE_TOOLSETS + ["web"],             # operator timetables, organiser pages, weather; never books
+    "lookahead": BASE_TOOLSETS + ["web"],             # operator timetables, organiser pages and weather
 }
 WATCH_TOOLSETS = BASE_TOOLSETS + ["web", "browser"]  # watches check pages: shops, marketplaces, event sites
 
@@ -621,7 +623,7 @@ def _save_registry(reg: dict) -> None:
             tmp.unlink(missing_ok=True)
 
 
-# `hermes cron` currently has no JSON mode. Parse only labeled command results and the list's ID/state and Name rows.
+# `hermes cron` currently has no JSON mode. Read only the labeled public CLI rows.
 _JOB_ID = r"[0-9a-f]{12}"
 
 
@@ -640,14 +642,53 @@ def _created_job_id(output: str) -> str:
     return ids[0]
 
 
-def _job_states(run) -> dict[str, str]:
-    """{job id: state} from `hermes cron list --all` ("  <id> [active|paused|...]" header lines only)."""
+def _job_listing(run) -> dict[str, dict]:
+    """Read job blocks from `cron list --all`; multiline errors follow the spec rows."""
     output = _cron(run, "list", "--all")
-    rows = re.findall(rf"^  ({_JOB_ID}) \[([^\]\n]+)\]$", output, re.MULTILINE)
-    states = dict(rows)
-    if len(rows) != len(states) or (not states and not re.search(r"^No scheduled jobs\b", output, re.MULTILINE)):
+    headers = list(re.finditer(rf"^  ({_JOB_ID}) \[([^\]\n]+)\][ \t]*$", output, re.M))
+    rows = {}
+    for i, header in enumerate(headers):
+        jid, state = header.groups()
+        if jid in rows:
+            raise RuntimeError(f"Duplicate job ID {jid} in `hermes cron list --all`.")
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(output)
+        block = re.split(r"^    (?:Last run|Dispatch|Execution):", output[header.end():end], maxsplit=1, flags=re.M)[0]
+        rows[jid] = {"state": state, **dict(re.findall(
+            r"^    (Name|Schedule|Deliver|Script|Mode|Timezone|Prompt|Toolsets|Enabled toolsets): +([^\n]*)",
+            block, re.M))}
+    if not rows and not re.search(r"^No scheduled jobs\b", output, re.M):
         raise RuntimeError("Could not read job IDs from `hermes cron list --all`.")
-    return states
+    return rows
+
+
+def _job_states(run) -> dict[str, str]:
+    return {jid: job["state"] for jid, job in _job_listing(run).items()}
+
+
+def _live_drift(live: dict, fields: dict) -> str | None:
+    """Compare what the public listing exposes. Current Hermes omits prompt and toolsets.
+
+    A manual pause is intentional; setup edits a paused job without arming it. An optional
+    row absent from an otherwise complete block (e.g. Script) means it is not configured.
+    """
+    if not live:
+        return None
+    if live["state"] not in {"active", "paused"}:
+        return "replace"
+    if (label := next((key for key in ("Enabled toolsets", "Toolsets") if key in live), None)) is not None:
+        observed = {value.strip() for value in live[label].split(",") if value.strip()}
+        if observed != set(fields.get("enabled_toolsets") or ()):
+            return "replace"  # cron edit cannot change the immutable toolset list
+    for label, key in (("Name", "name"), ("Schedule", "schedule"), ("Deliver", "deliver"), ("Prompt", "prompt")):
+        if label in live and live[label].strip() != fields[key].strip():
+            return "update"
+    if "Schedule" in live:
+        if any(live.get(label, "").strip() != (fields[key] or "").strip()
+               for label, key in (("Script", "script"), ("Timezone", "timezone"))):
+            return "update"
+        if live.get("Mode", "").startswith("no-agent ") != fields["no_agent"]:
+            return "update"
+    return None
 
 
 IDLE_WAIT_S = 10 * 60
@@ -680,56 +721,43 @@ def _run_states(output: str, jid: str) -> dict[str, str] | None:
     return states or None
 
 
-def _wait_for_idle(run, jid: str) -> bool:
-    """Pause fences future scheduling, not a previously claimed execution that can still save output.
+def _wait_for_idle(run, jid: str) -> tuple[bool, str | None]:
+    """Return removal safety and the listable attempts when there is no visible writer.
 
-    Read the public execution list, not just `cron list`'s latest attempt: a newer refused
-    run-now can hide an older running attempt. Missing, malformed or truncated evidence is not idle.
+    A newer refused run-now can hide an older run. A saturated listing never proves
+    all attempts are idle, but its snapshot and verified output copies can still be kept.
     """
     deadline = time.monotonic() + IDLE_WAIT_S
     while True:
         try:
             if _job_states(run).get(jid) not in {"paused", "disabled", "completed"}:
-                return False
+                return False, None
             output = _cron(run, "runs", jid, "--limit", "500")
         except (OSError, RuntimeError, subprocess.SubprocessError):
-            return False
+            return False, None
         rows = _run_states(output, jid)
-        if rows is None or len(rows) >= 500:
-            return False
+        if rows is None:
+            return False, None
         if _LIVE_RUN_STATES.isdisjoint(rows.values()):
-            return True
+            return len(rows) < 500, output
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return False
+            return False, None
         time.sleep(min(IDLE_POLL_S, remaining))
 
 
 def _defer_removal(key: str, old: str) -> None:
-    print(f"Setup: deferred removal of old {key} job {old} (paused); could not confirm it is idle. "
-          "Rerun setup to finish the swap and preserve its run history.")
+    print(f"Setup: deferred removal of old {key} job {old} (paused); could not confirm it is idle "
+          "or that its run history is complete.")
 
 
 def _job_names(run) -> dict[str, str]:
     """{job id: name} from `hermes cron list --all`: the "Name:" row under each "  <id> [state]" header line. Only
     used to find a job by the unique name setup gave it while making it (`<name> (setup <random hex>)`)."""
-    output = _cron(run, "list", "--all")
-    headers = set()
-    names: dict[str, str] = {}
-    current = None
-    for line in output.splitlines():
-        header = re.fullmatch(rf"  ({_JOB_ID}) \[[^\]\n]+\]", line)
-        if header:
-            current = header.group(1)
-            headers.add(current)
-            continue
-        # The CLI pads "Name:" to 11 characters, then prints the name without stripping it.
-        prefix = "    Name:      "
-        if current and line.startswith(prefix) and current not in names:
-            names[current] = line[len(prefix):]
-    if headers != names.keys() or (not headers and not re.search(r"^No scheduled jobs\b", output, re.MULTILINE)):
+    rows = _job_listing(run)
+    if any("Name" not in job for job in rows.values()):
         raise RuntimeError("Could not read job names from `hermes cron list --all`.")
-    return names
+    return {jid: job["Name"] for jid, job in rows.items()}
 
 
 def _list_job_ids(run) -> set[str]:
@@ -952,11 +980,11 @@ def _keep_history(key: str, old: str) -> int:
 CREATING = ph_jobs.CREATING
 
 
-def _finish_create(run, ensure, reg: dict, key: str, fields: dict, spec: dict) -> None:
+def _finish_create(run, ensure, reg: dict, key: str, fields: dict, spec: dict, drift=None) -> None:
     """Only reuse a stage whose immutable toolsets were journaled before creation."""
     record = reg.get(CREATING, {}).get(key)
     toolsets = spec.get("toolsets")
-    if record is not None and ("toolsets" not in record or record["toolsets"] != toolsets):
+    if record is not None and ("toolsets" not in record or record["toolsets"] != toolsets or drift == "replace"):
         _retire_stage(run, reg, key)
         record = None
     if record is None:
@@ -971,7 +999,7 @@ def _finish_create(run, ensure, reg: dict, key: str, fields: dict, spec: dict) -
     if record.get("new") != jid:
         record["new"] = jid
         _save_registry(reg)
-    if not (_job_id(reg.get(key)) == jid and _matches_spec(reg[key], spec)):
+    if not (_job_id(reg.get(key)) == jid and _matches_spec(reg[key], spec) and not drift):
         if (states.get(jid, "active" if toolsets is not None else "paused")) not in _FENCED_STATES:
             _pause(run, jid)
         _publish_edit(run, reg, key, jid, fields, spec)
@@ -1043,13 +1071,14 @@ def _candidates(run, record: dict, states: dict) -> set[str]:
     return ({new} if new in states else set(_temp_jobs(run, record))) & states.keys()
 
 
-def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True) -> dict[str, str]:
+def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True, paused=None, drift=None) -> dict[str, str]:
     """One scheduling fence for ordinary registry entries, swaps and first installs.
 
     Checkpoint intended re-arming before the first pause. An exception during the phase is
     handled by a fresh fence using durable identifiers only, even if the registry is unwritable.
     """
-    states = _job_states(run) if reg else {}
+    listing = _job_listing(run) if reg else {}
+    states = {jid: job["state"] for jid, job in listing.items()}
     swaps = ph_jobs.pending_swaps(reg)
     staged = reg.get(CREATING, {})
     fenced = set()
@@ -1060,7 +1089,10 @@ def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True) -> dict[str, str
         entry = reg.get(key)
         jid = _job_id(entry)
         spec = wanted[key][1] if key in wanted else None
-        matches = spec is not None and _matches_spec(entry, spec)
+        observed = _live_drift(listing.get(jid, {}), wanted[key][0]) if spec is not None else None
+        if observed and drift is not None:
+            drift[key] = observed
+        matches = spec is not None and _matches_spec(entry, spec) and not observed
         swap = swaps.get(key, {})
         stage = staged.get(key, {})
         retired = _retired_ids(swap)
@@ -1074,7 +1106,8 @@ def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True) -> dict[str, str
                 was_active = states[jid] not in _FENCED_STATES
                 if not swap:
                     # A content-only change can keep the same job. A toolset change cannot.
-                    if spec is None or spec.get("toolsets") == (entry.get("toolsets") if isinstance(entry, dict) else None):
+                    if spec is None or (observed != "replace" and spec.get("toolsets") ==
+                                        (entry.get("toolsets") if isinstance(entry, dict) else None)):
                         swap = {"new": jid, "arm": was_active}
                     else:
                         swap = {"old": jid, "was_active": was_active}
@@ -1090,6 +1123,8 @@ def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True) -> dict[str, str
     for jid in sorted(fenced & states.keys()):
         if states[jid] not in _FENCED_STATES:
             try:
+                if paused is not None:
+                    paused.add(jid)  # a failed pause receipt may still have changed the host
                 _pause(run, jid)
                 states[jid] = "paused"
             except (Exception, KeyboardInterrupt) as exc:
@@ -1133,17 +1168,17 @@ def _retire_swap(run, reg: dict, key: str) -> None:
     _save_registry(reg)
 
 
-def _configure_swap(run, ensure, reg: dict, key: str, fields: dict, spec: dict) -> None:
+def _configure_swap(run, ensure, reg: dict, key: str, fields: dict, spec: dict, drift=None) -> None:
     """Apply current policy to the fenced key, independently of its retired jobs' history."""
     record = reg[REPLACING][key]
     states = _job_states(run)
     _old, new = _swap_ids(record)
     entry = reg.get(key)
     current = new in states and new not in _retired_ids(record) and _job_id(entry) == new
-    if not (current and _matches_spec(entry, spec)):
+    if not (current and _matches_spec(entry, spec) and not drift):
         arm = record.get("arm", record.get("was_active", True))
         old_toolsets = entry.get("toolsets") if isinstance(entry, dict) else None
-        if not (current and old_toolsets == spec.get("toolsets")):
+        if not (current and old_toolsets == spec.get("toolsets") and drift != "replace"):
             previous = _candidates(run, record, states)
             jid = _job_id(entry)
             record["retired"] = sorted(_retired_ids(record) | previous | ({jid} if jid in states else set()))
@@ -1165,24 +1200,72 @@ def _configure_swap(run, ensure, reg: dict, key: str, fields: dict, spec: dict) 
         _save_registry(reg)
 
 
-def _archive_swap(run, reg: dict, key: str) -> int:
-    """Archive only fenced jobs; leave busy or unreadable jobs paused and journaled."""
-    record = reg[REPLACING][key]
-    kept, remaining = 0, False
-    live = _list_job_ids(run)
-    for jid in sorted(_retired_ids(record) & live):
-        if not _wait_for_idle(run, jid):
-            _defer_removal(key, jid)
-            remaining = True
-            continue
+_SCRIPT_WORKERS = {"say", "health", "tick"}
+
+
+@dataclass
+class RemovalResult:
+    removed: list[str] = field(default_factory=list)
+    paused: list[str] = field(default_factory=list)
+    copied: int = 0
+
+
+def _archive_attempts(key: str, jid: str, attempts: str) -> None:
+    # Keep CLI metadata alongside, not inside, the copied output tree.
+    body = attempts.encode("utf-8")
+    digest = sha256(body).hexdigest()
+    # A later snapshot may contain fewer rows after host retention prunes older attempts.
+    target = _history_dir(key, jid).with_suffix(".runs") / f"{digest}.txt"
+    _private_dir(target.parent)
+    expected = len(body), digest
+    if target.is_symlink():
+        raise RuntimeError(f"Refusing symlinked attempt history for {jid}.")
+    if target.is_file() and _history_fingerprint(target) == expected:
+        return
+    with NamedTemporaryFile(dir=target.parent, prefix=".runs-", delete=False) as out:
+        tmp = Path(out.name)
         try:
-            kept += _keep_history(key, jid)
+            out.write(body)
+            out.flush()
+            os.fsync(out.fileno())
+            if _history_fingerprint(tmp) != expected:
+                raise RuntimeError(f"Run attempt history copy mismatch for {jid}.")
+            tmp.replace(target)
+            _sync_dir(target.parent)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def _archive_swap(run, reg: dict, key: str, result: RemovalResult, *, uninstall=False) -> None:
+    """Retire fenced jobs. Only agent jobs have owner output worth preserving."""
+    record = reg[REPLACING][key]
+    live = _list_job_ids(run)
+    remaining = []
+    for jid in sorted(_retired_ids(record) & live):
+        idle = True
+        try:
+            if key not in _SCRIPT_WORKERS:
+                idle, attempts = _wait_for_idle(run, jid)
+                if attempts is not None:
+                    _archive_attempts(key, jid, attempts)
+                    result.copied += _keep_history(key, jid)
+                if not idle:
+                    _defer_removal(key, jid)
+                    remaining.append(jid)
+                    continue
             _remove(run, jid)
+            if jid in _list_job_ids(run):
+                raise RuntimeError("cron still lists the job after confirming removal")
+            result.removed.append(jid)
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(f"Could not archive or remove paused {key} job {jid}; rerun setup or remove. ({exc})") from exc
+            message = f"Could not archive or remove paused {key} job {jid}; rerun setup or remove. ({exc})"
+            if (idle and not uninstall) or _job_states(run).get(jid) not in _FENCED_STATES:
+                raise RuntimeError(message) from exc
+            print(message, file=sys.stderr)
+            remaining.append(jid)
+    result.paused.extend(remaining)
     if not remaining:
         _end_swap(reg, key)
-    return kept
 
 
 def _job_id(entry) -> str | None:
@@ -1227,67 +1310,109 @@ def _job_fields(cfg: dict, job: dict) -> tuple[dict, dict]:
     return fields, spec
 
 
+def _fields_by_key(cfg: dict) -> dict:
+    desired = JOBS + [watch_job(watch) for watch in cfg.get("watches", [])]
+    return {job["key"]: _job_fields(cfg, job) for job in desired}
+
+
+def _saved_config_bytes() -> bytes | None:
+    try:
+        return phconf.config_path().read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _restore_before_publish(run, original: dict, paused: set[str]) -> None:
+    """Undo this attempt's checkpoint and re-arm only previously active, still-valid jobs."""
+    if _load_registry() != original:
+        _save_registry(original)
+    if not paused:
+        return
+    saved = phconf.load()
+    fields = _fields_by_key(saved)
+    wanted = {key: fields[key] for key in ph_jobs.expected(saved)}
+    _safety_fence(run, wanted)
+    listing = _job_listing(run)
+    for key, (fields, spec) in wanted.items():
+        jid = ph_jobs.recorded_job_id(original, key, allow_pending=True)
+        if (jid in paused and listing.get(jid, {}).get("state") == "paused"
+                and _matches_spec(original.get(key), spec) and not _live_drift(listing[jid], fields)):
+            _resume(run, jid)
+
+
 def _apply(cfg: dict, dry_run: bool, *, run, ensure, publish=None) -> list[dict]:
     reg = _load_registry()
-    desired = JOBS + [watch_job(watch) for watch in cfg.get("watches", [])]
-    fields_by_key = {job["key"]: _job_fields(cfg, job) for job in desired}
+    fields_by_key = _fields_by_key(cfg)
     wanted = {key: fields_by_key[key] for key in ph_jobs.expected(cfg)}
     pending_before = set(ph_jobs.pending_swaps(reg))
+    awaiting_publish = not dry_run and publish is not None
+    original = deepcopy(reg) if awaiting_publish else {}
+    saved = _saved_config_bytes() if awaiting_publish else None
+    paused, drift = set(), {}
     try:
-        states = (_job_states(run) if reg else {}) if dry_run else _fence_jobs(run, reg, wanted)
+        if dry_run:
+            listing = _job_listing(run) if reg else {}
+            states = {jid: job["state"] for jid, job in listing.items()}
+            drift = {key: _live_drift(listing.get(_job_id(reg.get(key)), {}), fields)
+                     for key, (fields, _) in wanted.items()}
+        else:
+            states = _fence_jobs(run, reg, wanted, paused=paused, drift=drift)
         removed_watches = {key for key, entry in reg.items()
                            if key.startswith("watch:") and key not in wanted and _job_id(entry) in states}
-        actions = {key: _action(reg, key, wanted, states, pending_before) for key in fields_by_key}
+        actions = {key: _action(reg, key, wanted, states, drift.get(key)) for key in fields_by_key}
         if not dry_run:
             if publish is not None:
                 publish()  # never save a new policy while any job can still run the superseded spec
+                awaiting_publish = False
             install_runtime(cfg)
             warning = toolset_warning(cfg, cron_toolsets_setting())
             if warning:
                 print(warning)
-            _apply_fenced(run, ensure, reg, wanted, states)
+            _apply_fenced(run, ensure, reg, wanted, states, drift)
     except BaseException:
-        if not dry_run:
+        if awaiting_publish and _saved_config_bytes() == saved:
+            _restore_before_publish(run, original, paused)
+        elif not dry_run:
             _safety_fence(run, wanted)
         raise
 
     # No history I/O (including polling a running old job) can block a policy change above.
-    kept_runs = 0
+    retirement = RemovalResult()
     if not dry_run:
         for key in list(ph_jobs.pending_swaps(reg)):
-            kept_runs += _archive_swap(run, reg, key)
+            _archive_swap(run, reg, key, retirement)
             if key in pending_before and key not in ph_jobs.pending_swaps(reg):
                 print(f"Setup: finished an interrupted job swap for {key}.")
     out = [{"job": fields["name"], "action": actions[key], "schedule": fields["schedule"],
             "timezone": fields["timezone"]} for key, (fields, _) in fields_by_key.items()]
     for key in sorted(removed_watches - fields_by_key.keys()):
         out.append({"job": ph_jobs.job_name(key), "action": "remove", "schedule": "", "timezone": cfg.get("timezone")})
-    if kept_runs:
-        print(f"Run history: {kept_runs} saved run file(s) of replaced jobs were copied to "
+    if retirement.copied:
+        print(f"Run history: {retirement.copied} saved run file(s) of replaced jobs were copied to "
               f"{phconf.data_dir() / HISTORY} (Hermes deletes a job's own output folder when the job is removed; "
               "setup only reads Hermes's cron/output and never writes into it).")
     return out
 
 
-def _action(reg: dict, key: str, wanted: dict, states: dict, pending_before: set) -> str:
+def _action(reg: dict, key: str, wanted: dict, states: dict, drift: str | None) -> str:
     entry = reg.get(key)
     jid = _job_id(entry)
     swap = ph_jobs.pending_swaps(reg).get(key, {})
     if key not in wanted:
         return "remove" if jid in states else "skip"
-    if key in pending_before:
-        return "defer"
-    if swap.get("old") and not swap.get("new"):
+    if swap.get("old") and not swap.get("new") and jid in states:
         return "replace"
     if jid not in states or key in reg.get(CREATING, {}):
         return "create"
     spec = wanted[key][1]
+    if drift == "replace":
+        return "replace"
     if _matches_spec(entry, spec):
-        return "keep"
+        return drift or "keep"
     return "update" if spec.get("toolsets") == (entry.get("toolsets") if isinstance(entry, dict) else None) else "replace"
 
 
-def _apply_fenced(run, ensure, reg: dict, wanted: dict, states: dict) -> None:
+def _apply_fenced(run, ensure, reg: dict, wanted: dict, states: dict, drift: dict) -> None:
     for key in list(reg.get(CREATING, {})):
         if key not in wanted:
             _retire_stage(run, reg, key)
@@ -1306,30 +1431,28 @@ def _apply_fenced(run, ensure, reg: dict, wanted: dict, states: dict) -> None:
     for key in sorted(wanted, key=lambda key: key != "say"):
         fields, spec = wanted[key]
         if key in reg.get(CREATING, {}):
-            _finish_create(run, ensure, reg, key, fields, spec)
+            _finish_create(run, ensure, reg, key, fields, spec, drift.get(key))
         elif key in ph_jobs.pending_swaps(reg):
-            _configure_swap(run, ensure, reg, key, fields, spec)
+            _configure_swap(run, ensure, reg, key, fields, spec, drift.get(key))
         elif _job_id(reg.get(key)) not in states:
             _finish_create(run, ensure, reg, key, fields, spec)
 
 
-def remove_all(*, run=subprocess.run) -> list[str]:
-    """Remove every job the registry records (and the jobs of an interrupted swap), one run at a time per profile
-    (registry_lock)."""
+def remove_all(*, run=subprocess.run) -> RemovalResult:
+    """Fence every owned job, then report confirmed removals and deferred paused IDs."""
     with registry_lock():
         return _remove_all(run)
 
 
-def _remove_all(run) -> list[str]:
+def _remove_all(run) -> RemovalResult:
     reg = _load_registry()
     try:
         states = _fence_jobs(run, reg, {})
-        gone = dict.fromkeys((*ph_jobs.pending_swaps(reg), *reg.get(CREATING, {}),
-                              *(key for key, entry in reg.items() if _job_id(entry) in states)))
-        _apply_fenced(run, None, reg, {}, states)
+        _apply_fenced(run, None, reg, {}, states, {})
     except BaseException:
         _safety_fence(run, {})
         raise
-    for key in list(ph_jobs.pending_swaps(reg)):
-        _archive_swap(run, reg, key)
-    return list(gone)
+    result = RemovalResult()
+    for key in sorted(ph_jobs.pending_swaps(reg), key=lambda key: key not in _SCRIPT_WORKERS):
+        _archive_swap(run, reg, key, result, uninstall=True)
+    return result

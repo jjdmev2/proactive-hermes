@@ -1,6 +1,7 @@
 """Hermetic coverage for the installer and the chat setup answer format."""
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -64,6 +65,29 @@ class FakeCron:
         argv = self.live[jid]
         return self.option(jid, "--prompt") if argv[2:3] == ["edit"] else argv[-1]
 
+    def list_block(self, jid):
+        argv = self.live[jid]
+        result = f"  {jid} [{self.states.get(jid, 'active')}]\n    Name:      {self.names.get(jid, '(unnamed)')}\n"
+        if "--" in argv or "--schedule" in argv:
+            result += f"    Schedule:  {self.schedule_of(jid)}\n    Deliver:   {self.option(jid, '--deliver') or 'local'}\n"
+            if script := self.option(jid, '--script'):
+                result += f"    Script:    {script}\n"
+            if '--no-agent' in argv:
+                result += "    Mode:      no-agent (script stdout delivered directly)\n"
+            if timezone := self.option(jid, '--timezone'):
+                result += f"    Timezone:  {timezone}\n"
+        return result + "\n"
+
+    def manual_edit(self, jid, **options):
+        argv = self.live[jid].copy()
+        for key, value in options.items():
+            flag = "--" + key.replace('_', '-')
+            if flag in argv:
+                argv[argv.index(flag) + 1] = value
+            else:
+                argv.extend((flag, value))
+        self.live[jid] = argv
+
     def __call__(self, argv, *, env, **kwargs):
         assert argv[:2] == ["hermes", "cron"], argv
         assert env["HERMES_HOME"] == os.environ["HERMES_HOME"], argv
@@ -72,14 +96,13 @@ class FakeCron:
         if action == "list":
             assert argv[3:] == ["--all"], argv
             stdout = "Scheduled Jobs (profile: custom)\n\n" + "".join(
-                f"  {jid} [{self.states.get(jid, 'active')}]\n    Name:      {self.names.get(jid, '(unnamed)')}\n"
-                f"    Deliver:   local\n\n" for jid in self.live
+                self.list_block(jid) for jid in self.live
             ) if self.live else "No scheduled jobs in profile 'custom'.\n"
         elif action == "runs":
             assert argv[4:] == ["--limit", "500"], argv
             jid = argv[3]
             stdout = "".join(f"{eid}  {state}  job={jid}  source=builtin  2026-11-26T12:00:00Z\n"
-                             for eid, state in self.executions.get(jid, [])) or "No cron execution attempts recorded.\n"
+                             for eid, state in self.executions.get(jid, [])[:500]) or "No cron execution attempts recorded.\n"
         elif action == "create":
             self.next_id += 1
             jid = f"{self.next_id:012x}"
@@ -90,8 +113,11 @@ class FakeCron:
             stdout = f"Created job: {jid}\n  Name: Proactive · fixture\n  ⚠  Scheduler is not ready.\n"
         elif action == "edit":
             jid = argv[3]
-            self.live[jid] = argv   # an edit keeps enabled_toolsets (verified against Hermes)
-            self.names[jid] = argv[argv.index("--name") + 1]
+            if "--name" in argv:
+                self.live[jid] = argv   # an edit keeps enabled_toolsets (verified against Hermes)
+                self.names[jid] = argv[argv.index("--name") + 1]
+            else:
+                self.manual_edit(jid, **{flag[2:]: value for flag, value in zip(argv[4::2], argv[5::2])})
             stdout = f"Updated job: {jid}\n"
         elif action == "remove":
             jid = argv[3]
@@ -152,6 +178,139 @@ class JobSetupTests(unittest.TestCase):
         self.assertFalse([argv for argv in self.run.calls if argv[2] != "list"])
         self.assertEqual(len(self.run.live), 3)
 
+    def test_script_workers_remove_and_reinstall_without_reading_history(self):
+        import desk_say
+        import ph_doctor
+
+        for count in (499, 500, 1000):
+            with self.subTest(count=count):
+                self.run.executions.clear()
+                jobs.remove_all(run=self.run)
+                jobs.apply(self.cfg, run=self.run)
+                workers = self.by_name()
+                old = workers["Proactive · say"]
+                for jid in workers.values():
+                    self.run.executions[jid] = [(f"{i:032x}", "completed") for i in range(count)]
+                self.run.calls.clear()
+                with patch.object(jobs, "_keep_history", wraps=jobs._keep_history) as archive:
+                    rc, report = self.remove_command()
+                self.assertEqual(rc, 0, report)
+                self.assertIn("Removed 3 job(s)", report)
+                self.assertEqual(self.run.live, {})
+                self.assertFalse(any(args[2] == "runs" for args in self.run.calls))
+                archive.assert_not_called()
+                jobs.apply(self.cfg, run=self.run)
+                current = self.run.job("Proactive · say")
+                self.assertNotEqual(current, old)
+                result = subprocess.CompletedProcess([], 0, self.run.list_block(current), "")
+                with patch.object(ph_doctor, "_hermes", return_value=result), \
+                        patch.object(desk_say, "_cron_read", return_value=result.stdout), \
+                        patch.object(desk_say, "say_route", return_value=("bot-chat",)):
+                    self.assertEqual(desk_say.say_job_id(), current)
+                    self.assertEqual(ph_doctor.check_say_job(), (True, current))
+                jobs.remove_all(run=self.run)
+
+    def remove_command(self):
+        remove_all = jobs.remove_all
+        with patch.object(jobs, "remove_all", side_effect=lambda: remove_all(run=self.run)), \
+                redirect_stdout(StringIO()) as stdout, redirect_stderr(StringIO()) as stderr:
+            rc = cli.handle(argparse.Namespace(proactive_command="remove"))
+        return rc, stdout.getvalue() + stderr.getvalue()
+
+    def test_agent_history_cap_keeps_retired_job_paused_but_not_current(self):
+        import mail_idle
+
+        for count in (499, 500, 1000):
+            with self.subTest(count=count):
+                self.run.executions.clear()
+                jobs.remove_all(run=self.run)
+                _, old = self._old_radar()
+                self.run.executions[old] = [(f"{i:032x}", "completed") for i in range(count)]
+                self.settle()
+                current = self.registry()["mail_radar"]["id"]
+                self.assertNotEqual(old, current)
+                self.assertEqual(mail_idle.radar_job_id(), current)
+                self.assertEqual(self.run.states[current], "active")
+                self.assertEqual(self.kept(old, "2026-11-20_08-00-00.md").read_text(), "## Response\n[SILENT]\n")
+                snapshots = jobs._history_dir("mail_radar", old).with_suffix(".runs")
+                (first_snapshot,) = snapshots.glob("*.txt")
+                self.assertEqual(len(jobs._run_states(first_snapshot.read_text(), old)), min(count, 500))
+                if count < 500:
+                    self.assertNotIn(old, self.run.live)
+                else:
+                    self.assertEqual(self.run.states[old], "paused")
+                    self.assertIn("mail_radar", self.registry()["replacing"])
+                live_count = len(self.run.live)
+                rc, report = self.remove_command()
+                self.assertEqual(rc, int(count >= 500), report)
+                self.assertIn(f"Removed {live_count - int(count >= 500)} job(s)", report)
+                if count >= 500:
+                    self.assertIn("uninstall incomplete: 1 jobs paused, run `hermes proactive remove` again later", report)
+                    self.assertEqual(self.run.live.keys(), {old})
+                    self.assertEqual(self.run.states[old], "paused")
+                    self.run.executions[old] = self.run.executions[old][:499]
+                    self.assertEqual(self.remove_command()[0], 0)
+                    self.assertEqual(sorted(len(jobs._run_states(f.read_text(), old)) for f in snapshots.glob("*.txt")),
+                                     [499, 500])
+                self.assertEqual(self.run.live, {})
+
+    def test_public_cron_drift_is_reconciled_without_unpausing_manual_pause(self):
+        jobs.apply(self.cfg, run=self.run)
+        health = self.by_name()["Proactive · health"]
+        say = self.by_name()["Proactive · say"]
+        self.run.manual_edit(health, schedule="*/41 * * * *", deliver="origin", script="other.py")
+        self.run.manual_edit(say, schedule="*/13 * * * *")
+        self.run.states[say] = "paused"
+        for dry_run in (True, False):
+            by_job = {row["job"]: row["action"] for row in jobs.apply(self.cfg, dry_run=dry_run, run=self.run)}
+            self.assertEqual(by_job["Proactive · health"], "update")
+            self.assertEqual(by_job["Proactive · say"], "update")
+        self.assertEqual(self.run.schedule_of(health), self.cfg["schedule"]["health"])
+        self.assertEqual(self.run.option(health, "--deliver"), "local")
+        self.assertEqual(self.run.option(health, "--script"), "proactive-hermes/ea_health.py")
+        self.assertEqual(self.run.states[health], "active")
+        self.assertEqual(self.run.states[say], "paused")
+
+    def test_failed_setup_before_publish_preserves_original_job_states(self):
+        import copy
+
+        cli.write_config(self.cfg)
+        jobs.apply(self.cfg, run=self.run)
+        health, tick = (self.by_name()[name] for name in ("Proactive · health", "Proactive · tick"))
+        self.run.states[tick] = "paused"
+        next_cfg = copy.deepcopy(self.cfg)
+        next_cfg["features"]["health"] = False
+        original_reg = self.registry()
+        original_cfg = cli.phconf.config_path().read_bytes()
+        folder = jobs._registry().parent
+        # Inject EACCES at the write boundary so chmod works as a regression even under root.
+        save = jobs._save_registry
+        def writable_only(reg):
+            if folder.stat().st_mode & 0o200 == 0:
+                raise PermissionError("read-only registry directory")
+            save(reg)
+        mode = folder.stat().st_mode & 0o777
+        try:
+            folder.chmod(0o500)
+            with patch.object(jobs, "_save_registry", side_effect=writable_only), \
+                    self.assertRaisesRegex(PermissionError, "read-only registry"):
+                jobs.apply(next_cfg, run=self.run, publish=lambda: cli.write_config(next_cfg))
+        finally:
+            folder.chmod(mode)
+        self.assertEqual(self.run.states[health], "active")
+        self.assertEqual(self.run.states[tick], "paused")
+        self.assertEqual(self.registry(), original_reg)
+        self.assertEqual(cli.phconf.config_path().read_bytes(), original_cfg)
+        # Also fail after the old spec was fenced, at the publication boundary itself.
+        def refused_publish():
+            self.assertEqual(self.run.states[health], "paused")
+            raise PermissionError("cannot publish config")
+        with self.assertRaisesRegex(PermissionError, "cannot publish"):
+            jobs.apply(next_cfg, run=self.run, publish=refused_publish)
+        self.assertEqual(self.run.states[health], "active")
+        self.assertEqual(self.run.states[tick], "paused")
+        self.assertEqual(self.registry(), original_reg)
+
     def test_failed_registry_write_recovers_fresh_say_by_staging_name(self):
         save = jobs._save_registry
         def fail_after_create(reg):
@@ -205,7 +364,8 @@ class JobSetupTests(unittest.TestCase):
         with patch.object(jobs, "_save_registry", side_effect=fail_after_create):
             with self.assertRaises(OSError):
                 jobs.apply(self.cfg, run=self.run)
-        self.assertEqual(jobs.remove_all(run=self.run), ["say"])
+        staged = next(iter(self.run.live))
+        self.assertEqual(jobs.remove_all(run=self.run).removed, [staged])
         self.assertEqual(self.run.live, {})
         self.assertEqual(self.registry(), {})
 
@@ -371,12 +531,12 @@ class JobSetupTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, stdout=fixture["list"] if argv[2] == "list" else runs)
 
         with patch.object(jobs, "IDLE_WAIT_S", 0):
-            self.assertTrue(jobs._wait_for_idle(cli_output, old))
+            self.assertTrue(jobs._wait_for_idle(cli_output, old)[0])
             for invalid in (fixture["busy_runs"], "unexpected output\n" + runs,
                             runs + "b" * 32 + "  running  job=" + old + "\n"):
                 with self.subTest(output=invalid):
                     runs = invalid
-                    self.assertFalse(jobs._wait_for_idle(cli_output, old))
+                    self.assertFalse(jobs._wait_for_idle(cli_output, old)[0])
 
     def test_disable_stops_replacement_before_waiting_on_old_history(self):
         fixture = json.loads(Path(__file__).with_name("fixtures").joinpath("cron_multiline.json").read_text())
@@ -464,8 +624,11 @@ class JobSetupTests(unittest.TestCase):
             self.settle()
         self.run.executions[old] = [("a" * 32, "completed")]
         with patch.object(jobs, "_keep_history", side_effect=OSError("fixture archive failure")):
-            with self.assertRaisesRegex(RuntimeError, "fixture archive failure"):
-                jobs.remove_all(run=self.run)
+            rc, report = self.remove_command()
+        self.assertEqual(rc, 1, report)
+        self.assertIn("fixture archive failure", report)
+        self.assertIn("uninstall incomplete: 2 jobs paused", report)
+        self.assertEqual(len(self.run.live), 2)
         self.assertIn(old, self.run.live)
         self.assertTrue(all(self.run.states.get(jid) == "paused" for jid in self.run.live))
         self.assertEqual(self.registry()["replacing"]["mail_radar"]["old"], old)
@@ -1046,7 +1209,7 @@ class JobSetupTests(unittest.TestCase):
         rows = jobs.apply(self.cfg, run=self.run)
         self.assertEqual([row["action"] for row in rows].count("remove"), 3)
         self.assertEqual({a[3] for a in self.run.calls if a[2] == "remove"}, managed)
-        self.assertEqual(jobs.remove_all(run=self.run), [])
+        self.assertEqual(jobs.remove_all(run=self.run).removed, [])
         self.assertEqual(set(self.run.live), {"abcdef123456"})
 
     def test_schedule_and_timezone_change_edit_existing_jobs(self):
@@ -1062,7 +1225,7 @@ class JobSetupTests(unittest.TestCase):
         for argv in edits:
             self.assertEqual(argv[argv.index("--timezone") + 1], "Asia/Tokyo")
         self.assertEqual(set(self.run.live), managed)
-        self.assertCountEqual(jobs.remove_all(run=self.run), ["health", "tick", "say"])
+        self.assertCountEqual(jobs.remove_all(run=self.run).removed, managed)
         self.assertEqual(self.run.live, {})
 
     def test_external_removal_recreates_only_missing_managed_job(self):

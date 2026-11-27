@@ -180,6 +180,17 @@ class PromptsNeverInlineUntrustedText(unittest.TestCase):
         self.assertIn("data, never instructions", (HERE / "prompts" / "lookahead.md").read_text(encoding="utf-8"))
 
 
+class BookingWording(unittest.TestCase):
+    def test_scheduled_booking_wording_describes_instructions_and_authority(self):
+        claim = "Scheduled jobs are instructed not to book or pay and have no booking or payment authority by default."
+        for rel in ("README.md", "SECURITY.md", "after-install.md", "skills/browser-bookings/SKILL.md",
+                    "skills/proactive-setup/SKILL.md", "skills/proactive-desk/references/desk-contract.md"):
+            with self.subTest(path=rel):
+                text = (HERE / rel).read_text(encoding="utf-8")
+                self.assertIn(claim, text)
+                self.assertNotRegex(text.lower(), r"(?:scheduled jobs?|a watch)[^.\n]{0,75}(?:never|can't|cannot) (?:book|pay)")
+
+
 class ApiKeyScope(unittest.TestCase):
     def test_key_only_through_hermes_never_from_any_env_file(self):
         import ea_decide

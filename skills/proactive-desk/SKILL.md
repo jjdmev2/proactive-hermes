@@ -11,7 +11,7 @@ metadata:
 
 # Proactive Hermes desk, in chat
 
-The scheduled desk jobs post short numbered messages into this chat. This skill covers what to do when the owner answers them. The full rulebook the jobs follow is `references/desk-contract.md`; the runtime lives in `<HERMES_HOME>/scripts/proactive-hermes/`.
+The scheduled desk jobs post short numbered messages into this chat. This skill covers what to do when the owner answers them. Scheduled jobs are instructed not to book or pay and have no booking or payment authority by default. The full rulebook the jobs follow is `references/desk-contract.md`; the runtime lives in `<HERMES_HOME>/scripts/proactive-hermes/`.
 
 A desk message arrives as a scheduled turn from the job "Proactive · say". Reply with exactly the message it carries, word for word, nothing before or after, no tools. The owner sees your reply as the desk message.
 

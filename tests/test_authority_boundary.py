@@ -677,7 +677,7 @@ class ManagedJobIdentity(OfflineTestCase):
             self.assertIn(ph_jobs.job_name(key), health.missing_jobs([old]))
             health.check_local_delivery([old, new])
             cron.assert_not_called()
-            reg[key] = {"id": "replacement"}
+            reg[key] = {"id": "replacement", "spec": "fixture fingerprint"}
             registry.write_text(json.dumps(reg))
             self.assertNotIn(ph_jobs.job_name(key), health.missing_jobs([old, new]))
             cfg["watches"] = []
@@ -700,6 +700,28 @@ class ManagedJobIdentity(OfflineTestCase):
         registry.write_text(json.dumps(reg))
         self.assertEqual(desk_say.say_job_id(), ids["say"][0])
         self.assertEqual(mail_idle.radar_job_id(), ids["mail_radar"][0])
+
+    def test_worker_identity_depends_on_settlement_not_retired_history(self):
+        import desk_say
+        import mail_idle
+
+        registry = phconf.data_dir() / "jobs.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        for key, lookup in (("say", desk_say.say_job_id), ("mail_radar", mail_idle.radar_job_id)):
+            with self.subTest(key=key):
+                old, new = "1" * 12, "2" * 12
+                entry = {"id": new}
+                record = {"old": old, "new": new, "retired": [old]}
+                reg = {key: entry, "replacing": {key: record}}
+                registry.write_text(json.dumps(reg))
+                self.assertIsNone(lookup())                          # not fingerprinted
+                entry["spec"] = "fixture fingerprint"
+                record["arm"] = True
+                registry.write_text(json.dumps(reg))
+                self.assertIsNone(lookup())                          # not settled
+                del record["arm"]
+                registry.write_text(json.dumps(reg))
+                self.assertEqual(lookup(), new)                      # cleanup-only journal
 
     def test_recorded_job_id_counts_as_identity(self):
         import cli

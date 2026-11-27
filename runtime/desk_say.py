@@ -175,7 +175,7 @@ def pending_due() -> int:
 def say_job_id() -> str | None:
     """The plugin's own say job: jobs.json key "say" written by `hermes proactive setup`."""
     reg = ph_jobs.read_registry(phconf.data_dir() / "jobs.json")
-    jid = ph_jobs.recorded_job_id(reg, SAY_JOB_KEY)
+    jid = ph_jobs.recorded_job_id(reg, SAY_JOB_KEY, allow_pending=True)
     return jid if jid and re.fullmatch(r"[0-9a-f]{12}", jid) else None
 
 

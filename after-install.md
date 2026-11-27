@@ -19,4 +19,4 @@ Public holidays: the plugin declares the `holidays` package, which Hermes instal
 
 **Get the most out of it:** install the Hermes mobile app and share Reminders, Alarms, Location and Calendar, and sign in once (in the browser Hermes uses) to the shops, marketplaces and event sites you want watched.
 
-Approval first: Hermes does on its own only what you allow in setup. Sending, buying and registering wait for your yes; payments and passwords always stay with you.
+Approval first: Hermes does on its own only what you allow in setup. Sending, buying and registering wait for your yes; payment approvals and passwords stay with you. Scheduled jobs are instructed not to book or pay and have no booking or payment authority by default.

@@ -36,7 +36,8 @@ def recorded_job_id(reg: dict, key: str, *, allow_pending: bool = False) -> str 
     pending = pending_swaps(reg)
     if key in pending:
         swap = pending[key]
-        if (not allow_pending or not isinstance(swap, dict) or jid != swap.get("new")
+        if (not allow_pending or not isinstance(entry, dict) or not entry.get("spec")
+                or not isinstance(swap, dict) or jid != swap.get("new")
                 or jid == swap.get("old") or jid in (swap.get("retired") or ()) or "arm" in swap):
             return None
     return jid if isinstance(jid, str) and jid else None

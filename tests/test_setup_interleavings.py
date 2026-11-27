@@ -139,6 +139,7 @@ class FenceInterleavings(unittest.TestCase):
         self.enterContext(temporary_home())
         self.reset_world()
         rng = random.Random(SEED)
+        extra = random.Random(SEED ^ 0x500)
         exercised = Counter()
         for step in range(STEPS):
             cfg = cli.phconf.load() if cli.phconf.config_path().exists() else self.initial_config()
@@ -161,6 +162,17 @@ class FenceInterleavings(unittest.TestCase):
                 cfg['owner']['name'] = f'Fixture {step}'
             busy = rng.choice(sorted(set(self.host.live) - {self.unrelated}) or ['none'])
             self.host.executions = {busy: [('1' * 32, 'running')]} if fault == 'busy' else {}
+            if fault != 'busy' and busy != 'none' and extra.randrange(3) == 0:
+                count = extra.choice((499, 500, 1000))
+                self.host.executions[busy] = [(f'{i:032x}', 'completed') for i in range(count)]
+            if fault == 'none' and operation == 'recovery':
+                # Apply the saved policy immediately after an independent, public cron edit.
+                for row in jobs._load_registry().values():
+                    jid = row.get('id')
+                    if jid in self.host.live and self.host.states.get(jid) == 'active':
+                        self.host(['hermes', 'cron', 'edit', jid, '--schedule', '9 9 * * *'], env=os.environ)
+                        exercised['external_edit'] += 1
+                        break
             write_count = 0
             reject_write = rng.randint(1, 5)
 
@@ -174,6 +186,9 @@ class FenceInterleavings(unittest.TestCase):
 
             def archive(key, jid):
                 self.assert_invariant(removed=removed)
+                if len(self.host.executions.get(jid, ())) >= 500:
+                    exercised['capped_archive'] += 1
+                    self.assertEqual(self.host.states.get(jid), 'paused')
                 if fault == 'archive':
                     exercised['archive'] += 1
                     raise OSError('injected archive copy')
@@ -197,7 +212,8 @@ class FenceInterleavings(unittest.TestCase):
                 exercised['parser'] += self.host.rejections
                 exercised['busy'] += ('runs' in self.host.trace and fault == 'busy'
                                       and busy in self.host.live and self.host.states.get(busy) == 'paused')
-        for kind in ('archive', 'busy', 'parser', 'registry', 'interrupt', 'add', 'remove', 'uninstall', 'recovery'):
+        for kind in ('archive', 'busy', 'parser', 'registry', 'interrupt', 'add', 'remove', 'uninstall', 'recovery',
+                     'capped_archive', 'external_edit'):
             self.assertGreater(exercised[kind], 0, exercised)
         self.host.reset_faults()
         self.host.executions.clear()

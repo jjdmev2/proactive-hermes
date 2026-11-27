@@ -90,6 +90,33 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(json.loads(self.registry.read_text()), {})
         self.assertEqual(json.loads(self.config.read_text())["watches"], [])
 
+    def test_publication_is_between_fencing_and_arming(self):
+        self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
+        old = self.run.job("Proactive · watch: Card drop")
+        # A single setup removes the old watch and arms its replacement.
+        cfg = cli.phconf.load()
+        cfg["watches"][0]["name"] = "Spare parts"
+        events = []
+
+        def publish():
+            self.assertEqual(self.run.states[old], "paused")
+            self.assertEqual(cli.phconf.load()["watches"][0]["name"], "Card drop")
+            cli.write_config(cfg)
+            events.append("published")
+
+        def host(argv, **kwargs):
+            if argv[2] in ("edit", "resume"):
+                self.assertEqual(cli.phconf.load()["watches"][0]["name"], "Spare parts")
+                self.assertEqual(self.run.states[old], "paused")
+                events.append(argv[2])
+            return self.run(argv, **kwargs)
+
+        jobs.apply(cfg, run=host, publish=publish)
+        self.assertEqual(events[0], "published")
+        self.assertIn("resume", events)
+        self.assertEqual(self.run.states[self.run.job("Proactive · watch: Spare parts")], "active")
+        self.assertNotIn(old, self.run.live)
+
     def pending_watch(self):
         self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
         old = self.run.job("Proactive · watch: Card drop")

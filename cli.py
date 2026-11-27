@@ -446,11 +446,15 @@ def handle(args) -> int:
         return 0
     if cmd == "remove":
         try:
-            gone = jobs.remove_all()
-        except RuntimeError as exc:   # RegistryBusy, or a `hermes cron` step that failed
+            result = jobs.remove_all()
+        except (OSError, RuntimeError) as exc:   # registry persistence, lock or a cron step failed
             print(f"Remove: {exc}", file=sys.stderr)
             return 1
-        print(f"Removed {len(gone)} job(s). Config and private state kept in {phconf.data_dir()}.")
+        print(f"Removed {len(result.removed)} job(s). Config and private state kept in {phconf.data_dir()}.")
+        if result.paused:
+            print(f"uninstall incomplete: {len(result.paused)} jobs paused, run `hermes proactive remove` again later",
+                  file=sys.stderr)
+            return 1
         return 0
     if cmd != "setup":
         print(__doc__)

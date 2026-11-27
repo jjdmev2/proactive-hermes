@@ -71,7 +71,7 @@ If `hermes proactive doctor` does not show the `decisions` check as ok, say once
 
 Ask these three in plain words, after the details:
 
-1. **Approval levels.** "Which of these may I do without asking: private calendar blocks, reminders, alarms for urgent things, leave-time planning for trips, cleanup (removing my own blocks and alerts and ticking off my own reminders once an item is closed)? Everything else I prepare and ask first. Payments and passwords always stay with you." Juan's setup allows all five.
+1. **Approval levels.** "Which of these may I do without asking: private calendar blocks, reminders, alarms for urgent things, leave-time planning for trips, cleanup (removing my own blocks and alerts and ticking off my own reminders once an item is closed)? Everything else I prepare and ask first. Payment approvals and passwords stay with you." Juan's setup allows all five.
 2. **The Hermes mobile app.** Recommend it strongly: reminders, alarms, location (for leave times) and calendar make the desk useful on the go. Ask them to install it, sign in to the same Hermes, and share Reminders, Alarms, Location and Calendar in its settings. Check with the mobile device tools if they are available.
 3. **First watches.** Offer two or three from their life, for example:
    - selling apps (Vinted, eBay, Marketplace): "tell me when a buyer makes an offer, with a suggested reply"
@@ -102,5 +102,5 @@ Under `plugins.isolation: host` the CLI command is not registered. Use the same 
 ## Rules
 
 - Never ask for passwords, tokens or card numbers, and never accept one in chat. Accounts are connected through Hermes itself (google-workspace skill, Nous Portal connectors, himalaya), and mail push app passwords go only into Settings → Plugins → Proactive Hermes or `hermes plugins config proactive-hermes`.
-- Say once how approval works: what they allowed happens on its own, everything else waits for their yes, payments and passwords always stay with them.
+- Explain approvals once: what they allowed happens on its own; everything else waits for their yes. Payment approvals and passwords stay with them. Scheduled jobs are instructed not to book or pay and have no booking or payment authority by default.
 - Nothing personal goes into the plugin folder. Config lives in `plugin-data/proactive-hermes/config.json` on their machine only.
