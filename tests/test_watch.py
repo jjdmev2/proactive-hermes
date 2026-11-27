@@ -39,18 +39,16 @@ class AuthorityTests(unittest.TestCase):
             self.assertEqual(cli.phconf.allowed("unknown"), "ask")
 
 
-class WatchTests(unittest.TestCase):
+class WatchFixture(unittest.TestCase):
     def setUp(self):
         home = self.enterContext(TemporaryDirectory())
         self.enterContext(patch.dict(os.environ, {"HERMES_HOME": home}, clear=True))
         self.home = Path(home)
-        self.run = FakeCron()
-        self.enterContext(patch.object(jobs, "_plugin_ensure", self.run.ensure))
+        self.cron = FakeCron()
+        self.enterContext(patch.object(jobs, "_plugin_ensure", self.cron.ensure))
         self.enterContext(patch.object(jobs, "api_problem", return_value=None))
-        cfg = cli.base_config("custom")
-        cfg["features"] = dict.fromkeys(cfg["features"], False)
-        self.config = cli.write_config(cfg)
-        self.registry = self.home / "plugin-data" / "proactive-hermes" / "jobs.json"
+        self.config = cli.phconf.config_path()
+        self.registry = self.config.with_name("jobs.json")
         self.parser = argparse.ArgumentParser()
         cli.setup_parser(self.parser)
 
@@ -60,11 +58,69 @@ class WatchTests(unittest.TestCase):
         apply = jobs.apply
 
         def apply_fake(cfg, **kwargs):
-            return apply(cfg, run=self.run, **kwargs)
+            return apply(cfg, run=self.cron, **kwargs)
 
         with patch.object(jobs, "apply", side_effect=apply_fake), redirect_stdout(out), redirect_stderr(err):
             result = cli.handle(args)
         return result, out.getvalue() + err.getvalue()
+
+
+class UninstalledWatchTests(WatchFixture):
+    def test_fresh_remove_missing_watch_touches_nothing(self):
+        self.assertEqual(self.command(["watch", "remove", "--name", "Card drop"]), (0, "No watch named Card drop.\n"))
+        self.assertEqual(list(self.home.iterdir()), [])
+        self.assertEqual(self.cron.calls, [])
+        self.assertEqual(self.cron.ensured, [])
+
+    def test_fresh_add_saves_config_without_installing_jobs_or_runtime(self):
+        with patch.object(jobs, "preflight") as preflight:
+            output = self.command(ADD + ["--then", "tell"])
+        self.assertEqual(self.cron.calls, [])
+        self.assertEqual(self.cron.ensured, [])
+        preflight.assert_not_called()
+        self.assertEqual(output, (0, "Saved. Run `hermes proactive setup` to start the desk.\n"))
+        self.assertEqual(json.loads(self.config.read_text())["watches"], [
+            {"name": "Card drop", "schedule": "*/30 * * * *", "check": "the shop page for the new card set",
+             "when": "preorders open", "then": "tell", "urgent": False}])
+        self.assertFalse(self.registry.exists())
+        self.assertFalse((self.home / "scripts").exists())
+
+    def test_remove_retained_watch_after_uninstall_only_updates_config(self):
+        cfg = cli.base_config("custom")
+        cfg["watches"] = [{"name": "Card drop", "schedule": "*/30 * * * *", "check": "stock",
+                           "when": "available", "then": "tell", "urgent": False}]
+        cli.write_config(cfg)
+        jobs.apply(cfg, run=self.cron)
+        remove_all = jobs.remove_all
+        with patch.object(jobs, "remove_all", side_effect=lambda: remove_all(run=self.cron)):
+            self.assertEqual(self.command(["remove"])[0], 0)
+        self.assertEqual(json.loads(self.registry.read_text()), {})
+        self.assertEqual(self.cron.live, {})
+        registry_bytes = self.registry.read_bytes()
+        runtime = cli.phconf.scripts_dir().readlink()
+        self.cron.calls.clear()
+        self.cron.ensured.clear()
+
+        output = self.command(["watch", "remove", "--name", "Card drop"])
+        self.assertEqual(self.cron.calls, [])
+        self.assertEqual(self.cron.ensured, [])
+        self.assertEqual(self.cron.live, {})
+        self.assertEqual(output, (0, "Saved. Run `hermes proactive setup` to start the desk.\n"))
+        self.assertEqual(json.loads(self.config.read_text()), {**cfg, "watches": []})
+        self.assertEqual(self.registry.read_bytes(), registry_bytes)
+        self.assertEqual(cli.phconf.scripts_dir().readlink(), runtime)
+
+
+class WatchTests(WatchFixture):
+    def setUp(self):
+        super().setUp()
+        self.run = self.cron
+        cfg = cli.base_config("custom")
+        cfg["features"] = dict.fromkeys(cfg["features"], False)
+        cli.write_config(cfg)
+        # An installed desk with a recorded say ID missing from cron. The next
+        # add must repair it as well as install the first watch.
+        jobs._save_registry({"say": "123456abcdef"})
 
     def test_add_list_reapply_and_remove_only_the_watch(self):
         self.assertEqual(self.command(ADD + ["--then", "alarm", "--urgent"])[0], 0)

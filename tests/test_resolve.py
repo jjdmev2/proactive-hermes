@@ -123,7 +123,7 @@ class ResolveTests(unittest.TestCase):
                            'draft_versions': {'sam': version}})
 
     def delivered(self, extra=None):
-        def statuses():
+        def statuses(_notices):
             rows = [json.loads(line) for line in
                     (resolve.phconf.state_dir() / 'ping_log.jsonl').read_text().splitlines() if line.strip()]
             out = {resolve._message_id(r): {'status': 'delivered', 'reply_id': i} for i, r in enumerate(rows, 1)}
@@ -212,6 +212,38 @@ class ResolveTests(unittest.TestCase):
                         transcript.return_value = turns
                         self.assertEqual(resolve.number_target(1), (None, resolve.AMBIGUOUS))
                     self.assertEqual(desk_say.status_of(old_id), status)
+
+    def test_reply_number_ignores_a_legacy_notice_only_if_its_display_order_is_proven(self):
+        desk_say = importlib.import_module('desk_say')
+
+        old_text = 'Morgan needs a receipt by Friday Draft ready, reply 1.'
+        new_text = 'Riley needs a receipt by Friday. Draft ready, reply 1.'
+        old = {'kind': 'desk_message', 'job': 'audit', 'keys': ['Morgan'], 'text': old_text,
+               'drafts': {'Morgan': 'ready'}, 'delivery': 'delivered', 'row_id': None}
+        latest = resolve.put({**self.record, 'key': 'Riley', 'to': 'Riley@example.org'})
+        new_id = 'b' * 24
+        new = {'kind': 'desk_message', 'keys': ['Riley'], 'text': new_text, 'say_id': new_id,
+               'drafts': {'Riley': 'ready'}, 'draft_versions': {'Riley': resolve.draft_version(latest)}}
+        self.log_messages(old, new)
+        say_log = self.tmp / 'say_log.jsonl'
+        say_log.write_text(''.join(json.dumps(row) + '\n' for row in (
+            {'id': resolve._message_id(old), 'status': 'delivered', 'key': 'audit:Morgan',
+             'session_id': 'local-legacy', 'row_id': None, 'push': 'door', 'door_status': 'queued'},
+            {'id': new_id, 'status': 'delivered', 'reply_id': 6, 'text': new_text},
+        )))
+        # The old internal relay was hidden; the exact assistant reply was visible.
+        earlier = (4, 'assistant', old_text)
+        later = (6, 'assistant', new_text)
+        with patch.multiple(desk_say, STATE=self.tmp, SAY_LOG=say_log, OUTBOX=self.tmp / 'outbox.jsonl'), \
+                patch.object(desk_say, 'bot_chat_turns') as transcript:
+            for turns in ([later, earlier], [later], None, [earlier, later, (8, 'assistant', old_text)]):
+                transcript.return_value = turns
+                self.assertEqual(resolve.number_target(1), (None, resolve.AMBIGUOUS))
+            transcript.return_value = [earlier, later]
+            self.assertEqual(resolve.number_target(1), ('Riley', 'ok'))
+            self.assertIn('To: Riley@example.org', self.cli('show', '--n', '1')[1])
+            transcript.return_value = [earlier]
+            self.assertEqual(resolve.number_target(1), (None, resolve.AMBIGUOUS))
 
     def test_later_numbered_notice_without_a_draft_does_not_select_an_older_draft(self):
         sam = resolve.put(self.record)

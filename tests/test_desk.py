@@ -154,7 +154,7 @@ class DeskTests(OfflineTestCase):
         self.deliver = self.enterContext(patch.object(desk_say, "enqueue", return_value={"status": "queued", "id": "m1"}))
         self.kick = self.enterContext(patch.object(desk_say, "kick", return_value={"kick": "ok"}))
         # "Reply N" binds to messages the owner received: here every logged message counts as delivered.
-        self.enterContext(patch.object(resolve, "_say_statuses", lambda: {
+        self.enterContext(patch.object(resolve, "_say_statuses", lambda _notices: {
             resolve._message_id(r): {"status": "delivered", "reply_id": i}
              for i, r in enumerate(self.rows(desk.PING_LOG), 1)}))
 

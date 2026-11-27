@@ -222,7 +222,7 @@ def draft_version(row: dict) -> str:
     return hashlib.sha256(json.dumps([row.get(key) for key in fields], sort_keys=True).encode()).hexdigest()
 
 
-def _say_statuses() -> dict[str, dict]:
+def _say_statuses(notices) -> dict[str, dict]:
     import desk_say
     turns = None
     try:
@@ -234,8 +234,22 @@ def _say_statuses() -> dict[str, dict]:
     last = desk_say._last_status()
     order = {rid: i for i, (rid, role, _) in enumerate(turns or ()) if role == "assistant"}
     relays = desk_say.relay_orders(turns or (), last.values())
+    claimed = {row.get("reply_id") for row in last.values() if type(row.get("reply_id")) is int}
+    texts = {mid: _text(row.get("text")).strip() for mid, row in notices.items()}
+
+    def legacy_order(mid, receipt):
+        text = texts.get(mid)
+        if receipt.get("status") != "delivered" or receipt.get("reply_id") is not None or not text:
+            return None
+        # The private legacy relay may be hidden. Require one exact displayed reply,
+        # unique to this notice and not already bound to a confirmed receipt.
+        matches = [rid for rid, role, shown in turns or () if role == "assistant" and shown == text]
+        if len(matches) == 1 and matches[0] not in claimed and list(texts.values()).count(text) == 1:
+            return order[matches[0]]
+        return None
+
     return {mid: {**row, "reply_order": order.get(row["reply_id"]) if type(row.get("reply_id")) is int else None,
-                  "relay_order": relays.get(mid),
+                  "relay_order": relays.get(mid), "legacy_order": legacy_order(mid, row),
                   "outside_display": turns is not None and type(row.get("reply_id")) is int
                   and row["reply_id"] not in order}
             for mid, row in last.items()}
@@ -273,7 +287,7 @@ def _numbered_draft(n, statuses=None) -> tuple[dict | None, str]:
         return None, AMBIGUOUS
     if not rows:
         return None, AMBIGUOUS
-    statuses = _say_statuses() if statuses is None else statuses
+    statuses = _say_statuses(rows) if statuses is None else statuses
     received = {}
     unresolved_orders = []
     for mid, row in rows.items():
@@ -286,6 +300,8 @@ def _numbered_draft(n, statuses=None) -> tuple[dict | None, str]:
             continue
         if state == "delivered" and type(order) is int and order not in received:
             received[order] = row
+        elif state == "delivered" and receipt.get("reply_id") is None and order is None:
+            unresolved_orders.append(receipt.get("legacy_order"))
         elif state in ("handed", "accepted", "posting", "unverified"):
             unresolved_orders.append(receipt.get("relay_order"))
         elif state not in ("queued", "retry", "failed", None):

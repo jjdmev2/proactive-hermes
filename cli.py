@@ -352,10 +352,22 @@ def setup_parser(parser) -> None:
     watch_sub.add_parser("remove", help="Remove a watch and its managed job").add_argument("--name", required=True)
 
 
+def _watch_recorded(name, reg, jobs) -> bool:
+    key = f"watch:{name}"
+    return key in reg or key in jobs.ph_jobs.pending_swaps(reg) or key in reg.get(jobs.CREATING, {})
+
+
 def handle_watch(args, jobs) -> int:
     if args.watch_command == "list":
         print(json.dumps(phconf.load()["watches"], ensure_ascii=False, indent=2))
         return 0
+    # A missing removal is read-only, including on a profile with no lock file yet.
+    if (args.watch_command == "remove" and (name := getattr(args, "name", ""))
+            and name.strip() and name.isprintable()):
+        if (not any(watch["name"] == name for watch in phconf.load()["watches"])
+                and not _watch_recorded(name, jobs._load_registry(), jobs)):
+            print(f"No watch named {name}.")
+            return 0
     try:
         with jobs.registry_lock():   # read, change and save the watches, and apply them, as one run
             return _change_watch(args, jobs)
@@ -372,6 +384,12 @@ def _change_watch(args, jobs) -> int:
         if not name.strip() or not name.isprintable():
             raise ValueError("--name must be a nonblank, single-line name")
         existing = next((watch for watch in watches if watch["name"] == name), None)
+        reg = jobs._load_registry()
+        if args.watch_command == "remove" and existing is None and not _watch_recorded(name, reg, jobs):
+            print(f"No watch named {name}.")
+            return 0
+        # A cleanup journal is not a current managed-job registration.
+        installed = any(isinstance(jid := jobs._job_id(entry), str) and jid for entry in reg.values())
         if args.watch_command == "add":
             if not args.check.strip() or not args.when.strip():
                 raise ValueError("--check and --when must not be blank")
@@ -392,6 +410,14 @@ def _change_watch(args, jobs) -> int:
                 watches.append(watch)
         elif existing is not None:
             watches.remove(existing)
+        if not installed:
+            try:
+                write_config(cfg)
+            except OSError as exc:
+                print(f"Watch: {exc}", file=sys.stderr)
+                return 1
+            print("Saved. Run `hermes proactive setup` to start the desk.")
+            return 0
         jobs.preflight()       # a Hermes without the public cron API leaves config.json unchanged
         jobs.runtime_paths()   # a refused runtime destination leaves config.json unchanged
         check_authority(cfg)
