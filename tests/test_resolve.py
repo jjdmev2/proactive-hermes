@@ -181,6 +181,38 @@ class ResolveTests(unittest.TestCase):
                     self.assertIn('Ask the owner which item', output)
                     self.assertNotIn('new@acme.example', output)
 
+    def test_reply_number_ignores_only_unresolved_relays_proven_older_in_bot_chat(self):
+        import desk_say
+
+        sam = resolve.put(self.record)
+        latest = resolve.put({**self.record, 'key': 'latest', 'to': 'latest@acme.example', 'draft': 'Latest draft.'})
+        old_id, new_id = 'a' * 24, 'b' * 24
+        old_text, new_text = 'Old numbered notice.', 'New numbered notice.'
+        self.log_messages(*[
+            {'kind': 'desk_message', 'keys': [row['key']], 'drafts': {row['key']: 'ready'},
+             'say_id': mid, 'draft_versions': {row['key']: resolve.draft_version(row)}}
+            for row, mid in ((latest, new_id), (sam, old_id))  # composition order is not display order
+        ])
+        say_log = self.tmp / 'say_log.jsonl'
+        header = '[Cronjob "Proactive · say" output — scheduled job, not the user.]\n\n'
+        earlier = [(51, 'user', header + desk_say.job_output(old_text, old_id)),
+                   (50, 'assistant', 'A paraphrase without a receipt.')]
+        later = [(11, 'user', header + desk_say.job_output(new_text, new_id)), (10, 'assistant', new_text)]
+        with patch.multiple(desk_say, STATE=self.tmp, SAY_LOG=say_log, OUTBOX=self.tmp / 'outbox.jsonl'), \
+                patch.object(desk_say, 'bot_chat_turns') as transcript:
+            for status in ('unverified', 'handed'):
+                with self.subTest(status=status):
+                    say_log.write_text(''.join(json.dumps(row) + '\n' for row in (
+                        {'id': old_id, 'status': status, 'text': old_text, 'epoch': desk_say.time.time()},
+                        {'id': new_id, 'status': 'delivered', 'text': new_text, 'reply_id': 10},
+                    )))
+                    transcript.return_value = earlier + later
+                    self.assertIn('To: latest@acme.example', self.cli('show', '--n', '1')[1])
+                    for turns in (later + earlier, later, None, earlier + later + [(52, *earlier[0][1:])]):
+                        transcript.return_value = turns
+                        self.assertEqual(resolve.number_target(1), (None, resolve.AMBIGUOUS))
+                    self.assertEqual(desk_say.status_of(old_id), status)
+
     def test_later_numbered_notice_without_a_draft_does_not_select_an_older_draft(self):
         sam = resolve.put(self.record)
         at = self.clock.isoformat()

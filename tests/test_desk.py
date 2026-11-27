@@ -44,6 +44,7 @@ with TemporaryDirectory() as directory, patch.dict(os.environ, isolated_env(Path
 
 
 SILENT = "[SILENT]\n"
+REAL_SAY_ENQUEUE = desk_say.enqueue
 
 
 class RenderMessageTests(unittest.TestCase):
@@ -618,6 +619,60 @@ class ResolveGateTests(DeskTests):
             self.deliver.assert_called_once_with("Work on hold", key="overflow:hold", job="overflow", urgent=False)
             self.assertEqual(self.rows(desk.HELD), [])
             self.kick.assert_not_called()
+
+    def test_mail_radar_only_say_drains_all_four_overnight_items_after_gap(self):
+        import ph_jobs
+        from tests.test_desk_say import JID, OWNED, DeskSayTests
+
+        self.configure(owner={"name": "Alex"}, watches=[],
+                       features={**dict.fromkeys(phconf.CFG["features"], False), "mail_radar": True})
+        self.assertEqual(ph_jobs.expected(phconf.CFG), ["mail_radar", "say"])
+        self.patch_paths(desk_say, "OUTBOX", "SAY_LOG", "STATUS_LOG")
+        self.clock = self.clock.replace(hour=23)
+        keys = [f"task-{i}" for i in range(4)]
+        self.assertEqual(self.compose([self.item(key) for key in keys]), SILENT)
+        self.assertEqual([r["key"] for r in self.rows(desk.HELD)], keys)
+        self.clock = (self.clock + timedelta(days=1)).replace(hour=7)
+        execution = 0
+        finished, turns = [], []
+
+        def tick():
+            nonlocal execution
+            execution += 1
+            eid = f"{execution:032x}"
+            with patch.object(desk_say, "_job_details", return_value={**OWNED, "Execution": f"running {eid}"}), \
+                    patch.object(desk_say, "_runs", return_value=[(eid, "running"), *finished]):
+                out = desk_say.next_output()
+            finished.append((eid, "completed"))
+            if out:
+                _, body = out.split("\n" + desk_say.START + "\n", 1)
+                body = body.removesuffix("\n" + desk_say.END)
+                mid = self.rows(desk_say.SAY_LOG)[-1]["id"]
+                turns.extend((DeskSayTests.relay(mid, body), ("assistant", body)))
+                self.assertEqual(desk_say.confirm(turns=DeskSayTests.turns(turns)), 1)
+            return out
+
+        # Keep the real queue and receipt paths; only Hermes's cron calls and the owner's Bot Chat are simulated.
+        self.deliver.side_effect = REAL_SAY_ENQUEUE
+        with patch.object(desk_say, "say_job_id", return_value=JID), \
+                patch.object(desk_say, "say_route", return_value=("bot-chat",)), \
+                patch.object(desk_say, "quiet_now", side_effect=lambda: desk.in_quiet(self.clock)):
+            self.assertIsNotNone(tick())
+            self.assertEqual(self.rows(desk.HELD), [])
+            self.assertEqual([r["key"] for r in self.rows(desk.DIGEST)], keys[3:])
+            self.clock += desk.FLUSH_GAP - timedelta(minutes=1)
+            self.assertIsNone(tick())
+            self.clock += timedelta(minutes=1)
+            self.assertIsNotNone(tick())
+            self.clock += desk.FLUSH_GAP
+            self.assertIsNone(tick())
+        self.assertEqual(self.rows(desk.DIGEST), [])
+        self.assertEqual([r["keys"] for r in self.rows(desk.PING_LOG)], [keys[:3], keys[3:]])
+        self.assertEqual([text for role, text in turns if role == "assistant"], [
+            "Hey Alex, 3 things:\n1. Work on task-0\n2. Work on task-1\n3. Work on task-2\n"
+            "+1 more lined up, coming next (or ask me)", "Work on task-3",
+        ])
+        self.kick.assert_not_called()
 
     def test_daytime_tick_releases_ordinary_held_without_a_brief(self):
         self.clock = self.clock.replace(hour=23)

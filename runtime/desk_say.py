@@ -583,11 +583,27 @@ def _relay_candidates(turn: str, by_tag: dict) -> tuple[str, set[str]] | None:
     return found[0] if len(found) == 1 else None
 
 
-def match_replies(turns: list[tuple[int, str, str]], notices: list[dict], used=()) -> list[tuple[str, int]]:
-    """Match a reply only to the immediately preceding user turn's verified relay and payload."""
+def _relay_index(notices) -> dict:
     by_tag = {}
     for row in notices:
-        by_tag.setdefault(tag_for(row["id"]), []).append(row)
+        if isinstance(row.get("id"), str) and isinstance(row.get("text"), str):
+            by_tag.setdefault(tag_for(row["id"]), []).append(row)
+    return by_tag
+
+
+def relay_orders(turns, notices) -> dict[str, int]:
+    """Latest tagged relay position in display order, without claiming its reply matched."""
+    by_tag = _relay_index(notices)
+    orders = {}
+    for i, (_, role, text) in enumerate(turns):
+        if role == "user" and (relay := _relay_candidates(text, by_tag)):
+            orders[relay[0]] = i
+    return orders
+
+
+def match_replies(turns: list[tuple[int, str, str]], notices: list[dict], used=()) -> list[tuple[str, int]]:
+    """Match a reply only to the immediately preceding user turn's verified relay and payload."""
+    by_tag = _relay_index(notices)
     open_relay, hits, used_ids, matched = None, [], set(used), set()
     for reply_id, role, text in turns:
         if role == "user":

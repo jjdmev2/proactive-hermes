@@ -231,11 +231,14 @@ def _say_statuses() -> dict[str, dict]:
             desk_say.confirm(turns=turns)
     except Exception:
         turns = None
+    last = desk_say._last_status()
     order = {rid: i for i, (rid, role, _) in enumerate(turns or ()) if role == "assistant"}
-    return {mid: {**row, "reply_order": order.get(row.get("reply_id")),
+    relays = desk_say.relay_orders(turns or (), last.values())
+    return {mid: {**row, "reply_order": order.get(row["reply_id"]) if type(row.get("reply_id")) is int else None,
+                  "relay_order": relays.get(mid),
                   "outside_display": turns is not None and type(row.get("reply_id")) is int
                   and row["reply_id"] not in order}
-            for mid, row in desk_say._last_status().items()}
+            for mid, row in last.items()}
 
 
 def _message_id(row: dict) -> str | None:
@@ -272,6 +275,7 @@ def _numbered_draft(n, statuses=None) -> tuple[dict | None, str]:
         return None, AMBIGUOUS
     statuses = _say_statuses() if statuses is None else statuses
     received = {}
+    unresolved_orders = []
     for mid, row in rows.items():
         receipt = statuses.get(mid) or {}
         if not isinstance(receipt, dict):
@@ -282,12 +286,17 @@ def _numbered_draft(n, statuses=None) -> tuple[dict | None, str]:
             continue
         if state == "delivered" and type(order) is int and order not in received:
             received[order] = row
+        elif state in ("handed", "accepted", "posting", "unverified"):
+            unresolved_orders.append(receipt.get("relay_order"))
         elif state not in ("queued", "retry", "failed", None):
-            # A compose timestamp says nothing about where an unconfirmed relay appeared in the chat.
             return None, AMBIGUOUS
     if not received:
         return None, AMBIGUOUS
-    latest = received[max(received)]
+    latest_order = max(received)
+    # A compose timestamp is not a display position. Only a verified earlier relay can be ignored.
+    if any(type(order) is not int or order >= latest_order for order in unresolved_orders):
+        return None, AMBIGUOUS
+    latest = received[latest_order]
     keys = latest.get("keys")
     if not isinstance(keys, list) or n > len(keys) or not isinstance(keys[n - 1], str):
         return None, AMBIGUOUS

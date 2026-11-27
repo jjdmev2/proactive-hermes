@@ -643,14 +643,41 @@ def _created_job_id(output: str) -> str:
 def _job_states(run) -> dict[str, str]:
     """{job id: state} from `hermes cron list --all` ("  <id> [active|paused|...]" header lines only)."""
     output = _cron(run, "list", "--all")
-    states = dict(re.findall(rf"^[ \t]+({_JOB_ID}) \[([^\]\n]+)\]", output, re.MULTILINE))
-    if not states and not re.search(r"^No scheduled jobs\b", output, re.MULTILINE):
+    rows = re.findall(rf"^  ({_JOB_ID}) \[([^\]\n]+)\]$", output, re.MULTILINE)
+    states = dict(rows)
+    if len(rows) != len(states) or (not states and not re.search(r"^No scheduled jobs\b", output, re.MULTILINE)):
         raise RuntimeError("Could not read job IDs from `hermes cron list --all`.")
     return states
 
 
 IDLE_WAIT_S = 10 * 60
 IDLE_POLL_S = 2
+_LIVE_RUN_STATES = {"claimed", "running"}
+_TERMINAL_RUN_STATES = {"completed", "failed", "unknown", "cancelled", "missed"}
+
+
+def _run_states(output: str, jid: str) -> dict[str, str] | None:
+    if output.strip() == "No cron execution attempts recorded.":
+        return {}
+    pattern = re.compile(rf"([0-9a-f]{{32}}) +([a-z_]+) +job={re.escape(jid)} +source=\S+ +"
+                         r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)")
+    states: dict[str, str] = {}
+    in_error = False
+    for line in output.splitlines():
+        if row := pattern.fullmatch(line):
+            eid, state = row.groups()
+            if eid in states or state not in _LIVE_RUN_STATES | _TERMINAL_RUN_STATES:
+                return None
+            states[eid] = state
+            in_error = False
+        elif re.match(r"\s*[0-9a-f]{32}\b", line) or re.search(r"\bjob=\S+ +source=", line):
+            return None  # a malformed header, not known to be error text
+        elif line.strip():
+            # Hermes indents the first line of an error only. Its raw continuation can be unindented.
+            if not in_error and (not states or not line.startswith("    ")):
+                return None
+            in_error = True
+    return states or None
 
 
 def _wait_for_idle(run, jid: str) -> bool:
@@ -667,15 +694,11 @@ def _wait_for_idle(run, jid: str) -> bool:
             output = _cron(run, "runs", jid, "--limit", "500")
         except (OSError, RuntimeError, subprocess.SubprocessError):
             return False
-        if output.strip() == "No cron execution attempts recorded.":
-            return True
-        pattern = rf"^([0-9a-f]{{32}}) +([a-z_]+) +job={re.escape(jid)} +source=\S+ "
-        rows = [re.match(pattern, line) for line in output.splitlines() if line and not line[0].isspace()]
-        if not rows or any(row is None for row in rows):
+        rows = _run_states(output, jid)
+        if rows is None or len(rows) >= 500:
             return False
-        states = {row[2] for row in rows}
-        if not states & {"claimed", "running"}:
-            return len(rows) < 500 and states <= {"completed", "failed", "unknown", "cancelled", "missed"}
+        if _LIVE_RUN_STATES.isdisjoint(rows.values()):
+            return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
@@ -1074,23 +1097,37 @@ def _undo_swap(run, record: dict) -> list[str] | None:
     return removed if ok else None
 
 
-def _recover_swaps(run, reg: dict) -> int:
-    """Finish or undo every job swap an earlier setup run did not complete (killed, interrupted), BEFORE anything
-    else is decided, so the old job's real state is known from the record and never guessed from the half-swapped
-    state it was left in. A swap whose new job is already the recorded one is finished (the old job is removed,
-    after its saved runs are kept); any other is undone (the half-made new job goes, the old job is resumed if it
-    was active). Raises RuntimeError when it could not complete. Returns how many saved-run files were kept."""
+def _recover_swaps(run, reg: dict, disabled: set[str]) -> int:
+    """Finish or undo a journaled swap. A disabled feature stops before any wait for old run history.
+
+    Normally an already recorded replacement is kept and an uncommitted swap is undone. For a
+    disabled feature there is nothing to restore: remove its replacement and archive the paused old
+    job separately. The journal stays until that old job can safely be removed.
+    """
     pending = reg.get(REPLACING)
     if not isinstance(pending, dict):
         if REPLACING in reg:   # malformed: nothing to act on
             del reg[REPLACING]
             _save_registry(reg)
         return 0
+    # A policy change must not wait behind any of the potentially long history checks.
+    for key, record in pending.items():
+        if key not in disabled or not isinstance(record, dict):
+            continue
+        old, new = _swap_ids(record)
+        states = _job_states(run)
+        if old and states.get(old) == "active":
+            _pause(run, old)
+        replacements = [new] if new else _temp_jobs(run, record)
+        for jid in replacements:
+            if jid != old and jid in states:
+                _remove(run, jid)
+                print(f"Setup: disabled {key} replacement job {jid}; keeping old run history separately.")
     kept = 0
     for key, record in list(pending.items()):
         record = record if isinstance(record, dict) else {}
         old, new = _swap_ids(record)
-        if new and _job_id(reg.get(key)) == new:   # the registry already points at the new job: finish
+        if key in disabled or (new and _job_id(reg.get(key)) == new):
             try:
                 states = _job_states(run)
                 if old and old in states:
@@ -1168,13 +1205,15 @@ def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None) 
 
 def _apply(cfg: dict, dry_run: bool, *, run, ensure) -> list[dict]:
     reg = _load_registry()
+    desired = JOBS + [watch_job(watch) for watch in cfg.get("watches", [])]
+    wanted = {job["key"] for job in desired if enabled(cfg, job)}
     kept_runs = 0
     if not dry_run and REPLACING in reg:
-        kept_runs += _recover_swaps(run, reg)   # an interrupted swap is settled first; nothing below guesses its state
+        disabled = {job["key"] for job in desired} - wanted
+        kept_runs += _recover_swaps(run, reg, disabled)
     states = _job_states(run) if reg else {}
     live = set(states)
     if not dry_run and CREATING in reg:
-        wanted = {j["key"] for j in JOBS + [watch_job(w) for w in cfg.get("watches", [])] if enabled(cfg, j)}
         for key in set(reg[CREATING]) - wanted:
             _remove_staged(run, reg, key)
         states = _job_states(run)
@@ -1186,7 +1225,6 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure) -> list[dict]:
         if warning:
             print(warning)
     # The say job first: every desk message reaches Bot Chat through it, so it exists before anything can speak.
-    desired = JOBS + [watch_job(watch) for watch in cfg.get("watches", [])]
     for job in sorted(desired, key=lambda j: j["key"] != "say"):
         key = job["key"]
         entry = reg.get(key)
@@ -1213,8 +1251,8 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure) -> list[dict]:
         # applied spec (not the private prompt text) for no-op reapplication.
         spec = sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
         if key in reg.get(REPLACING, {}):
-            action = "defer"  # an idle check still owns this key; don't overwrite its recovery record
-        elif enabled(cfg, job):
+            action = "defer"  # only history recovery remains if this feature was disabled
+        elif key in wanted:
             record = {"toolsets": toolsets} if toolsets is not None else {}
             same_toolsets = toolsets is None or (isinstance(entry, dict) and entry.get("toolsets") == toolsets)
             if jid not in live or key in reg.get(CREATING, {}):

@@ -14,6 +14,7 @@ import sys
 from collections.abc import Iterator
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -411,9 +412,9 @@ def report(notify) -> list[str]:
             enqueue_for_owner(text, key)
             state[key]["last_alerted"] = t.isoformat(timespec="seconds")
         elif cls == "desk" and due and t - first >= DESK_DOWN_AFTER:
-            due_desk[key] = text
-    out = list(due_desk.values())
-    notify(out)   # enqueue or write to the local failure lane before marking any desk alert
+            due_desk[key] = (text, first.isoformat(timespec="seconds"), prev.get("last_alerted"))
+    out = [entry[0] for entry in due_desk.values()]
+    notify(due_desk)   # enqueue or write to the local failure lane before marking any desk alert
     for key in due_desk:
         state[key]["last_alerted"] = t.isoformat(timespec="seconds")
     for key, prev in state.items():
@@ -456,19 +457,25 @@ def main() -> int:
             log({"error": f"{type(exc).__name__}: {exc}"[:200]})
     local = [text for cls, text in faults.values() if cls == "relay"]
 
-    def notify(lines):
-        if lines:
+    def notify(due):
+        if due:
             import desk_say
             # An old unresolved receipt is not proof the current route is broken.
             problem = desk_say.route_problem(require_active=True) or any(
                 text.startswith("desk messages held:") for text in local)
-            for i in range(0, len(lines), 2):
-                batch = lines[i:i + 2]
+            keys = list(due)
+            for i in range(0, len(keys), 2):
+                batch_keys = keys[i:i + 2]
+                batch = [due[key][0] for key in batch_keys]
                 if not problem:
                     text = (f"{phconf.owner()}, the desk has a fault and may miss things until it's fixed: "
                             + "; ".join(batch))
+                    # The persisted previous alert identifies this interval, even if notification succeeds
+                    # but the health-state write fails. Today's clock is not a retry-stable key.
+                    interval = [(key, *due[key][1:]) for key in sorted(batch_keys)]
+                    delivery_key = "health:" + sha256(json.dumps(interval).encode()).hexdigest()
                     try:
-                        receipt = desk_say.deliver(text, key="health:" + "|".join(sorted(batch))[:200], job="health")
+                        receipt = desk_say.deliver(text, key=delivery_key, job="health")
                         if receipt.get("status") in {"queued", "handed", "accepted", "delivered"}:
                             continue
                         if receipt.get("status") == "duplicate" and desk_say.status_of(receipt.get("id")) in {

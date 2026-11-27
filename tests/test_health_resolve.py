@@ -258,6 +258,43 @@ class ResolveHealthTests(unittest.TestCase):
                     self.assertIn(calendar, stderr.getvalue())
                 self.assertEqual(json.loads(health.HEALTH_STATE.read_text())[key]["last_alerted"], self.clock.isoformat())
 
+    def test_persistent_fault_gets_a_distinct_retry_stable_delivery_after_24_hours(self):
+        log, say = self._say_log()
+        calendar = "Calendar source sync is broken"
+        key = health.fault_key(calendar)
+        health.HEALTH_STATE.write_text(json.dumps({
+            key: {"status": "open", "first_seen": (self.clock - timedelta(hours=5)).isoformat()}}))
+        health.fault("desk", calendar)
+        stubs = dict.fromkeys(("check_local_delivery", "check_jobs", "check_contract", "check_say_outbox",
+                               "check_say_receipts"), DEFAULT)
+        with patch.multiple(health, **stubs), patch.object(health, "load_jobs", return_value=[]), \
+                patch.object(say, "quiet_now", return_value=False), patch.object(say, "kick_after", side_effect=lambda r: r):
+            self.assertEqual(health.main(), 0)
+            first, = say._pending(say._lines(say.OUTBOX)).values()
+            self.append(log, {**first, "status": "delivered", "reply_id": 42})
+            self.clock += timedelta(hours=23)
+            with patch.object(health, "now", return_value=self.clock):
+                self.assertEqual(health.main(), 0)
+            self.assertEqual(set(say._pending(say._lines(say.OUTBOX))), {first["id"]})
+            self.clock += timedelta(hours=2)
+            # Crash after enqueue but before persisting last_alerted, then rerun later in the same interval.
+            with patch.object(health, "now", return_value=self.clock), \
+                    patch.object(Path, "replace", side_effect=OSError("interrupted health state write")):
+                with self.assertRaisesRegex(OSError, "interrupted health state write"):
+                    health.main()
+            self.clock += timedelta(hours=1)
+            with patch.object(health, "now", return_value=self.clock):
+                self.assertEqual(health.main(), 0)
+        rows = say._lines(say.OUTBOX)
+        self.assertEqual(len(rows), 2)
+        first, repeat = rows
+        self.assertEqual(first["text"], repeat["text"])
+        self.assertNotEqual(first["key"], repeat["key"])
+        self.assertNotEqual(first["id"], repeat["id"])
+        self.assertEqual(say.status_of(first["id"]), "delivered")
+        self.assertEqual(say.status_of(repeat["id"]), "queued")
+        self.assertEqual(json.loads(health.HEALTH_STATE.read_text())[key]["last_alerted"], self.clock.isoformat())
+
     def test_main_runs_resolve_step_without_other_health_effects(self):
         self.run_row("a", "b", "c")
         # Do not invoke other probes, delivery checks, persistence, or notification code.

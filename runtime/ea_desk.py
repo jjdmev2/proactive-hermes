@@ -817,9 +817,13 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
 
 
 def release_held() -> None:
-    """The always-installed say job releases daytime holds without re-running itself or printing diagnostics."""
-    if not HELD.exists() or in_quiet(now()) or not read_lines(HELD):
+    """The always-installed say job releases daytime holds and their overflow without kicking itself."""
+    if in_quiet(now()):
         return
+    if not read_lines(HELD) and not any(isinstance(row, dict) and row.get("kind") in SPEAKING
+                                       for row in read_lines(DIGEST)):
+        return
+    # compose enforces the gap and rechecks eligibility under its queue lock.
     args = argparse.Namespace(job="overflow", brief=False, take_held=True)
     with redirect_stdout(io.StringIO()):
         compose(args, [], flush=True, kick_now=False)

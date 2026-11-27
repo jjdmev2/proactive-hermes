@@ -1,0 +1,6 @@
+{
+  "formatter": "hermes_cli.cron.cron_list / cron_runs (formatters from local Hermes checkout)",
+  "list": "\n┌─────────────────────────────────────────────────────────────────────────┐\n│                         Scheduled Jobs (profile: fixture)               │\n└─────────────────────────────────────────────────────────────────────────┘\n\n  000000000002 [paused]\n    Name:      Proactive · mail radar\n    Schedule:  */15 7-22 * * *\n    Repeat:    ∞\n    Next run:  None\n    Deliver:   local\n    Last run:  2026-11-26T12:00:00Z  error: Script exited with code 1\nstderr:\nCalendar is unavailable.\n    Execution: failed  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n",
+  "terminal_runs": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  failed     job=000000000002  source=builtin  2026-11-26T12:00:00Z\n    Script exited with code 1\nstderr:\nCalendar is unavailable.\n",
+  "busy_runs": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  failed     job=000000000002  source=builtin  2026-11-26T12:00:00Z\n    Script exited with code 1\nstderr:\nCalendar is unavailable.\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  running    job=000000000002  source=builtin  2026-11-26T12:00:00Z\n"
+}

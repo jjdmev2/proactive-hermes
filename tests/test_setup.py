@@ -331,6 +331,56 @@ class JobSetupTests(unittest.TestCase):
         self.assertEqual(self.assert_swapped_cleanly(old, active=True), new)
         self.assertEqual(self.kept(old, late.name).read_text(), "late saved run")
 
+    def test_real_multiline_cron_output_distinguishes_idle_from_busy_or_ambiguous(self):
+        fixture = json.loads(Path(__file__).with_name("fixtures").joinpath("cron_multiline.json").read_text())
+        _, old = self._old_radar(state="paused")
+        runs = fixture["terminal_runs"]
+
+        def cli_output(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, stdout=fixture["list"] if argv[2] == "list" else runs)
+
+        with patch.object(jobs, "IDLE_WAIT_S", 0):
+            self.assertTrue(jobs._wait_for_idle(cli_output, old))
+            for invalid in (fixture["busy_runs"], "unexpected output\n" + runs,
+                            runs + "b" * 32 + "  running  job=" + old + "\n"):
+                with self.subTest(output=invalid):
+                    runs = invalid
+                    self.assertFalse(jobs._wait_for_idle(cli_output, old))
+
+    def test_disable_stops_replacement_before_waiting_on_old_history(self):
+        fixture = json.loads(Path(__file__).with_name("fixtures").joinpath("cron_multiline.json").read_text())
+        _, old = self._old_radar()
+        runs = fixture["busy_runs"]
+
+        def cli_output(argv, **kwargs):
+            result = self.run(argv, **kwargs)
+            if argv[2:4] == ["runs", old]:
+                result.stdout = runs
+            return result
+
+        with patch.object(jobs, "IDLE_WAIT_S", 0):
+            self.assertIn("deferred removal", self.settle(run=cli_output))
+            new = self.registry()["mail_radar"]["id"]
+            self.assertEqual(jobs._job_states(cli_output)[new], "active")
+            self.run.calls.clear()
+            self.cfg["features"]["mail_radar"] = False
+            self.assertIn("deferred removal", self.settle(run=cli_output))
+            self.assertNotEqual(jobs._job_states(cli_output).get(new), "active")
+            steps = [tuple(argv[2:4]) for argv in self.run.calls]
+            revoke = next(i for i, step in enumerate(steps) if step in {("pause", new), ("remove", new)})
+            self.assertLess(revoke, steps.index(("runs", old)))
+            self.assertEqual(self.run.states[old], "paused")
+            self.assertEqual(self.registry()["replacing"]["mail_radar"]["old"], old)
+            late = self.home / "cron" / "output" / old / "late.md"
+            late.write_text("saved while replacement was disabled")
+            runs = fixture["terminal_runs"]
+            self.settle(run=cli_output)
+        self.assertNotIn(old, self.run.live)
+        self.assertNotIn(new, self.run.live)
+        self.assertNotIn("replacing", self.registry())
+        self.assertNotIn("mail_radar", self.registry())
+        self.assertEqual(self.kept(old, late.name).read_text(), late.read_text())
+
     def test_a_paused_job_stays_paused_through_the_replace(self):
         path, old = self._old_radar(state="paused")
         self.run.calls.clear()
