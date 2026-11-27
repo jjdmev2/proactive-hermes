@@ -92,6 +92,55 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(json.loads(self.registry.read_text()), {})
         self.assertEqual(json.loads(self.config.read_text())["watches"], [])
 
+    def pending_watch(self):
+        self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
+        old = self.run.job("Proactive · watch: Card drop")
+        self.run.executions[old] = [("a" * 32, "running")]
+        cfg = cli.phconf.load()
+        cfg["slack"]["enabled"] = True
+        cli.write_config(cfg)
+        self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
+        new = json.loads(self.registry.read_text())["watch:Card drop"]["id"]
+        self.assertNotEqual(old, new)
+        return old, new
+
+    def test_watch_remove_fences_replacement_before_busy_history_poll(self):
+        with patch.object(jobs, "IDLE_WAIT_S", 0):
+            old, new = self.pending_watch()
+            self.run.calls.clear()
+            self.assertEqual(self.command(["watch", "remove", "--name", "Card drop"])[0], 0)
+        steps = [tuple(a[2:4]) for a in self.run.calls]
+        self.assertLess(next(i for i, step in enumerate(steps) if step in {("pause", new), ("remove", new)}),
+                        steps.index(("runs", old)))
+        self.assertIn("watch:Card drop", json.loads(self.registry.read_text())["replacing"])
+        self.run.executions[old] = [("a" * 32, "completed")]
+        jobs.apply(cli.phconf.load(), run=self.run)
+        jobs.remove_all(run=self.run)
+        self.assertEqual(self.run.live, {})
+        self.assertNotIn(("resume", old), [tuple(a[2:4]) for a in self.run.calls])
+
+    def test_watch_remove_stays_revoked_when_archive_fails(self):
+        with patch.object(jobs, "IDLE_WAIT_S", 0):
+            old, new = self.pending_watch()
+        self.run.executions[old] = [("a" * 32, "completed")]
+        with patch.object(jobs, "_keep_history", side_effect=OSError("fixture archive failure")):
+            rc, output = self.command(["watch", "remove", "--name", "Card drop"])
+        self.assertEqual(rc, 1)
+        self.assertIn("fixture archive failure", output)
+        self.assertEqual(cli.phconf.load()["watches"], [])
+        self.assertNotEqual(jobs._job_states(self.run).get(new), "active")
+        self.assertEqual(self.run.states[old], "paused")
+
+    def test_watch_add_reconciles_authority_on_pending_replacement(self):
+        with patch.object(jobs, "IDLE_WAIT_S", 0):
+            old, new = self.pending_watch()
+            cfg = cli.phconf.load()
+            cfg["slack"]["enabled"] = False
+            cli.write_config(cfg)
+            self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
+            self.assertIn(old, self.run.live)
+            self.assertFalse(new in self.run.live and self.run.states.get(new, "active") == "active")
+
     def test_reapplying_revoked_authority_updates_the_same_watch_job(self):
         cfg = cli.phconf.load()
         cfg = cli.apply_answers(cfg, {"mobile.enabled": True, "authority.auto": ["alarms", "reminders"]})

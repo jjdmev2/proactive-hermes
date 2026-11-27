@@ -55,6 +55,7 @@ from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import ph_jobs  # noqa: E402
 import phconf  # noqa: E402
 
 DEBOUNCE_S = 30
@@ -405,13 +406,9 @@ class Debouncer:
 
 def radar_job_id() -> str | None:
     """The plugin's own mail radar job: jobs.json key "mail_radar" ({"id": ...} or a bare id)."""
-    try:
-        reg = json.loads((phconf.data_dir() / "jobs.json").read_text())
-    except (FileNotFoundError, ValueError):
-        return None
-    entry = reg.get("mail_radar") if isinstance(reg, dict) else None
-    jid = entry.get("id") if isinstance(entry, dict) else entry
-    return jid if isinstance(jid, str) and re.fullmatch(r"[0-9a-f]{12}", jid) else None
+    reg = ph_jobs.read_registry(phconf.data_dir() / "jobs.json")
+    jid = ph_jobs.recorded_job_id(reg, "mail_radar")
+    return jid if jid and re.fullmatch(r"[0-9a-f]{12}", jid) else None
 
 
 def job_paused(job: dict) -> bool:

@@ -179,18 +179,15 @@ def check_resolve() -> None:
         fault("desk", "resolve wait queue stuck")
 
 
-def registry_ids() -> dict[str, str]:
-    """{job key: cron job id} as the installer recorded them (<plugin-data>/jobs.json); {} when unreadable."""
-    try:
-        reg = json.loads((phconf.data_dir() / "jobs.json").read_text())
-    except (OSError, ValueError):
-        return {}
-    out = {}
-    for key, entry in (reg.items() if isinstance(reg, dict) else ()):
-        jid = entry.get("id") if isinstance(entry, dict) else entry
-        if isinstance(jid, str) and jid:
-            out[key] = jid
-    return out
+def _job_registry() -> dict:
+    return ph_jobs.read_registry(phconf.data_dir() / "jobs.json")
+
+
+def registry_ids(*, reg: dict | None = None, allow_pending: bool = False) -> dict[str, str]:
+    """Health never heals a pending key. Identity checks may count its settled replacement, not history."""
+    reg = _job_registry() if reg is None else reg
+    return {key: jid for key in ph_jobs.expected(phconf.CFG)
+            if (jid := ph_jobs.recorded_job_id(reg, key, allow_pending=allow_pending))}
 
 
 def missing_jobs(live: list[dict]) -> list[str]:
@@ -201,7 +198,9 @@ def missing_jobs(live: list[dict]) -> list[str]:
     live job counts for at most one expected job, so a duplicate or a misnamed job never stands in for another.
     LIVE is every cron job, not only the ones named with the desk prefix: a renamed job keeps its recorded id."""
     expected = ph_jobs.expected(phconf.CFG)
-    recorded = registry_ids()
+    reg = _job_registry()
+    recorded = registry_ids(reg=reg, allow_pending=True)
+    pending = ph_jobs.pending_swaps(reg)
     used: set[int] = set()
     matched: set[str] = set()
 
@@ -217,7 +216,7 @@ def missing_jobs(live: list[dict]) -> list[str]:
         if jid:
             claim(key, lambda job, jid=jid: job.get("id") == jid)
     for key in expected:
-        if key not in matched:
+        if key not in matched and key not in pending:
             name = ph_jobs.job_name(key)
             claim(key, lambda job, name=name: (job.get("name") or "").strip() == name)
     return [ph_jobs.job_name(key) for key in expected if key not in matched]

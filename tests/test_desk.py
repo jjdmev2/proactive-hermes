@@ -674,6 +674,76 @@ class ResolveGateTests(DeskTests):
         ])
         self.kick.assert_not_called()
 
+    def confirmed_say_ticks(self):
+        """Real notice queues and receipt matching; only cron and Bot Chat are simulated."""
+        from tests.test_desk_say import JID, OWNED, DeskSayTests
+
+        self.patch_paths(desk_say, "OUTBOX", "SAY_LOG", "STATUS_LOG")
+        self.deliver.side_effect = REAL_SAY_ENQUEUE
+        self.enterContext(patch.object(desk_say, "say_job_id", return_value=JID))
+        self.enterContext(patch.object(desk_say, "say_route", return_value=("bot-chat",)))
+        self.enterContext(patch.object(desk_say, "quiet_now", side_effect=lambda: desk.in_quiet(self.clock)))
+        finished, turns = [], []
+
+        def tick():
+            eid = f"{len(finished) + 1:032x}"
+            with patch.object(desk_say, "_job_details", return_value={**OWNED, "Execution": f"running {eid}"}), \
+                    patch.object(desk_say, "_runs", return_value=[(eid, "running"), *finished]):
+                out = desk_say.next_output()
+            finished.append((eid, "completed"))
+            if out is None:
+                return None
+            body = out.split("\n" + desk_say.START + "\n", 1)[1].removesuffix("\n" + desk_say.END)
+            mid = self.rows(desk_say.SAY_LOG)[-1]["id"]
+            turns.extend((DeskSayTests.relay(mid, body), ("assistant", body)))
+            self.assertEqual(desk_say.confirm(turns=DeskSayTests.turns(turns)), 1)
+            return body
+
+        return tick
+
+    def test_say_drains_four_urgent_items_before_2310_without_ordinary_items(self):
+        self.clock = self.clock.replace(hour=23, minute=0)
+        tick = self.confirmed_say_ticks()
+        keys = ["flight", "ferry", "train", "bus"]
+        self.cli(desk, "compose", "--job", "radar", stdin=json.dumps([
+            *[self.item(k, urgent=True, priority="p0") for k in keys], self.item("ordinary-held"),
+        ]))
+        desk.append(desk.DIGEST, {**self.item("ordinary-overflow"), "at": self.clock.isoformat(), "overflow": True})
+        heard = []
+        for _ in range(5):
+            if body := tick():
+                heard.append((self.clock.strftime("%H:%M"), body))
+            self.clock += timedelta(minutes=2)
+        self.assertEqual([r["keys"] for r in self.rows(desk.PING_LOG)], [keys[:3], keys[3:]])
+        self.assertEqual(len(heard), 2)
+        self.assertLess(heard[-1][0], "23:10")
+        for key in keys:
+            self.assertEqual(sum(f"Work on {key}" in body for _, body in heard), 1)
+        self.assertEqual([r["key"] for r in self.rows(desk.HELD)], ["ordinary-held"])
+        self.assertEqual([r["key"] for r in self.rows(desk.DIGEST)], ["ordinary-overflow"])
+
+    def test_mail_radar_only_say_releases_draft_wait_on_first_tick_after_expiry(self):
+        import ph_jobs
+
+        self.configure(owner={"name": "Alex"}, watches=[], features={
+            **dict.fromkeys(phconf.CFG["features"], False), "mail_radar": True, "resolve_first": True,
+        })
+        self.assertEqual(ph_jobs.expected(phconf.CFG), ["mail_radar", "say"])
+        tick = self.confirmed_say_ticks()
+        self.assertEqual(self.cli(desk, "compose", "--job", "mail-radar",
+                                  stdin=json.dumps([self.item("draft-wait", act="reply")])),
+                         "[RESOLVE-FIRST] draft-wait\n" + SILENT)
+        self.clock += desk.RESOLVE_WAIT_MAX - timedelta(minutes=1)
+        self.assertIsNone(tick())
+        self.clock += timedelta(minutes=2)
+        self.assertEqual(tick(), "Work on draft-wait")
+        self.assertEqual(self.rows(desk.RESOLVE_WAIT), [])
+        self.clock += timedelta(minutes=2)
+        self.assertIsNone(tick())
+        self.assertEqual([r["keys"] for r in self.rows(desk.PING_LOG)], [["draft-wait"]])
+        self.assertIn("draft-wait", self.rows(desk.RUN_LOG)[-1]["unresolved"])
+        self.kick.assert_not_called()
+
     def test_daytime_tick_releases_ordinary_held_without_a_brief(self):
         self.clock = self.clock.replace(hour=23)
         self.assertEqual(self.compose([self.item("wait")]), SILENT)

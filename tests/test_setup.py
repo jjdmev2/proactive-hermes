@@ -195,7 +195,12 @@ class JobSetupTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "copy mismatch"):
                 jobs.apply(self.cfg, run=self.run)
         self.assertIn(old, self.run.live)
-        self.assertEqual(self.registry()["mail_radar"]["id"], old)
+        self.assertEqual(self.run.states[old], "paused")
+        self.assertEqual(self.registry()["replacing"]["mail_radar"]["old"], old)
+        new = self.registry()["mail_radar"]["id"]
+        self.assertNotEqual(new, old)
+        self.assertEqual(self.run.toolsets[new], ["terminal", "file", "skills"])
+        self.assertEqual(self.run.states[new], "active")
         self.assertEqual(target.read_text(), "partial")
         self.assertEqual(list(target.parent.iterdir()), [target])
         jobs.apply(self.cfg, run=self.run)
@@ -381,6 +386,77 @@ class JobSetupTests(unittest.TestCase):
         self.assertNotIn("mail_radar", self.registry())
         self.assertEqual(self.kept(old, late.name).read_text(), late.read_text())
 
+    def test_pending_swap_reconciles_narrowed_toolsets_before_polling_old_history(self):
+        self.cfg["slack"]["enabled"] = True
+        _, old = self._old_radar()
+        self.run.executions[old] = [("a" * 32, "running")]
+        with patch.object(jobs, "IDLE_WAIT_S", 0):
+            self.settle()
+            stale = self.registry()["mail_radar"]["id"]
+            self.assertIn("connections", self.run.toolsets[stale])
+            self.cfg["slack"]["enabled"] = False
+            wanted = ["terminal", "file", "skills"]
+
+            def poll(argv, **kwargs):
+                if argv[2:4] == ["runs", old]:
+                    for jid in self.run.live:
+                        if "mail radar" in self.run.names[jid] and self.run.states.get(jid, "active") == "active":
+                            self.assertEqual(self.run.toolsets[jid], wanted)
+                return self.run(argv, **kwargs)
+
+            self.settle(run=poll)
+            self.assertNotEqual(self.run.states.get(stale), "active")
+            self.assertEqual(self.run.states[old], "paused")
+        self.run.executions[old] = [("a" * 32, "completed")]
+        self.settle()
+        self.assert_swapped_cleanly(old, active=True)
+
+    def test_pending_swap_applies_schedule_prompt_and_delivery_before_failed_history_copy(self):
+        _, old = self._old_radar()
+        with patch.object(jobs, "IDLE_WAIT_S", 0):
+            self.run.executions[old] = [("a" * 32, "running")]
+            self.settle()
+        new = self.registry()["mail_radar"]["id"]
+        self.run.executions[old] = [("a" * 32, "completed")]
+        self.cfg["schedule"]["mail_radar"] = "*/19 * * * *"
+        job = next(j for j in jobs.JOBS if j["key"] == "mail_radar")
+        with patch.dict(job, {"deliver": "bot-chat"}), \
+                patch.object(jobs, "prompt_for", return_value="Current owner prompt"), \
+                patch.object(jobs, "_keep_history", side_effect=OSError("fixture archive failure")):
+            with self.assertRaisesRegex(RuntimeError, "fixture archive failure"):
+                self.settle()
+        self.assertEqual(self.run.schedule_of(new), "*/19 * * * *")
+        self.assertEqual(self.run.prompt_of(new), "Current owner prompt")
+        self.assertEqual(self.run.option(new, "--deliver"), "bot-chat")
+        self.assertEqual(self.run.states[old], "paused")
+        self.assertIn("mail_radar", self.registry()["replacing"])
+
+    def test_remove_all_fences_jobs_before_history_error_and_keeps_old_for_recovery(self):
+        _, old = self._old_radar()
+        with patch.object(jobs, "IDLE_WAIT_S", 0):
+            self.run.executions[old] = [("a" * 32, "running")]
+            self.settle()
+        self.run.executions[old] = [("a" * 32, "completed")]
+        with patch.object(jobs, "_keep_history", side_effect=OSError("fixture archive failure")):
+            with self.assertRaisesRegex(RuntimeError, "fixture archive failure"):
+                jobs.remove_all(run=self.run)
+        self.assertIn(old, self.run.live)
+        self.assertTrue(all(self.run.states.get(jid) == "paused" for jid in self.run.live))
+        self.assertEqual(self.registry()["replacing"]["mail_radar"]["old"], old)
+        jobs.remove_all(run=self.run)
+        self.assertEqual(self.run.live, {})
+        self.assertEqual(self.registry(), {})
+        self.assertTrue(self.kept(old, "2026-11-20_08-00-00.md").is_file())
+
+    def test_recovery_never_resumes_out_of_spec_old_job_from_uncommitted_swap(self):
+        _, old = self._old_radar()
+        with patch.object(jobs, "_plugin_ensure", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.settle()
+        self.run.calls.clear()
+        self.settle()
+        self.assertNotIn(("resume", old), [tuple(a[2:4]) for a in self.run.calls])
+        self.assert_swapped_cleanly(old, active=True)
+
     def test_a_paused_job_stays_paused_through_the_replace(self):
         path, old = self._old_radar(state="paused")
         self.run.calls.clear()
@@ -394,8 +470,8 @@ class JobSetupTests(unittest.TestCase):
         self.assertTrue(self.kept(old, "2026-11-20_08-00-00.md").is_file())
         self.assertFalse((self.home / "cron" / "output" / new).exists())
 
-    def test_a_failed_replace_leaves_the_old_job_as_it_was(self):
-        path, old = self._old_radar()
+    def test_a_failed_replace_fences_old_job_and_keeps_it_for_recovery(self):
+        _, old = self._old_radar()
         real_edit = self.run.__call__
 
         def failing(argv, **kwargs):
@@ -405,11 +481,13 @@ class JobSetupTests(unittest.TestCase):
             return real_edit(argv, **kwargs)
         with self.assertRaisesRegex(RuntimeError, "boom"):
             jobs.apply(self.cfg, run=failing)
-        self.assertEqual(json.loads(path.read_text())["mail_radar"]["id"], old)
-        self.assertEqual(self.run.states[old], "active")           # resumed
+        self.assertNotIn("mail_radar", self.registry())
+        self.assertEqual(self.run.states[old], "paused")
         self.assertEqual([j for j in self.run.live if self.run.names[j].startswith("Proactive · mail radar")], [old])
         self.assertTrue((self.home / "cron" / "output" / old / "2026-11-20_08-00-00.md").is_file())
-        self.assertNotIn("replacing", self.registry())   # a swap that failed cleanly leaves no record behind
+        self.assertEqual(self.registry()["replacing"]["mail_radar"]["old"], old)
+        self.settle()
+        self.assert_swapped_cleanly(old, active=True)
 
     # --- run history stays in plugin-data; Hermes's cron/output is only read ---------------------------------------
 
@@ -509,11 +587,10 @@ class JobSetupTests(unittest.TestCase):
         # Left half swapped: the old job is paused, and the registry says why.
         self.assertEqual(self.run.states[old], "paused")
         reg = self.registry()
-        self.assertEqual(reg["mail_radar"]["id"], old)
+        self.assertNotIn("mail_radar", reg)
         self.assertEqual((reg["replacing"]["mail_radar"]["old"], reg["replacing"]["mail_radar"]["was_active"]),
                          (old, True))
-        said = self.settle()
-        self.assertIn("undid an interrupted job swap for mail_radar", said)
+        self.assertIn("finished an interrupted job swap for mail_radar", self.settle())
         new = self.assert_swapped_cleanly(old, active=True)   # not paused: the half-swapped state is not the truth
         self.assertEqual(self.run.states.get(new, "active"), "active")
         self.assertTrue(self.kept(old, "2026-11-20_08-00-00.md").is_file())
@@ -560,20 +637,22 @@ class JobSetupTests(unittest.TestCase):
         self.assert_swapped_cleanly(old, active=False)
         self.assertNotIn(("resume", old), [(a[2], a[3]) for a in self.run.calls if len(a) > 3])
 
-    def test_an_undo_that_cannot_resume_the_old_job_keeps_the_record_and_stops_setup(self):
+    def test_a_replacement_that_cannot_arm_stays_paused_and_journaled_until_retry(self):
         path, old = self._old_radar()
         with patch.object(jobs, "_plugin_ensure", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
             jobs.apply(self.cfg, run=self.run)
         real = self.run.__call__
         broken = lambda argv, **kw: (subprocess.CompletedProcess(argv, 1, stdout="", stderr="no")  # noqa: E731
                                      if argv[2] == "resume" else real(argv, **kw))
-        with self.assertLogs(jobs.logger, "WARNING") as logged, self.assertRaisesRegex(RuntimeError, "could not put it back"):
+        with self.assertRaisesRegex(RuntimeError, "cron resume failed"):
             jobs.apply(self.cfg, run=broken)
-        self.assertIn("could not resume", logged.output[0])
-        self.assertIn("mail_radar", self.registry()["replacing"])
+        reg = self.registry()
+        new = reg["mail_radar"]["id"]
+        self.assertTrue(reg["replacing"]["mail_radar"]["arm"])
         self.assertEqual(self.run.states[old], "paused")
-        self.settle()   # cron works again: the record is still there and still right
-        self.assert_swapped_cleanly(old, active=True)
+        self.assertEqual(self.run.states[new], "paused")
+        self.settle()
+        self.assertEqual(self.assert_swapped_cleanly(old, active=True), new)
 
     def _die_after_ensure_before_note(self):
         """Setup dies after ensure_named_job made the temp job but before the record learned its id (only `temp`)."""
@@ -596,25 +675,25 @@ class JobSetupTests(unittest.TestCase):
         # A job of someone else with a similar name is never touched.
         self.run.live["abcdef123456"] = ["someone else's job"]
         self.run.names["abcdef123456"] = record["temp"] + " "   # even trailing whitespace is a different name
-        said = self.settle()
-        self.assertIn(f"the half-made job {temp_id} is removed", said)
+        self.assertIn("finished an interrupted job swap for mail_radar", self.settle())
         self.assertNotIn(temp_id, self.run.live)
         self.assertIn("abcdef123456", self.run.live)
-        self.assertNotIn("may still exist", said)
         del self.run.live["abcdef123456"]
         self.assert_swapped_cleanly(old, active=True)
 
     def test_the_temp_record_stays_until_its_job_could_be_removed(self):
         old, record = self._die_after_ensure_before_note()
         temp_id = self.run.job(record["temp"])
+        self.run.calls.clear()
         real = self.run.__call__
         broken = lambda argv, **kw: (subprocess.CompletedProcess(argv, 1, stdout="", stderr="busy")  # noqa: E731
                                      if argv[2] == "remove" and argv[3] == temp_id else real(argv, **kw))
-        with self.assertLogs(jobs.logger, "WARNING"), self.assertRaisesRegex(RuntimeError, "could not put it back"):
+        with self.assertRaisesRegex(RuntimeError, "Could not archive or remove paused"):
             jobs.apply(self.cfg, run=broken)
-        self.assertEqual(self.registry()["replacing"]["mail_radar"]["temp"], record["temp"])   # kept until done
+        self.assertIn(temp_id, self.registry()["replacing"]["mail_radar"]["retired"])
         self.assertIn(temp_id, self.run.live)
-        self.assertEqual(self.run.states[old], "paused")    # do not resume until the half-made job is gone
+        self.assertEqual(self.run.states[temp_id], "paused")
+        self.assertNotIn(("resume", old), [tuple(a[2:4]) for a in self.run.calls])
         self.settle()   # cron works again: the temp job goes and the swap completes
         self.assertNotIn(temp_id, self.run.live)
         self.assert_swapped_cleanly(old, active=True)

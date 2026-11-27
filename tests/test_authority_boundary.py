@@ -662,6 +662,45 @@ class ManagedJobIdentity(OfflineTestCase):
                     health.check_jobs(broken + [{"name": "Other job"}])
                 self.assertEqual(list(health.faults.values()), [("desk", "desk job missing: Proactive \u00b7 tick")])
 
+    def test_health_never_heals_a_revoked_watch_or_treats_archive_job_as_current(self):
+        cfg = self.configs()["custom connected"][0]
+        health = self.health(cfg)
+        key = "watch:Card drop"
+        registry = phconf.data_dir() / "jobs.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        reg = {key: {"id": "old"}, "replacing": {key: {"old": "old", "new": "replacement"}}}
+        registry.write_text(json.dumps(reg))
+        old = {"id": "old", "name": ph_jobs.job_name(key), "state": "paused", "deliver": "bot-chat"}
+        new = {"id": "replacement", "name": ph_jobs.job_name(key), "deliver": "bot-chat"}
+        with patch.object(phconf, "CFG", cfg), patch.object(health.subprocess, "run") as cron, \
+                patch.object(health, "log"):
+            self.assertIn(ph_jobs.job_name(key), health.missing_jobs([old]))
+            health.check_local_delivery([old, new])
+            cron.assert_not_called()
+            reg[key] = {"id": "replacement"}
+            registry.write_text(json.dumps(reg))
+            self.assertNotIn(ph_jobs.job_name(key), health.missing_jobs([old, new]))
+            cfg["watches"] = []
+            health.check_local_delivery([old, new])
+            cron.assert_not_called()
+
+    def test_pending_relay_and_radar_are_not_kickable_from_registry(self):
+        import desk_say
+        import mail_idle
+        ids = {"say": ("1" * 12, "2" * 12), "mail_radar": ("3" * 12, "4" * 12)}
+        registry = phconf.data_dir() / "jobs.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        reg = {key: {"id": old} for key, (old, _) in ids.items()}
+        reg["replacing"] = {key: {"old": old, "new": new} for key, (old, new) in ids.items()}
+        registry.write_text(json.dumps(reg))
+        for key, lookup in (("say", desk_say.say_job_id), ("mail_radar", mail_idle.radar_job_id)):
+            with self.subTest(key=key):
+                self.assertIsNone(lookup())
+        del reg["replacing"]
+        registry.write_text(json.dumps(reg))
+        self.assertEqual(desk_say.say_job_id(), ids["say"][0])
+        self.assertEqual(mail_idle.radar_job_id(), ids["mail_radar"][0])
+
     def test_recorded_job_id_counts_as_identity(self):
         import cli
         cfg = cli.base_config("custom")

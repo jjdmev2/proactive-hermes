@@ -7,8 +7,8 @@ creates, updates or removes jobs so the set always matches the enabled features.
 changes nothing. Only jobs recorded in jobs.json are ever edited, replaced or removed; a job is never
 adopted because its name or settings match. Before any change it checks that Hermes's public cron API
 for plugins (cron.plugin_api) is there, and the say job is created first. A job swap (new toolsets) is written
-to the registry as a `replacing` record before the old job is touched, so an interrupted swap is finished or
-undone by the next run, and the old job's saved runs are kept under <plugin-data>/job-history/.
+to the registry as a `replacing` record before the old job is touched. Recovery applies the current config
+before archiving saved runs of retired jobs under <plugin-data>/job-history/.
 """
 from __future__ import annotations
 
@@ -1039,7 +1039,7 @@ def _remove_staged(run, reg: dict, key: str) -> None:
     _save_registry(reg)
 
 
-REPLACING = "replacing"   # registry record of a job swap in progress: {job key: {old, was_active, temp, new}}
+REPLACING = ph_jobs.REPLACING  # key -> original old ID, retired IDs, and any replacement being armed
 
 
 def _swap_ids(record: dict) -> tuple[str | None, str | None]:
@@ -1066,125 +1066,122 @@ def _temp_jobs(run, record: dict) -> list[str]:
     return [jid for jid, name in _job_names(run).items() if name == temp and jid != old]
 
 
-def _undo_swap(run, record: dict) -> list[str] | None:
-    """Roll a swap back: remove the half-made new job if it still exists (by the id in RECORD, or, when setup
-    stopped before it learned that id, by the unique temp name RECORD carries), and put the old job back as it was:
-    resumed when the swap found it active and paused it. Returns the ids removed; None when something could not be
-    done (the record then stays, and the next setup run tries again)."""
-    old, new = _swap_ids(record)
-    try:
-        states = _job_states(run)
-        half_made = [new] if new and new in states else []
-        if not new:
-            half_made = _temp_jobs(run, record)
-    except Exception as exc:
-        logger.warning("proactive-hermes: could not list jobs to undo a swap (%s)", exc)
-        return None
-    ok, removed = True, []
-    for jid in half_made:
-        try:
-            _remove(run, jid)
-            removed.append(jid)
-        except Exception as exc:
-            logger.warning("proactive-hermes: could not remove half-made job %s (%s)", jid, exc)
-            ok = False
-    if ok and record.get("was_active") and old and states.get(old) == "paused":
-        try:
-            _resume(run, old)
-        except Exception as exc:
-            logger.warning("proactive-hermes: could not resume %s after a failed replace (%s)", old, exc)
-            ok = False
-    return removed if ok else None
+def _retired_ids(record: dict) -> set[str]:
+    retired = record.get("retired")
+    return {jid for jid in [record.get("old"), *(retired if isinstance(retired, list) else [])]
+            if isinstance(jid, str)}
 
 
-def _recover_swaps(run, reg: dict, disabled: set[str]) -> int:
-    """Finish or undo a journaled swap. A disabled feature stops before any wait for old run history.
+def _matches_spec(entry, spec: dict) -> bool:
+    return isinstance(entry, dict) and all(entry.get(field) == spec.get(field) for field in ("spec", "toolsets"))
 
-    Normally an already recorded replacement is kept and an uncommitted swap is undone. For a
-    disabled feature there is nothing to restore: remove its replacement and archive the paused old
-    job separately. The journal stays until that old job can safely be removed.
-    """
+
+def _fence_swaps(run, reg: dict, wanted: dict) -> None:
+    """First stop all superseded jobs. No edits, creations or history waits can delay a later key's revocation."""
     pending = reg.get(REPLACING)
     if not isinstance(pending, dict):
-        if REPLACING in reg:   # malformed: nothing to act on
-            del reg[REPLACING]
+        if REPLACING in reg:
+            reg.pop(REPLACING)
             _save_registry(reg)
-        return 0
-    # A policy change must not wait behind any of the potentially long history checks.
-    for key, record in pending.items():
-        if key not in disabled or not isinstance(record, dict):
-            continue
-        old, new = _swap_ids(record)
-        states = _job_states(run)
-        if old and states.get(old) == "active":
-            _pause(run, old)
-        replacements = [new] if new else _temp_jobs(run, record)
-        for jid in replacements:
-            if jid != old and jid in states:
-                _remove(run, jid)
-                print(f"Setup: disabled {key} replacement job {jid}; keeping old run history separately.")
-    kept = 0
+        return
+    states = _job_states(run)
+    errors = []
     for key, record in list(pending.items()):
-        record = record if isinstance(record, dict) else {}
-        old, new = _swap_ids(record)
-        if key in disabled or (new and _job_id(reg.get(key)) == new):
-            try:
-                states = _job_states(run)
-                if old and old in states:
-                    if states[old] == "active":
-                        _pause(run, old)
-                    if not _wait_for_idle(run, old):
-                        _defer_removal(key, old)
-                        continue   # the swap journal keeps ownership of both jobs for the next setup
-                    kept += _keep_history(key, old)
-                    _remove(run, old)
-            except Exception as exc:
-                raise RuntimeError(f"An earlier setup run replaced {key} with job {new} but the old job {old} is "
-                                   f"still there: rerun setup after resolving the history or cron error. ({exc})") from exc
-            print(f"Setup: finished an interrupted job swap for {key}: the old job {old} is removed.")
+        if not isinstance(record, dict):
+            _end_swap(reg, key)
+            continue
+        _old, new = _swap_ids(record)
+        retired = _retired_ids(record)
+        entry = reg.get(key)
+        desired = wanted.get(key)
+        current = bool(new and new not in retired and _job_id(entry) == new and new in states)
+        same_spec = current and desired and _matches_spec(entry, desired[1])
+        try:
+            candidates = ({new} if new else set(_temp_jobs(run, record))) & states.keys()
+            fenced = retired | (set() if same_spec else candidates)
+            if desired and new and current and not same_spec and "arm" not in record:
+                record["arm"] = states[new] == "active"
+                _save_registry(reg)  # distinguish a manual pause from a pause performed by this setup
+            for jid in sorted(fenced & states.keys()):
+                if states[jid] == "active":
+                    _pause(run, jid)
+            if not desired:
+                # These jobs are retained solely to rescue history. Nothing can restore their authority.
+                record["retired"] = sorted(retired | candidates)
+                for field in ("new", "temp", "arm"):
+                    record.pop(field, None)
+                reg.pop(key, None)
+                _save_registry(reg)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            errors.append((key, exc))
+    if errors:
+        key, exc = errors[0]
+        raise RuntimeError(f"Could not fence superseded jobs for {key}: {exc}") from exc
+
+
+def _configure_swap(run, ensure, reg: dict, key: str, fields: dict, spec: dict) -> None:
+    """Publish only a replacement with the current spec; the retired jobs never resume."""
+    record = reg[REPLACING][key]
+    states = _job_states(run)
+    _old, new = _swap_ids(record)
+    entry = reg.get(key)
+    current = new is not None and new in states and new not in _retired_ids(record) and _job_id(entry) == new
+    if not (current and _matches_spec(entry, spec)):
+        arm = record.get("arm", record.get("was_active", True))
+        if new and current and isinstance(entry, dict) and entry.get("toolsets") == spec.get("toolsets"):
+            _edit(run, new, fields)   # already fenced, so a failed edit leaves it paused
         else:
-            removed = _undo_swap(run, record)
-            if removed is None:
-                want = f"active (`hermes cron resume {old}`)" if record.get("was_active") else "as you left it"
-                drop = (f", and job {new} removed (`hermes cron remove {new}`)" if new else
-                        f", and any job named {record['temp']!r} removed" if record.get("temp") else "")
-                raise RuntimeError(f"An earlier setup run was interrupted while replacing {key}, and setup could not "
-                                   f"put it back. Make sure job {old} is {want}{drop}, then run setup again.")
-            print(f"Setup: undid an interrupted job swap for {key}: "
-                  + (f"the half-made job {', '.join(removed)} is removed, " if removed else "")
-                  + f"the old job {old} is {'active again' if record.get('was_active') else 'as it was'}.")
+            # Any prior replacement may have produced output. Archive it too, without blocking the new spec.
+            previous = {new} if new else set(_temp_jobs(run, record))
+            record["retired"] = sorted(_retired_ids(record) | (previous & states.keys()))
+            record.pop("new", None)
+            record.pop("temp", None)
+            record["arm"] = arm
+            reg.pop(key, None)
+            _save_registry(reg)
+
+            def note(**ids) -> None:
+                record.update(ids)
+                _save_registry(reg)
+
+            new = _create(run, ensure, fields, paused=True, note=note)
+        reg[key] = {"id": new, **spec}
+        _save_registry(reg)
+    if "arm" in record:
+        if new and record["arm"] and _job_states(run).get(new) == "paused":
+            _resume(run, new)
+        del record["arm"]
+        _save_registry(reg)
+
+
+def _archive_swap(run, reg: dict, key: str) -> int:
+    """Archive only fenced jobs; leave busy or unreadable jobs paused and journaled."""
+    record = reg[REPLACING][key]
+    kept, remaining = 0, False
+    live = _list_job_ids(run)
+    for jid in sorted(_retired_ids(record) & live):
+        if not _wait_for_idle(run, jid):
+            _defer_removal(key, jid)
+            remaining = True
+            continue
+        try:
+            kept += _keep_history(key, jid)
+            _remove(run, jid)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"Could not archive or remove paused {key} job {jid}; rerun setup or remove. ({exc})") from exc
+    if not remaining:
         _end_swap(reg, key)
     return kept
 
 
-def _replace(run, ensure, reg: dict, key: str, old: str, state: str, fields: dict) -> tuple[str, int | None]:
-    """Swap the recorded job OLD for a new one (`hermes cron edit` cannot change toolsets); returns (new id, saved
-    runs kept). First a `replacing` record (old id, was_active, and later the new job's name and id) goes into the
-    registry, so a swap that dies half way is finished or undone by the next setup run with OLD's real state. The new
-    job is made next; a paused or disabled OLD gives a paused new job; OLD's saved runs are copied to plugin-data
-    (_keep_history); only then is OLD removed, by the caller. OLD is paused during the swap so the two never both
-    schedule new runs together; an existing old run can finish normally. If OLD cannot be confirmed idle,
-    return None for the run count and defer removal."""
-    was_active = state == "active"
-    if not isinstance(reg.get(REPLACING), dict):
-        reg[REPLACING] = {}
-    record = {"old": old, "was_active": was_active}
-    reg[REPLACING][key] = record
-    _save_registry(reg)   # before anything changes
-
-    def note(**ids) -> None:
-        record.update(ids)
-        _save_registry(reg)
-    try:
-        if was_active:
-            _pause(run, old)
-        new = _create(run, ensure, fields, paused=not was_active, note=note)
-        kept = _keep_history(key, old) if _wait_for_idle(run, old) else None
-    except Exception:
-        if _undo_swap(run, record) is not None:
-            _end_swap(reg, key)
-        raise
-    return new, kept
+def _replace(run, ensure, reg: dict, key: str, old: str, state: str, fields: dict, spec: dict) -> int:
+    """Start a swap for a change cron edit cannot make (enabled_toolsets)."""
+    reg.setdefault(REPLACING, {})[key] = {"old": old, "was_active": state == "active"}
+    _save_registry(reg)
+    if state == "active":
+        _pause(run, old)
+    _configure_swap(run, ensure, reg, key, fields, spec)
+    return _archive_swap(run, reg, key)
 
 
 def _job_id(entry) -> str | None:
@@ -1203,88 +1200,89 @@ def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None) 
         return _apply(cfg, False, run=run, ensure=ensure)
 
 
+def _job_fields(cfg: dict, job: dict) -> tuple[dict, dict]:
+    key = job["key"]
+    fields = {
+        "prompt": prompt_for(job, cfg),
+        "schedule": job["schedule"] if "watch" in job else cfg["schedule"][key],
+        "name": PREFIX + job["name"],
+        "deliver": job.get("deliver", "local"),
+        "failure_deliver": "local",
+        "script": f"proactive-hermes/{job['script']}" if job.get("script") else None,
+        "no_agent": bool(job.get("no_agent")),
+        "timezone": cfg["daily_call"].get("timezone") if job.get("tz") == "daily" else cfg.get("timezone"),
+        "wrap_response": False,
+        "catch_up": False,
+    }
+    if job.get("skills"):
+        fields["skills"] = job["skills"]
+    toolsets = toolsets_for(job, cfg)
+    if toolsets is not None:
+        fields["enabled_toolsets"] = toolsets
+    # Cache the last applied spec, not the private prompt text.
+    spec: dict = {"spec": sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()}
+    if toolsets is not None:
+        spec["toolsets"] = toolsets
+    return fields, spec
+
+
 def _apply(cfg: dict, dry_run: bool, *, run, ensure) -> list[dict]:
     reg = _load_registry()
     desired = JOBS + [watch_job(watch) for watch in cfg.get("watches", [])]
-    wanted = {job["key"] for job in desired if enabled(cfg, job)}
+    fields_by_key = {job["key"]: _job_fields(cfg, job) for job in desired}
+    wanted = {key: fields_by_key[key] for key in ph_jobs.expected(cfg)}
     kept_runs = 0
     if not dry_run and REPLACING in reg:
-        disabled = {job["key"] for job in desired} - wanted
-        kept_runs += _recover_swaps(run, reg, disabled)
-    states = _job_states(run) if reg else {}
-    live = set(states)
+        _fence_swaps(run, reg, wanted)
     if not dry_run and CREATING in reg:
-        for key in set(reg[CREATING]) - wanted:
+        for key in set(reg[CREATING]) - wanted.keys():
             _remove_staged(run, reg, key)
-        states = _job_states(run)
-        live = set(states)
     out = []
     if not dry_run:
         install_runtime(cfg)
         warning = toolset_warning(cfg, cron_toolsets_setting())
         if warning:
             print(warning)
+        pending = list(reg.get(REPLACING, {}))
+        for key in pending:
+            if key in wanted:
+                _configure_swap(run, ensure, reg, key, *wanted[key])
+        # Every pending replacement now matches the owner's policy (or is fenced).
+        # Only then may history recovery wait or fail.
+        for key in pending:
+            kept_runs += _archive_swap(run, reg, key)
+            if key not in reg.get(REPLACING, {}):
+                print(f"Setup: finished an interrupted job swap for {key}.")
+    states = _job_states(run) if reg else {}
+    live = set(states)
     # The say job first: every desk message reaches Bot Chat through it, so it exists before anything can speak.
     for job in sorted(desired, key=lambda j: j["key"] != "say"):
         key = job["key"]
         entry = reg.get(key)
         jid = _job_id(entry)
-        tz = cfg["daily_call"].get("timezone") if job.get("tz") == "daily" else cfg.get("timezone")
-        fields = {
-            "prompt": prompt_for(job, cfg),
-            "schedule": job["schedule"] if "watch" in job else cfg["schedule"][key],
-            "name": PREFIX + job["name"],
-            "deliver": job.get("deliver", "local"),
-            "failure_deliver": "local",
-            "script": f"proactive-hermes/{job['script']}" if job.get("script") else None,
-            "no_agent": bool(job.get("no_agent")),
-            "timezone": tz,
-            "wrap_response": False,
-            "catch_up": False,
-        }
-        if job.get("skills"):  # only jobs with skills carry the key, so other jobs' specs stay unchanged
-            fields["skills"] = job["skills"]
-        toolsets = toolsets_for(job, cfg)
-        if toolsets is not None:  # agent jobs only, so the no-agent jobs' specs stay unchanged
-            fields["enabled_toolsets"] = toolsets
-        # The CLI list omits settings like prompt and catch-up. Cache the last
-        # applied spec (not the private prompt text) for no-op reapplication.
-        spec = sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
-        if key in reg.get(REPLACING, {}):
-            action = "defer"  # only history recovery remains if this feature was disabled
+        fields, spec = fields_by_key[key]
+        pending = reg.get(REPLACING)
+        if isinstance(pending, dict) and key in pending:
+            action = "defer"  # policy is settled; only history recovery remains
         elif key in wanted:
-            record = {"toolsets": toolsets} if toolsets is not None else {}
+            toolsets = spec.get("toolsets")
             same_toolsets = toolsets is None or (isinstance(entry, dict) and entry.get("toolsets") == toolsets)
             if jid not in live or key in reg.get(CREATING, {}):
                 action = "create"
                 if not dry_run:
-                    _finish_create(run, ensure, reg, key, fields, {"spec": spec, **record})
-            elif isinstance(entry, dict) and entry.get("spec") == spec and same_toolsets:
+                    _finish_create(run, ensure, reg, key, fields, spec)
+            elif isinstance(entry, dict) and entry.get("spec") == spec["spec"] and same_toolsets:
                 action = "keep"
             elif same_toolsets:
                 action = "update"
                 if not dry_run:
                     _edit(run, jid, fields)
-                    reg[key] = {"id": jid, "spec": spec, **record}
+                    reg[key] = {"id": jid, **spec}
                     _save_registry(reg)
             else:
-                # `hermes cron edit` cannot change toolsets: a new job replaces the recorded one (new id, same
-                # name, settings, pause state and run history), made before the old one is removed.
                 action = "replace"
                 if not dry_run:
-                    new, kept = _replace(run, ensure, reg, key, jid, states[jid], fields)
-                    reg[key] = {"id": new, "spec": spec, **record}
-                    _save_registry(reg)   # the `replacing` record stays until the old job is gone
-                    if kept is None:
-                        _defer_removal(key, jid)
-                    else:
-                        kept_runs += kept
-                        try:
-                            _remove(run, jid)
-                        except Exception as exc:
-                            raise RuntimeError(f"Replaced {fields['name']!r} with job {new}, but the old job {jid} "
-                                               f"(paused) was not removed. Rerun setup to finish the swap. ({exc})") from exc
-                        _end_swap(reg, key)
+                    kept_runs += _replace(run, ensure, reg, key, jid, states[jid], fields, spec)
         else:
             action = "remove" if jid in live else "skip"
             if not dry_run and key in reg:
@@ -1292,7 +1290,7 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure) -> list[dict]:
                     _remove(run, jid)
                 del reg[key]
                 _save_registry(reg)
-        out.append({"job": fields["name"], "action": action, "schedule": fields["schedule"], "timezone": tz})
+        out.append({"job": fields["name"], "action": action, "schedule": fields["schedule"], "timezone": fields["timezone"]})
     order = {PREFIX + job["name"]: i for i, job in enumerate(desired)}
     out.sort(key=lambda row: order.get(row["job"], len(order)))   # report in template order
     active_watches = {job["key"] for job in desired if "watch" in job}
@@ -1324,26 +1322,16 @@ def remove_all(*, run=subprocess.run) -> list[str]:
 
 def _remove_all(run) -> list[str]:
     reg = _load_registry()
-    gone = []
+    pending = reg.get(REPLACING)
+    gone = list(pending) if isinstance(pending, dict) else []
+    if REPLACING in reg:
+        _fence_swaps(run, reg, {})
     for key in list(reg.get(CREATING, {})):
         _remove_staged(run, reg, key)
         gone.append(key)
     live = _list_job_ids(run) if reg else set()
-    # A swap an interrupted setup left: the half-made and the replaced job are the plugin's own too.
-    pending = reg.get(REPLACING) if isinstance(reg.get(REPLACING), dict) else {}
-    recorded = {_job_id(entry) for key, entry in reg.items() if key != REPLACING}
-    for record in pending.values():
-        if not isinstance(record, dict):
-            continue
-        old, new = _swap_ids(record)
-        for jid in [old, new] + ([] if new else _temp_jobs(run, record)):
-            if jid and jid in live and jid not in recorded:
-                _remove(run, jid)
-                live.discard(jid)
     for key, entry in list(reg.items()):
         if key == REPLACING:
-            del reg[key]
-            _save_registry(reg)
             continue
         jid = _job_id(entry)
         if jid in live:
@@ -1351,4 +1339,7 @@ def _remove_all(run) -> list[str]:
             gone.append(key)
         del reg[key]
         _save_registry(reg)
+    # No managed job can schedule while we wait for already-claimed runs to save their history.
+    for key in list(reg.get(REPLACING, {})):
+        _archive_swap(run, reg, key)
     return gone

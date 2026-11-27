@@ -527,20 +527,22 @@ def compose(a, items: list[dict], *, flush=False, kick_now=True) -> int:
                 if (it := normalize_item(row)) and is_resolvable(it)}
         expired_wait = {key for key, row in wait.items() if wait_expired(timestamp(row.get("at")), t)}
         overflow_allowed = True
+        urgent_only = False
         if flush:
-            last = last_ping_at()
-            # Process timeouts first so a full ordinary queue cannot delay them another tick.
-            overflow_allowed = not expired_wait and (last is None or t - last >= FLUSH_GAP)
-            held_ready = not in_quiet(t) and bool(read_lines(HELD))
-            eligible = held_ready or bool(expired_wait)
-            if overflow_allowed and not in_quiet(t):
-                eligible = (eligible or any(resolution_for(it, t) for it in wait.values())
-                            or any((it := normalize_item(row)) and it["kind"] in SPEAKING for row in read_lines(DIGEST)))
-            if in_quiet(t) or not eligible:
-                if print_only:
-                    print("[SILENT]")
-                return 0
-        prepared = prepare_compose(a, items, t, wait, expired_wait, overflow_allowed)
+            speaking = [it for row in read_lines(DIGEST)
+                        if (it := normalize_item(row)) and it["kind"] in SPEAKING]
+            urgent_only = any(it.get("urgent") for it in speaking)
+            if not urgent_only:
+                last = last_ping_at()
+                # Timeouts bypass the gap and take priority over ordinary overflow.
+                overflow_allowed = not expired_wait and (last is None or t - last >= FLUSH_GAP)
+                eligible = (bool(read_lines(HELD)) or bool(expired_wait)
+                            or (overflow_allowed and (speaking or any(resolution_for(it, t) for it in wait.values()))))
+                if in_quiet(t) or not eligible:
+                    if print_only:
+                        print("[SILENT]")
+                    return 0
+        prepared = prepare_compose(a, items, t, wait, expired_wait, overflow_allowed, urgent_only=urgent_only)
         if prepared is None:
             print("[SILENT]")
             return 0
@@ -629,11 +631,11 @@ def drop_closed(items: list[dict], t: datetime) -> tuple[list[dict], list[str]]:
     return kept, [i["key"] for i in dropped]
 
 
-def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
+def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed, *, urgent_only=False):
     at = t.isoformat(timespec="seconds")
     said_at = t.isoformat()
     said = recent_said(t - timedelta(days=30))
-    take_held = getattr(a, "take_held", False)
+    take_held = getattr(a, "take_held", False) and not urgent_only
     attach_digest = getattr(a, "attach_digest", None)
     if take_held and not in_quiet(t):
         keys = {i["key"] for i in items}
@@ -653,7 +655,7 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
     # Every run takes the rolled-over items first: no daily cap, nothing waits for a brief.
     for row in (read_lines(DIGEST) if overflow_allowed else ()):
         item = normalize_item(row)
-        if item and item["kind"] in SPEAKING:
+        if item and item["kind"] in SPEAKING and (not urgent_only or item.get("urgent")):
             consumed.append(row)
             if item["key"] in keys:  # the job re-raised it: keep the new text, keep its place in line
                 for it in items:
@@ -672,7 +674,8 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
     # A fresh submission supersedes the saved text. Otherwise reoffer only rows
     # that have resolved or run out of time. A within-gap flush takes only timeouts.
     for key, row in wait.items():
-        if key not in keys and (key in expired_wait or (overflow_allowed and resolution_for(row, t))):
+        if (not urgent_only or row.get("urgent")) and key not in keys and (
+                key in expired_wait or (overflow_allowed and resolution_for(row, t))):
             items.append(row)
             keys.add(key)
     # Overflow and waiting rows joined the batch above: a key the owner closed meanwhile must not speak.
@@ -780,7 +783,7 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
         speak, draft_rows = speak[:kept], draft_rows[:kept]
     for it in overflow:
         key = it["key"]
-        if is_resolvable(it) and (row := returned_wait.get((key, fp(it)))) is not None:
+        if not it.get("urgent") and is_resolvable(it) and (row := returned_wait.get((key, fp(it)))) is not None:
             # Keep the deadline through rollover, so the next tick can still bypass the gap.
             remaining_wait.setdefault(key, row)
         else:
@@ -817,13 +820,16 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
 
 
 def release_held() -> None:
-    """The always-installed say job releases daytime holds and their overflow without kicking itself."""
-    if in_quiet(now()):
+    """The say worker drains eligible desk queues without kicking itself or reading sources."""
+    t = now()
+    quiet = in_quiet(t)
+    overflow = any(isinstance(row, dict) and row.get("kind") in SPEAKING
+                   and (not quiet or row.get("urgent")) for row in read_lines(DIGEST))
+    if not overflow and (quiet or not (read_lines(HELD) or any(
+            isinstance(row, dict) and wait_expired(timestamp(row.get("at")), t)
+            for row in read_lines(RESOLVE_WAIT)))):
         return
-    if not read_lines(HELD) and not any(isinstance(row, dict) and row.get("kind") in SPEAKING
-                                       for row in read_lines(DIGEST)):
-        return
-    # compose enforces the gap and rechecks eligibility under its queue lock.
+    # compose rechecks eligibility and the ordinary overflow gap under the queue lock.
     args = argparse.Namespace(job="overflow", brief=False, take_held=True)
     with redirect_stdout(io.StringIO()):
         compose(args, [], flush=True, kick_now=False)

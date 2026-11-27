@@ -8,6 +8,37 @@ It lives in runtime/ because the watchdog runs from the installed scripts direct
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+REPLACING = "replacing"
+
+
+def read_registry(path: Path) -> dict:
+    try:
+        reg = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return reg if isinstance(reg, dict) else {}
+
+
+def pending_swaps(reg: dict) -> dict:
+    pending = reg.get(REPLACING)
+    return pending if isinstance(pending, dict) else {}
+
+
+def recorded_job_id(reg: dict, key: str, *, allow_pending: bool = False) -> str | None:
+    entry = reg.get(key)
+    jid = entry.get("id") if isinstance(entry, dict) else entry
+    pending = pending_swaps(reg)
+    if key in pending:
+        swap = pending[key]
+        if (not allow_pending or not isinstance(swap, dict) or jid != swap.get("new")
+                or jid == swap.get("old") or "arm" in swap):
+            return None
+    return jid if isinstance(jid, str) and jid else None
+
+
 # Every managed job key, in install order. jobs.JOBS holds one template per key (a test keeps them equal).
 MANAGED_KEYS: tuple[str, ...] = (
     "morning_brief", "mail_radar", "slack_sweep", "promises", "work_recap_after_daily", "work_recap_evening",
