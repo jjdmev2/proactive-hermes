@@ -414,7 +414,7 @@ class ResolveGateTests(DeskTests):
         item = self.item("k", act="send")
         self.assertEqual(self.compose([item]), "[RESOLVE-FIRST] k\n" + SILENT)
         self.assertEqual(self.put("k", draft="Hello, Sam.")["status"], "ready")
-        self.assertEqual(self.compose([]), "Work on k Draft ready, reply 1.\n")
+        self.assertEqual(self.compose([]), "Work on k. Draft ready, reply 1.\n")
         self.assertEqual(resolve.get("k")["item_fp"], desk.fp(item))
         self.assertEqual(self.rows(desk.RESOLVE_WAIT), [])
         self.assertEqual(self.rows(desk.PING_LOG)[-1]["drafts"], {"k": "ready"})
@@ -473,14 +473,14 @@ class ResolveGateTests(DeskTests):
     def test_changed_fingerprint_waits_again_and_resets_the_deadline(self):
         item = self.item("k", act="send")
         self.put("k", draft="Hello, Sam.")
-        self.assertEqual(self.compose([item]), "Work on k Draft ready, reply 1.\n")
+        self.assertEqual(self.compose([item]), "Work on k. Draft ready, reply 1.\n")
         self.assertEqual(self.compose([dict(item, change="deadline moved")]), "[RESOLVE-FIRST] k\n" + SILENT)
         self.clock += timedelta(minutes=21)
         changed = dict(item, change="deadline moved again")
         self.assertEqual(self.compose([changed]), "[RESOLVE-FIRST] k\n" + SILENT)
         self.assertEqual(self.rows(desk.RESOLVE_WAIT)[0]["at"], self.clock.isoformat())
         self.put("k", draft="Updated draft.")
-        self.assertEqual(self.compose([changed]), "Work on k Draft ready, reply 1.\n")
+        self.assertEqual(self.compose([changed]), "Work on k. Draft ready, reply 1.\n")
 
     def test_quiet_hours_hold_resolved_item_for_morning_take_held(self):
         self.clock = self.clock.replace(hour=23)
@@ -489,7 +489,7 @@ class ResolveGateTests(DeskTests):
         self.assertEqual([r["key"] for r in self.rows(desk.HELD)], ["k"])
         self.assertEqual(self.rows(desk.RESOLVE_WAIT), [])
         self.clock += timedelta(hours=8)
-        self.assertEqual(self.compose([], "--brief", "--take-held"), "Work on k Draft ready, reply 1.\n")
+        self.assertEqual(self.compose([], "--brief", "--take-held"), "Work on k. Draft ready, reply 1.\n")
         self.assertEqual(self.rows(desk.HELD), [])
 
     def test_flush_at_20_minutes_ignores_gap_for_timeout_only(self):
@@ -522,7 +522,7 @@ class ResolveGateTests(DeskTests):
     def test_flush_releases_ready_waiter_without_a_new_producer(self):
         self.assertEqual(self.compose([self.item("k", act="reply")]), "[RESOLVE-FIRST] k\n" + SILENT)
         self.put("k", act="reply", draft="Hello, Sam.")
-        self.assertEqual(self.cli(desk, "flush", "--print-only"), "Work on k Draft ready, reply 1.\n")
+        self.assertEqual(self.cli(desk, "flush", "--print-only"), "Work on k. Draft ready, reply 1.\n")
         self.assertEqual(self.rows(desk.RESOLVE_WAIT), [])
         self.assertEqual(self.rows(desk.RUN_LOG)[-1]["unresolved"], [])
 
@@ -550,13 +550,13 @@ class ResolveGateTests(DeskTests):
         self.put("first", act="decide")
         items = [self.item("second", act="send"), self.item("third", act="send"),
                  self.item("rolled", act="send"), self.item("first", "decision", act="decide")]
-        text = ("Hey Alex, 3 things:\n1. Work on first\n2. Work on second Draft ready, reply 2.\n"
-                "3. Work on third Draft ready, reply 3.\n+1 more lined up, coming next (or ask me)")
+        text = ("Hey Alex, 3 things:\n1. Work on first\n2. Work on second. Draft ready, reply 2.\n"
+                "3. Work on third. Draft ready, reply 3.\n+1 more lined up, coming next (or ask me)")
         self.assertEqual(self.cli(desk, "compose", "--job", "test", stdin=json.dumps(items)), SILENT)
         # Nothing but the message: no private notes ride along (the delivery input is visible in Bot Chat).
         self.deliver.assert_called_once_with(text, key="test:first,second,third", job="test", urgent=False)
         self.assertEqual(self.rows(desk.PING_LOG)[-1]["drafts"], {"second": "ready", "third": "ready"})
-        self.assertEqual(self.compose([]), "Work on rolled Draft ready, reply 1.\n")
+        self.assertEqual(self.compose([]), "Work on rolled. Draft ready, reply 1.\n")
         self.deliver.reset_mock()
         self.put("plain")
         self.assertEqual(self.cli(desk, "compose", "--job", "test", stdin=json.dumps([self.item("plain", act="send")])), SILENT)

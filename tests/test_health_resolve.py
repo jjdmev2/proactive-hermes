@@ -125,14 +125,44 @@ class ResolveHealthTests(unittest.TestCase):
         jobs = [{"id": "say-job", "name": "Proactive · say", "deliver": "local", "failure_deliver": "origin"},
                 {"id": "radar", "name": "Proactive · mail radar", "deliver": "bot-chat"},
                 {"id": "foreign", "name": "Proactive · say", "deliver": "telegram", "failure_deliver": "origin"}]
-        with patch.object(health.subprocess, "run") as run, patch.object(health, "log"), \
+        with patch.object(health.subprocess, "run") as run, patch.object(health, "log") as log, \
+                patch.object(health, "kick_say", return_value={"kick": "ok", "runs": 1}) as kick, \
                 patch.object(health, "registry_ids", return_value={"say": "say-job", "mail_radar": "radar"}):
+            run.return_value.returncode = 0
             health.check_local_delivery(jobs)
         healed = [call.args[0][5:] for call in run.call_args_list]
         self.assertEqual(healed, [["say-job", "--deliver", "bot-chat"], ["say-job", "--failure-deliver", "local"],
                                   ["radar", "--deliver", "local"]])
         self.assertEqual(list(health.faults.values()),
                          [("desk", "the say job delivered to local, not Bot Chat; set back to Bot Chat")])
+        # Healed back to Bot Chat: the say job is kicked once, after every edit, so waiting messages go out now.
+        kick.assert_called_once_with()
+        self.assertEqual(log.call_args_list[-1].args[0], {"kicked_say_after_heal": {"kick": "ok", "runs": 1}})
+
+    def test_no_kick_when_the_say_heal_failed_or_only_other_jobs_were_healed(self):
+        for jobs, rc in (([{"id": "say-job", "deliver": "local"}], 1),
+                         ([{"id": "say-job", "deliver": "bot-chat", "failure_deliver": "origin"},
+                           {"id": "radar", "deliver": "bot-chat"}], 0)):
+            with self.subTest(jobs=jobs), patch.object(health.subprocess, "run") as run, patch.object(health, "log"), \
+                    patch.object(health, "kick_say") as kick, \
+                    patch.object(health, "registry_ids", return_value={"say": "say-job", "mail_radar": "radar"}):
+                run.return_value.returncode = rc
+                health.check_local_delivery(jobs)
+            kick.assert_not_called()
+
+    def test_kick_say_runs_the_say_job_through_the_public_cron_run(self):
+        import desk_say
+        with patch.object(desk_say, "pending_due", return_value=1), \
+                patch.object(desk_say, "say_job_id", return_value="0123456789ab"), \
+                patch.object(desk_say, "_settled_ids", side_effect=[set(), {"m"}, {"m"}]), \
+                patch.object(desk_say.subprocess, "Popen") as popen, patch.dict("os.environ", DESK_SAY_DISABLE_DOOR=""):
+            popen.return_value.wait.return_value = 0
+            with patch.object(desk_say, "pending_due", side_effect=[1, 1, 0]):
+                self.assertEqual(health.kick_say(), {"kick": "ok", "runs": 1})
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[1:], ["cron", "run", "0123456789ab"])
+        with patch.object(desk_say, "flush", side_effect=OSError("boom")):
+            self.assertEqual(health.kick_say(), {"kick": "OSError: boom"})
 
     def test_a_say_job_on_bot_chat_is_left_alone(self):
         jobs = [{"id": "say-job", "name": "Proactive · say", "deliver": "bot-chat", "failure_deliver": "local"}]

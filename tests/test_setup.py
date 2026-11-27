@@ -6,9 +6,10 @@ import os
 import re
 import subprocess
 import sys
+import time
 import types
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -70,7 +71,8 @@ class FakeCron:
         if action == "list":
             assert argv[3:] == ["--all"], argv
             stdout = "Scheduled Jobs (profile: custom)\n\n" + "".join(
-                f"  {jid} [{self.states.get(jid, 'active')}]\n    Deliver:   local\n" for jid in self.live
+                f"  {jid} [{self.states.get(jid, 'active')}]\n    Name:      {self.names.get(jid, '(unnamed)')}\n"
+                f"    Deliver:   local\n\n" for jid in self.live
             ) if self.live else "No scheduled jobs in profile 'custom'.\n"
         elif action == "create":
             self.next_id += 1
@@ -421,6 +423,66 @@ class JobSetupTests(unittest.TestCase):
         self.settle()   # cron works again: the record is still there and still right
         self.assert_swapped_cleanly(old, active=True)
 
+    def _die_after_ensure_before_note(self):
+        """Setup dies after ensure_named_job made the temp job but before the record learned its id (only `temp`)."""
+        path, old = self._old_radar()
+        real_ensure = self.run.ensure
+
+        def ensure_then_die(name, **kwargs):
+            real_ensure(name, **kwargs)
+            raise KeyboardInterrupt
+        with patch.object(jobs, "_plugin_ensure", ensure_then_die), self.assertRaises(KeyboardInterrupt):
+            jobs.apply(self.cfg, run=self.run)
+        record = self.registry()["replacing"]["mail_radar"]
+        self.assertNotIn("new", record)
+        self.assertEqual(self.setup_names(), [record["temp"]])   # the half-made job, known only by its temp name
+        return old, record
+
+    def test_an_interrupted_swap_with_only_the_temp_name_removes_that_job(self):
+        old, record = self._die_after_ensure_before_note()
+        temp_id = self.run.job(record["temp"])
+        # A job of someone else with a similar name is never touched.
+        self.run.live["abcdef123456"] = ["someone else's job"]
+        self.run.names["abcdef123456"] = record["temp"] + " "   # even trailing whitespace is a different name
+        said = self.settle()
+        self.assertIn(f"the half-made job {temp_id} is removed", said)
+        self.assertNotIn(temp_id, self.run.live)
+        self.assertIn("abcdef123456", self.run.live)
+        self.assertNotIn("may still exist", said)
+        del self.run.live["abcdef123456"]
+        self.assert_swapped_cleanly(old, active=True)
+
+    def test_the_temp_record_stays_until_its_job_could_be_removed(self):
+        old, record = self._die_after_ensure_before_note()
+        temp_id = self.run.job(record["temp"])
+        real = self.run.__call__
+        broken = lambda argv, **kw: (subprocess.CompletedProcess(argv, 1, stdout="", stderr="busy")  # noqa: E731
+                                     if argv[2] == "remove" and argv[3] == temp_id else real(argv, **kw))
+        with self.assertLogs(jobs.logger, "WARNING"), self.assertRaisesRegex(RuntimeError, "could not put it back"):
+            jobs.apply(self.cfg, run=broken)
+        self.assertEqual(self.registry()["replacing"]["mail_radar"]["temp"], record["temp"])   # kept until done
+        self.assertIn(temp_id, self.run.live)
+        self.assertEqual(self.run.states[old], "paused")    # do not resume until the half-made job is gone
+        self.settle()   # cron works again: the temp job goes and the swap completes
+        self.assertNotIn(temp_id, self.run.live)
+        self.assert_swapped_cleanly(old, active=True)
+
+    def test_remove_all_also_removes_the_temp_named_job_of_an_interrupted_swap(self):
+        old, record = self._die_after_ensure_before_note()
+        jobs.remove_all(run=self.run)
+        self.assertEqual(self.run.live, {})
+        self.assertEqual(self.registry(), {})
+
+    def test_job_names_reads_the_name_row_under_each_header(self):
+        listing = ("Scheduled Jobs (profile: custom)\n\n  0123456789ab [active]\n    Name:      Proactive · say\n"
+                   "    Schedule:  */2 * * * *\n\n  ba9876543210 [paused]\n    Name:      Proactive · x (setup 00ff)  \n"
+                   "    Deliver:   local\n")
+        run = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout=listing, stderr="")  # noqa: E731
+        self.assertEqual(jobs._job_names(run), {"0123456789ab": "Proactive · say", "ba9876543210": "Proactive · x (setup 00ff)  "})
+        listing += "\n  cccccccccccc [active]\n    Deliver:   local\n"
+        with self.assertRaisesRegex(RuntimeError, "Could not read job names"):
+            jobs._job_names(run)
+
     def test_remove_all_also_removes_the_jobs_of_an_interrupted_swap(self):
         path, old = self._old_radar()
         dying = self.interrupt_on("edit", when=lambda argv: argv[3] != old)
@@ -487,11 +549,116 @@ class JobSetupTests(unittest.TestCase):
         for config in ({}, {"platform_toolsets": {}}, {"platform_toolsets": {"cron": []}},
                        {"platform_toolsets": {"cron": "terminal"}}, {"platform_toolsets": None}, None,
                        {"platform_toolsets": {"cron": ["hermes-cron"]}},
-                       {"platform_toolsets": {"cron": ["terminal", "hermes-cli"]}}):
+                       {"platform_toolsets": {"cron": ["terminal", "hermes-cli"]}},
+                       # every other bundle Hermes's toolsets.py defines: no name comparison, no warning
+                       {"platform_toolsets": {"cron": ["terminal", "debugging"]}},
+                       {"platform_toolsets": {"cron": ["safe"]}}, {"platform_toolsets": {"cron": ["coding"]}},
+                       {"platform_toolsets": {"cron": ["all"]}}, {"platform_toolsets": {"cron": ["file", "*"]}},
+                       {"platform_toolsets": {"cron": ["hermes"]}}, {"platform_toolsets": {"cron": ["hermes-gateway"]}}):
             with self.subTest(config=config), with_config(config):
                 self.assertIsNone(read())
         with with_config(boom=True):
             self.assertIsNone(read())
+        # Plain toolsets stay comparable, so the warning still works for them.
+        for name in ("terminal", "file", "web", "search", "browser", "skills", "session_search", "connections", "kanban"):
+            self.assertFalse(jobs.toolset_bundle(name), name)
+
+    # --- one writer of the registry at a time ------------------------------------------------------------------
+
+    def hold_lock(self):
+        """The registry lock held by another run (a separate open file, as another process would hold it)."""
+        import fcntl
+        path = self.home / "plugin-data" / "proactive-hermes" / "jobs.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = path.open("a")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        return fh
+
+    def test_a_second_setup_waits_then_refuses_clearly_and_changes_nothing(self):
+        held = self.hold_lock()
+        err = StringIO()
+        with patch.object(jobs, "LOCK_WAIT_S", 0.5), redirect_stderr(err), \
+                self.assertRaisesRegex(jobs.RegistryBusy, "still running for this profile.*Nothing was changed"):
+            jobs.apply(self.cfg, run=self.run)
+        self.assertIn("waiting for it to finish", err.getvalue())
+        self.assertEqual(self.run.calls, [])                          # not one `hermes cron` call
+        self.assertFalse((self.home / "plugin-data" / "proactive-hermes" / "jobs.json").exists())
+        with patch.object(jobs, "LOCK_WAIT_S", 0.5), redirect_stderr(StringIO()), self.assertRaises(jobs.RegistryBusy):
+            jobs.remove_all(run=self.run)
+        held.close()
+        jobs.apply(self.cfg, run=self.run)                            # free again: runs normally
+        self.assertEqual(len(self.run.live), 3)
+
+    def test_a_second_setup_waits_for_the_first_to_finish(self):
+        import threading
+        held = self.hold_lock()
+        threading.Timer(0.6, held.close).start()
+        err = StringIO()
+        started = time.monotonic()
+        with redirect_stderr(err):
+            jobs.apply(self.cfg, run=self.run)
+        self.assertGreaterEqual(time.monotonic() - started, 0.5)
+        self.assertIn("waiting for it to finish", err.getvalue())
+        self.assertEqual(len(self.run.live), 3)
+
+    def test_watch_add_and_remove_refuse_before_saving_config_when_registry_is_busy(self):
+        with self.hold_lock(), patch.object(jobs, "LOCK_WAIT_S", 0.1), \
+                patch.object(cli, "write_config") as save, patch.object(jobs, "apply") as apply:
+            for command in ("add", "remove"):
+                with self.subTest(command=command), redirect_stderr(StringIO()) as err:
+                    self.assertEqual(cli.handle_watch(types.SimpleNamespace(watch_command=command), jobs), 1)
+                    self.assertIn("Nothing was changed", err.getvalue())
+            save.assert_not_called()
+            apply.assert_not_called()
+
+    def test_a_dry_run_and_a_nested_run_do_not_wait_on_the_lock(self):
+        with jobs.registry_lock():                                    # a watch change holds it and calls apply
+            jobs.apply(self.cfg, run=self.run)
+        held = self.hold_lock()
+        with patch.object(jobs, "LOCK_WAIT_S", 0.1):
+            jobs.apply(self.cfg, dry_run=True, run=self.run)          # read only: no lock
+        held.close()
+
+    def test_another_thread_cannot_enter_the_same_lock(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def other():
+            with jobs.registry_lock(wait_s=0.1):
+                self.fail("a different thread entered while the test held the lock")
+
+        with jobs.registry_lock(), redirect_stderr(StringIO()), ThreadPoolExecutor(max_workers=1) as workers:
+            with self.assertRaisesRegex(jobs.RegistryBusy, "Nothing was changed"):
+                workers.submit(other).result(timeout=2)
+
+    def test_two_real_processes_never_apply_at_once(self):
+        """A second process blocks on the flock while the first holds it, and goes on once it is released."""
+        import textwrap
+        lock = self.home / "plugin-data" / "proactive-hermes" / "jobs.lock"
+        script = textwrap.dedent(f"""
+            import sys, time
+            sys.path.insert(0, {str(Path(jobs.HERE))!r})
+            import jobs
+            with jobs.registry_lock(wait_s=float(sys.argv[1])):
+                print("got", time.time(), flush=True)
+                time.sleep(float(sys.argv[2]))
+        """)
+        env = {**os.environ, "HERMES_HOME": str(self.home)}
+        first = subprocess.Popen([sys.executable, "-c", script, "5", "1.0"], stdout=subprocess.PIPE, text=True, env=env)
+        self.assertTrue(first.stdout.readline().startswith("got"))
+        self.assertTrue(lock.exists())
+        second = subprocess.run([sys.executable, "-c", script, "5", "0"], capture_output=True, text=True, env=env)
+        first.wait(10)
+        first.stdout.close()
+        self.assertEqual(second.returncode, 0)
+        self.assertIn("waiting for it to finish", second.stderr)
+        refused = subprocess.Popen([sys.executable, "-c", script, "5", "2.0"], stdout=subprocess.PIPE, text=True, env=env)
+        refused.stdout.readline()
+        busy = subprocess.run([sys.executable, "-c", script, "0.3", "0"], capture_output=True, text=True, env=env)
+        refused.wait(10)
+        refused.stdout.close()
+        self.assertNotEqual(busy.returncode, 0)
+        self.assertIn("RegistryBusy", busy.stderr)
+        self.assertIn("Nothing was changed", busy.stderr)
 
     # --- the manifest floor ------------------------------------------------------------------------------------
 

@@ -314,7 +314,10 @@ def render_parts(header: str | None, items: list[str], worth: list[str], more: i
         prefix = f"{i}. " if count > 1 else ""
         suffix = suffixes[i - 1].replace("{n}", str(i)) if suffixes else ""
         if suffix:
-            base = _clip_message_item(base, line_chars - len(prefix) - len(suffix) - 1) + " " + suffix
+            base = _clip_message_item(base, line_chars - len(prefix) - len(suffix) - 2)
+            if not base.endswith((".", "?", "!", "\u2026")):
+                base += "."   # "... by Friday. Draft ready, reply 1." not "... by Friday Draft ready, reply 1."
+            base += " " + suffix
         else:
             base = _clip_message_item(base, line_chars)
         lines.append(prefix + base)

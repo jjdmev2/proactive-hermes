@@ -85,10 +85,12 @@ def check_local_delivery(jobs: list[dict]) -> None:
     """Keep the plugin's own cron responses in the local lane; desk messages go out only through the say job, whose
     output (one desk message) is the one thing delivered to Bot Chat. Only jobs the installer recorded are healed
     (never another job because of its name). The say job is healed back to Bot Chat, never to local, and that
-    raises a fault: while it pointed elsewhere it took nothing (desk_say fails closed)."""
+    raises a fault: while it pointed elsewhere it took nothing (desk_say fails closed). Once the say job is back on
+    Bot Chat it is kicked (kick_say), so the messages that waited go out now, not on its next two-minute run."""
     recorded = registry_ids()
     say_id = recorded.get("say")
     own = set(recorded.values())
+    say_healed = False
     for job in jobs:
         if job.get("id") not in own:
             continue
@@ -102,7 +104,22 @@ def check_local_delivery(jobs: list[dict]) -> None:
                                   capture_output=True, text=True, timeout=60)
             log({"healed": f"{field}_to_{want.replace('-', '_')}", "job_id": job["id"], "ok": proc.returncode == 0})
             if say and field == "deliver":
-                fault("desk", f"the say job delivered to {value or 'nothing'}, not Bot Chat; set back to Bot Chat")
+                result = "set back to Bot Chat" if proc.returncode == 0 else "could not set it back to Bot Chat"
+                fault("desk", f"the say job delivered to {value or 'nothing'}, not Bot Chat; {result}")
+                say_healed = say_healed or proc.returncode == 0
+    if say_healed:
+        log({"kicked_say_after_heal": kick_say()})
+
+
+def kick_say() -> dict:
+    """Run the say job now through desk_say.flush (`hermes cron run <say job>` while a message is due; nothing when
+    none is, and non-urgent messages still wait out quiet hours). Never raises."""
+    try:
+        sys.path.insert(0, str(HERE))
+        import desk_say
+        return desk_say.flush()
+    except Exception as exc:
+        return {"kick": f"{type(exc).__name__}: {exc}"[:200]}
 
 
 def check_say_outbox() -> None:

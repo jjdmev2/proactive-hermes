@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from hashlib import sha256
@@ -151,8 +152,8 @@ def toolsets_for(job: dict, cfg: dict | None = None) -> list[str] | None:
 
 def cron_toolsets_setting() -> list[str] | None:
     """`platform_toolsets.cron` from Hermes's config, read through its read-only loader (hermes_cli.config.
-    load_config_readonly, as mail_idle does). None when it is absent, empty, unreadable, or a bundle such as
-    hermes-cron, whose members are Hermes's to expand and cannot be compared by name."""
+    load_config_readonly, as mail_idle does). None when it is absent, empty, unreadable, or names any toolset
+    bundle (toolset_bundle), whose members are Hermes's to expand and cannot be compared by name."""
     try:
         from hermes_cli.config import load_config_readonly
         section = (load_config_readonly() or {}).get("platform_toolsets")
@@ -160,9 +161,19 @@ def cron_toolsets_setting() -> list[str] | None:
     except Exception:
         return None
     names = [str(name).strip() for name in value if str(name).strip()] if isinstance(value, list) else []
-    if not names or any(name == "hermes" or name.startswith("hermes-") for name in names):
+    if not names or any(toolset_bundle(name) for name in names):
         return None
     return names
+
+
+# The toolset names Hermes defines as bundles of other toolsets (its toolsets.py): "all" and "*" (every toolset),
+# the composites below, and every hermes / hermes-* platform bundle. A job's own toolsets cannot be compared with
+# them by name, so a setting that holds one gets no warning.
+TOOLSET_BUNDLES = frozenset({"all", "*", "debugging", "safe", "coding"})
+
+
+def toolset_bundle(name: str) -> bool:
+    return name in TOOLSET_BUNDLES or name == "hermes" or name.startswith("hermes-")
 
 
 def toolset_warning(cfg: dict, configured: list[str] | None) -> str | None:
@@ -542,6 +553,51 @@ def _registry() -> Path:
     return phconf.data_dir() / "jobs.json"
 
 
+class RegistryBusy(RuntimeError):
+    """Another setup, remove or watch change of this profile still holds the registry lock after LOCK_WAIT_S."""
+
+
+LOCK_WAIT_S = 600   # a full setup runs a few dozen `hermes cron` calls; wait that long for one, then refuse
+_lock_owner = threading.local()
+
+
+@contextmanager
+def registry_lock(wait_s: float | None = None):
+    """Serialize registry writes per profile. A watch or setup can call apply() under its own lock, but a different
+    thread or process must acquire the flock itself. A second run waits up to LOCK_WAIT_S, then raises RegistryBusy."""
+    path = phconf.data_dir().resolve() / "jobs.lock"
+    held = getattr(_lock_owner, "paths", None)
+    if held is None:
+        _lock_owner.paths = held = set()
+    if path in held:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Setup: another Proactive Hermes setup, remove or watch change is running for this profile; "
+                  "waiting for it to finish.", file=sys.stderr, flush=True)
+            deadline = time.monotonic() + (LOCK_WAIT_S if wait_s is None else wait_s)
+            while True:
+                time.sleep(0.2)
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RegistryBusy("another Proactive Hermes setup, remove or watch change is still running "
+                                           f"for this profile (it holds {path}). Nothing was changed; run this "
+                                           "again when it has finished.") from None
+        held.add(path)
+        try:
+            yield
+        finally:
+            held.remove(path)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def _load_registry() -> dict:
     try:
         return json.loads(_registry().read_text())
@@ -562,8 +618,7 @@ def _save_registry(reg: dict) -> None:
             tmp.unlink(missing_ok=True)
 
 
-# `hermes cron` currently has no JSON mode. Only parse its labeled result and
-# the indented ID/state header lines, never names, prompts or scheduler warnings.
+# `hermes cron` currently has no JSON mode. Parse only labeled command results and the list's ID/state and Name rows.
 _JOB_ID = r"[0-9a-f]{12}"
 
 
@@ -589,6 +644,28 @@ def _job_states(run) -> dict[str, str]:
     if not states and not re.search(r"^No scheduled jobs\b", output, re.MULTILINE):
         raise RuntimeError("Could not read job IDs from `hermes cron list --all`.")
     return states
+
+
+def _job_names(run) -> dict[str, str]:
+    """{job id: name} from `hermes cron list --all`: the "Name:" row under each "  <id> [state]" header line. Only
+    used to find a job by the unique name setup gave it while making it (`<name> (setup <random hex>)`)."""
+    output = _cron(run, "list", "--all")
+    headers = set()
+    names: dict[str, str] = {}
+    current = None
+    for line in output.splitlines():
+        header = re.fullmatch(rf"  ({_JOB_ID}) \[[^\]\n]+\]", line)
+        if header:
+            current = header.group(1)
+            headers.add(current)
+            continue
+        # The CLI pads "Name:" to 11 characters, then prints the name without stripping it.
+        prefix = "    Name:      "
+        if current and line.startswith(prefix) and current not in names:
+            names[current] = line[len(prefix):]
+    if headers != names.keys() or (not headers and not re.search(r"^No scheduled jobs\b", output, re.MULTILINE)):
+        raise RuntimeError("Could not read job names from `hermes cron list --all`.")
+    return names
 
 
 def _list_job_ids(run) -> set[str]:
@@ -807,30 +884,45 @@ def _end_swap(reg: dict, key: str) -> None:
     _save_registry(reg)
 
 
-def _undo_swap(run, record: dict) -> bool:
-    """Roll a swap back: remove the half-made new job (its id is in RECORD) if it still exists, and put the old job
-    back as it was: resumed when the swap found it active and paused it. False when something could not be
-    restored (the record then stays, and the next setup run tries again)."""
+def _temp_jobs(run, record: dict) -> list[str]:
+    """Ids of the jobs named exactly as the swap RECORD's temp name (a half-made job whose id never reached the
+    record). The name carries setup's random suffix, so only setup's own half-made job can have it."""
+    temp = record.get("temp")
+    old, _new = _swap_ids(record)
+    if not isinstance(temp, str) or not temp:
+        return []
+    return [jid for jid, name in _job_names(run).items() if name == temp and jid != old]
+
+
+def _undo_swap(run, record: dict) -> list[str] | None:
+    """Roll a swap back: remove the half-made new job if it still exists (by the id in RECORD, or, when setup
+    stopped before it learned that id, by the unique temp name RECORD carries), and put the old job back as it was:
+    resumed when the swap found it active and paused it. Returns the ids removed; None when something could not be
+    done (the record then stays, and the next setup run tries again)."""
     old, new = _swap_ids(record)
     try:
         states = _job_states(run)
+        half_made = [new] if new and new in states else []
+        if not new:
+            half_made = _temp_jobs(run, record)
     except Exception as exc:
         logger.warning("proactive-hermes: could not list jobs to undo a swap (%s)", exc)
-        return False
-    ok = True
-    if new and new in states:
+        return None
+    ok, removed = True, []
+    for jid in half_made:
         try:
-            _remove(run, new)
+            _remove(run, jid)
+            removed.append(jid)
         except Exception as exc:
-            logger.warning("proactive-hermes: could not remove half-made job %s (%s)", new, exc)
+            logger.warning("proactive-hermes: could not remove half-made job %s (%s)", jid, exc)
             ok = False
-    if record.get("was_active") and old and states.get(old) == "paused":
+    if ok and record.get("was_active") and old and states.get(old) == "paused":
         try:
             _resume(run, old)
         except Exception as exc:
             logger.warning("proactive-hermes: could not resume %s after a failed replace (%s)", old, exc)
             ok = False
-    return ok
+    return removed if ok else None
 
 
 def _recover_swaps(run, reg: dict) -> int:
@@ -859,17 +951,16 @@ def _recover_swaps(run, reg: dict) -> int:
                                    f"still there: run `hermes cron remove {old}`. ({exc})") from exc
             print(f"Setup: finished an interrupted job swap for {key}: the old job {old} is removed.")
         else:
-            if not _undo_swap(run, record):
+            removed = _undo_swap(run, record)
+            if removed is None:
                 want = f"active (`hermes cron resume {old}`)" if record.get("was_active") else "as you left it"
-                drop = f", and job {new} removed (`hermes cron remove {new}`)" if new else ""
+                drop = (f", and job {new} removed (`hermes cron remove {new}`)" if new else
+                        f", and any job named {record['temp']!r} removed" if record.get("temp") else "")
                 raise RuntimeError(f"An earlier setup run was interrupted while replacing {key}, and setup could not "
                                    f"put it back. Make sure job {old} is {want}{drop}, then run setup again.")
             print(f"Setup: undid an interrupted job swap for {key}: "
-                  + (f"the half-made job {new} is removed, " if new else "")
+                  + (f"the half-made job {', '.join(removed)} is removed, " if removed else "")
                   + f"the old job {old} is {'active again' if record.get('was_active') else 'as it was'}.")
-            if record.get("temp") and not new:
-                print(f"Setup: a replacement job named {record['temp']!r} may still exist (setup stopped while "
-                      "making it). If `hermes cron list --all` shows it, remove it with `hermes cron remove <id>`.")
         _end_swap(reg, key)
     return kept
 
@@ -897,7 +988,7 @@ def _replace(run, ensure, reg: dict, key: str, old: str, state: str, fields: dic
         new = _create(run, ensure, fields, paused=not was_active, note=note)
         kept = _keep_history(key, old)
     except Exception:
-        if _undo_swap(run, record):
+        if _undo_swap(run, record) is not None:
             _end_swap(reg, key)
         raise
     return new, kept
@@ -910,9 +1001,16 @@ def _job_id(entry) -> str | None:
 
 def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None) -> list[dict]:
     """Make the plugin's jobs match CFG. Only jobs recorded in the plugin's own registry (<plugin-data>/jobs.json)
-    are ever edited, replaced or removed; a job is never adopted because its name or settings match."""
-    if not dry_run:
-        preflight()   # before any change: no runtime, no job, no registry write on a Hermes without cron.plugin_api
+    are ever edited, replaced or removed; a job is never adopted because its name or settings match. One run at a
+    time per profile (registry_lock); a dry run only reads."""
+    if dry_run:
+        return _apply(cfg, True, run=run, ensure=ensure)
+    preflight()   # before any change: no runtime, no job, no registry write on a Hermes without cron.plugin_api
+    with registry_lock():
+        return _apply(cfg, False, run=run, ensure=ensure)
+
+
+def _apply(cfg: dict, dry_run: bool, *, run, ensure) -> list[dict]:
     reg = _load_registry()
     kept_runs = 0
     if not dry_run and REPLACING in reg:
@@ -1015,6 +1113,13 @@ def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None) 
 
 
 def remove_all(*, run=subprocess.run) -> list[str]:
+    """Remove every job the registry records (and the jobs of an interrupted swap), one run at a time per profile
+    (registry_lock)."""
+    with registry_lock():
+        return _remove_all(run)
+
+
+def _remove_all(run) -> list[str]:
     reg = _load_registry()
     live = _list_job_ids(run) if reg else set()
     gone = []
@@ -1022,9 +1127,13 @@ def remove_all(*, run=subprocess.run) -> list[str]:
     pending = reg.get(REPLACING) if isinstance(reg.get(REPLACING), dict) else {}
     recorded = {_job_id(entry) for key, entry in reg.items() if key != REPLACING}
     for record in pending.values():
-        for jid in _swap_ids(record) if isinstance(record, dict) else ():
+        if not isinstance(record, dict):
+            continue
+        old, new = _swap_ids(record)
+        for jid in [old, new] + ([] if new else _temp_jobs(run, record)):
             if jid and jid in live and jid not in recorded:
                 _remove(run, jid)
+                live.discard(jid)
     for key, entry in list(reg.items()):
         if key == REPLACING:
             del reg[key]

@@ -353,11 +353,20 @@ def setup_parser(parser) -> None:
 
 
 def handle_watch(args, jobs) -> int:
+    if args.watch_command == "list":
+        print(json.dumps(phconf.load()["watches"], ensure_ascii=False, indent=2))
+        return 0
+    try:
+        with jobs.registry_lock():   # read, change and save the watches, and apply them, as one run
+            return _change_watch(args, jobs)
+    except jobs.RegistryBusy as exc:
+        print(f"Watch: {exc}", file=sys.stderr)
+        return 1
+
+
+def _change_watch(args, jobs) -> int:
     cfg = phconf.load()
     watches = cfg["watches"]
-    if args.watch_command == "list":
-        print(json.dumps(watches, ensure_ascii=False, indent=2))
-        return 0
     name = args.name
     try:
         if not name.strip() or not name.isprintable():
@@ -429,7 +438,11 @@ def handle(args) -> int:
             print(f"  {row['job']}: {action}  {row['schedule']}")
         return 0
     if cmd == "remove":
-        gone = jobs.remove_all()
+        try:
+            gone = jobs.remove_all()
+        except RuntimeError as exc:   # RegistryBusy, or a `hermes cron` step that failed
+            print(f"Remove: {exc}", file=sys.stderr)
+            return 1
         print(f"Removed {len(gone)} job(s). Config and private state kept in {phconf.data_dir()}.")
         return 0
     if cmd != "setup":
@@ -468,14 +481,16 @@ def handle(args) -> int:
     key_note = decisions_note(cfg)
     if key_note:
         print(key_note)
-    path = write_config(cfg)
-    phconf.CFG = cfg
     try:
-        rows = jobs.apply(cfg)
+        with jobs.registry_lock():   # one setup, remove or watch change at a time: config.json and the jobs together
+            cfg["watches"] = phconf.load()["watches"]   # a watch added while the questions were open is kept
+            path = write_config(cfg)
+            phconf.CFG = cfg
+            rows = jobs.apply(cfg)
     except (jobs.IncompatibleHermes, jobs.UnsafeRuntimeDestination) as exc:   # changed since the check: nothing installed
         print(f"Setup: {exc}", file=sys.stderr)
         return 1
-    except RuntimeError as exc:   # a `hermes cron` step failed; the message says what is left to do
+    except RuntimeError as exc:   # RegistryBusy, or a `hermes cron` step failed; the message says what is left to do
         print(f"Setup: {exc}", file=sys.stderr)
         return 1
     print(f"Config: {path}")
