@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+CREATING = "creating"
 REPLACING = "replacing"
 
 
@@ -30,11 +31,13 @@ def pending_swaps(reg: dict) -> dict:
 def recorded_job_id(reg: dict, key: str, *, allow_pending: bool = False) -> str | None:
     entry = reg.get(key)
     jid = entry.get("id") if isinstance(entry, dict) else entry
+    if key in reg.get(CREATING, {}):
+        return None  # a first install has not finished arming
     pending = pending_swaps(reg)
     if key in pending:
         swap = pending[key]
         if (not allow_pending or not isinstance(swap, dict) or jid != swap.get("new")
-                or jid == swap.get("old") or "arm" in swap):
+                or jid == swap.get("old") or jid in (swap.get("retired") or ()) or "arm" in swap):
             return None
     return jid if isinstance(jid, str) and jid else None
 

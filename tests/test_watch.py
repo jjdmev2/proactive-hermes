@@ -59,10 +59,8 @@ class WatchTests(unittest.TestCase):
         out, err = StringIO(), StringIO()
         apply = jobs.apply
 
-        def apply_fake(cfg):
-            # Check that the CLI persisted the watch before mutating cron.
-            self.assertEqual(cfg, json.loads(self.config.read_text()))
-            return apply(cfg, run=self.run)
+        def apply_fake(cfg, **kwargs):
+            return apply(cfg, run=self.run, **kwargs)
 
         with patch.object(jobs, "apply", side_effect=apply_fake), redirect_stdout(out), redirect_stderr(err):
             result = cli.handle(args)
@@ -72,7 +70,7 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.command(ADD + ["--then", "alarm", "--urgent"])[0], 0)
         # Both jobs are staged first and armed only after their ID is recorded.
         self.assertEqual([a[2] for a in self.run.calls if a[2] != "list"],
-                         ["create", "pause", "edit", "resume", "pause", "edit", "resume"])
+                         ["create", "edit", "resume", "pause", "edit", "resume"])
         jid = self.run.job("Proactive · watch: Card drop")
         argv = self.run.live[jid]
         self.assertEqual(argv[argv.index("--name") + 1], "Proactive · watch: Card drop")
@@ -131,6 +129,35 @@ class WatchTests(unittest.TestCase):
         self.assertNotEqual(jobs._job_states(self.run).get(new), "active")
         self.assertEqual(self.run.states[old], "paused")
 
+    def test_settled_watch_is_fenced_before_unrelated_radar_archive_fails(self):
+        self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
+        cfg = cli.phconf.load()
+        cfg["features"]["mail_radar"] = True
+        cli.write_config(cfg)
+        jobs.apply(cfg, run=self.run)
+        old = self.run.job("Proactive · mail radar")
+        cfg["slack"]["enabled"] = True
+        cli.write_config(cfg)
+        self.run.executions[old] = [("a" * 32, "running")]
+        with patch.object(jobs, "IDLE_WAIT_S", 0):
+            jobs.apply(cfg, run=self.run)
+        watch = self.run.job("Proactive · watch: Card drop")
+        self.assertNotIn("watch:Card drop", jobs._load_registry()["replacing"])
+        self.run.executions[old] = []
+        copy = jobs._keep_history
+        def fail_radar(key, jid):
+            if jid == old:
+                self.assertNotEqual(jobs._job_states(self.run).get(watch), "active")
+                raise OSError("fixture radar archive failure")
+            return copy(key, jid)
+        with patch.object(jobs, "_keep_history", side_effect=fail_radar):
+            rc, output = self.command(["watch", "remove", "--name", "Card drop"])
+        self.assertEqual(rc, 1)
+        self.assertIn("fixture radar archive failure", output)
+        self.assertEqual(cli.phconf.load()["watches"], [])
+        self.assertNotEqual(jobs._job_states(self.run).get(watch), "active")
+        self.assertNotIn("watch:Card drop", jobs._load_registry())
+
     def test_watch_add_reconciles_authority_on_pending_replacement(self):
         with patch.object(jobs, "IDLE_WAIT_S", 0):
             old, new = self.pending_watch()
@@ -153,7 +180,7 @@ class WatchTests(unittest.TestCase):
         cfg["authority"]["never"].append("alarms")
         self.run.calls.clear()
         jobs.apply(cfg, run=self.run)
-        self.assertEqual([a[2] for a in self.run.calls], ["list", "edit"])
+        self.assertEqual([a[2] for a in self.run.calls if a[2] != "list"], ["pause", "edit", "resume"])
         self.assertEqual(self.run.job("Proactive · watch: Card drop"), jid)
         argv = self.run.live[jid]
         updated = argv[argv.index("--prompt") + 1]

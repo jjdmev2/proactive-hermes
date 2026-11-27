@@ -85,6 +85,8 @@ class FakeCron:
             jid = f"{self.next_id:012x}"
             self.live[jid] = argv
             self.names[jid] = argv[argv.index("--name") + 1]
+            if "--paused" in argv:
+                self.states[jid] = "paused"
             stdout = f"Created job: {jid}\n  Name: Proactive · fixture\n  ⚠  Scheduler is not ready.\n"
         elif action == "edit":
             jid = argv[3]
@@ -169,6 +171,30 @@ class JobSetupTests(unittest.TestCase):
         self.assertEqual(self.registry()["say"]["id"], staged)
         self.assertNotIn("creating", self.registry())
         self.assertEqual(len([name for name in self.by_name() if real_name(name) == "Proactive · say"]), 1)
+
+    def test_schedule_rejection_then_retry_replaces_staged_toolsets(self):
+        self.cfg["features"]["mail_radar"] = True
+        self.cfg["slack"]["enabled"] = True
+        self.cfg["schedule"]["mail_radar"] = "invalid schedule"
+        def reject(argv, **kwargs):
+            if argv[2] == "edit" and "invalid schedule" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "Invalid schedule")
+            return self.run(argv, **kwargs)
+        cli.write_config(self.cfg)
+        with self.assertRaisesRegex(RuntimeError, "Invalid schedule"):
+            jobs.apply(self.cfg, run=reject)
+        staged = self.registry()["creating"]["mail_radar"]["new"]
+        self.assertIn("connections", self.run.toolsets[staged])
+        self.cfg["slack"]["enabled"] = False
+        self.cfg["schedule"]["mail_radar"] = "*/17 * * * *"
+        cli.write_config(self.cfg)
+        jobs.apply(self.cfg, run=self.run)
+        current = self.run.job("Proactive · mail radar")
+        self.assertEqual(self.run.toolsets[current], self.registry()["mail_radar"]["toolsets"])
+        self.assertNotEqual(staged, current)
+        self.assertNotIn(staged, self.run.live)
+        self.assertNotIn("connections", self.run.toolsets[current])
+        self.assertEqual(self.run.states[current], "active")
 
     def test_remove_all_cleans_journaled_fresh_creation_before_ownership(self):
         save = jobs._save_registry
@@ -483,7 +509,10 @@ class JobSetupTests(unittest.TestCase):
             jobs.apply(self.cfg, run=failing)
         self.assertNotIn("mail_radar", self.registry())
         self.assertEqual(self.run.states[old], "paused")
-        self.assertEqual([j for j in self.run.live if self.run.names[j].startswith("Proactive · mail radar")], [old])
+        staged = self.registry()["replacing"]["mail_radar"]["new"]
+        self.assertEqual([j for j in self.run.live if self.run.names[j].startswith("Proactive · mail radar")], [old, staged])
+        self.assertEqual(self.run.states[staged], "paused")
+        self.assertIn("(setup ", self.run.names[staged])
         self.assertTrue((self.home / "cron" / "output" / old / "2026-11-20_08-00-00.md").is_file())
         self.assertEqual(self.registry()["replacing"]["mail_radar"]["old"], old)
         self.settle()
@@ -1042,7 +1071,7 @@ class JobSetupTests(unittest.TestCase):
         del self.run.live[first]
         self.run.calls.clear()
         jobs.apply(self.cfg, run=self.run)
-        self.assertEqual([a[2] for a in self.run.calls if a[2] != "list"], ["create", "pause", "edit", "resume"])
+        self.assertEqual([a[2] for a in self.run.calls if a[2] != "list"], ["create", "edit", "resume"])
         for jid in rest:
             self.assertIn(jid, self.run.live)
         self.assertNotIn(first, self.run.live)
@@ -1059,7 +1088,8 @@ class JobSetupTests(unittest.TestCase):
         path.write_text(json.dumps(ids))
         self.run.calls.clear()
         jobs.apply(self.cfg, run=self.run)
-        self.assertEqual([argv[2] for argv in self.run.calls], ["list", "edit", "edit", "edit"])
+        self.assertEqual([argv[2] for argv in self.run.calls if argv[2] != "list"],
+                         ["pause"] * 3 + ["edit", "resume"] * 3)
         self.assertEqual({key: entry["id"] for key, entry in json.loads(path.read_text()).items()}, ids)
         self.run.calls.clear()
         jobs.apply(self.cfg, run=self.run)

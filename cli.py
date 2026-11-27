@@ -394,14 +394,21 @@ def _change_watch(args, jobs) -> int:
             watches.remove(existing)
         jobs.preflight()       # a Hermes without the public cron API leaves config.json unchanged
         jobs.runtime_paths()   # a refused runtime destination leaves config.json unchanged
-        write_config(cfg)
+        check_authority(cfg)
     except (ValueError, jobs.IncompatibleHermes, jobs.UnsafeRuntimeDestination) as exc:
         print(f"Watch: {exc}", file=sys.stderr)
         return 2
+    path = None
+
+    def publish():
+        nonlocal path
+        path = write_config(cfg)
+
     try:
-        jobs.apply(cfg)
+        jobs.apply(cfg, publish=publish)
     except (OSError, RuntimeError) as exc:
-        print(f"Watch config saved, but cron reconciliation failed: {exc}", file=sys.stderr)
+        prefix = "Watch config saved, but cron reconciliation failed" if path else "Watch reconciliation failed"
+        print(f"{prefix}: {exc}", file=sys.stderr)
         return 1
     print(f"Watch {name!r}: {'installed' if args.watch_command == 'add' else 'removed'}.")
     return 0
@@ -481,16 +488,21 @@ def handle(args) -> int:
     key_note = decisions_note(cfg)
     if key_note:
         print(key_note)
+    path = None
+
+    def publish():
+        nonlocal path
+        path = write_config(cfg)
+        phconf.CFG = cfg
+
     try:
         with jobs.registry_lock():   # one setup, remove or watch change at a time: config.json and the jobs together
             cfg["watches"] = phconf.load()["watches"]   # a watch added while the questions were open is kept
-            path = write_config(cfg)
-            phconf.CFG = cfg
-            rows = jobs.apply(cfg)
-    except (jobs.IncompatibleHermes, jobs.UnsafeRuntimeDestination) as exc:   # changed since the check: nothing installed
+            rows = jobs.apply(cfg, publish=publish)
+    except (jobs.IncompatibleHermes, jobs.UnsafeRuntimeDestination) as exc:
         print(f"Setup: {exc}", file=sys.stderr)
         return 1
-    except RuntimeError as exc:   # RegistryBusy, or a `hermes cron` step failed; the message says what is left to do
+    except (OSError, RuntimeError) as exc:   # registry lock, persistence or a `hermes cron` step failed
         print(f"Setup: {exc}", file=sys.stderr)
         return 1
     print(f"Config: {path}")

@@ -405,9 +405,12 @@ class Debouncer:
 # ---------------------------------------------------------------- poke
 
 def radar_job_id() -> str | None:
-    """The plugin's own mail radar job: jobs.json key "mail_radar" ({"id": ...} or a bare id)."""
+    """Read the current radar ID, including a verified replacement waiting only on history."""
     reg = ph_jobs.read_registry(phconf.data_dir() / "jobs.json")
-    jid = ph_jobs.recorded_job_id(reg, "mail_radar")
+    jid = ph_jobs.recorded_job_id(reg, "mail_radar", allow_pending=True)
+    entry = reg.get("mail_radar")
+    if "mail_radar" in ph_jobs.pending_swaps(reg) and not (isinstance(entry, dict) and entry.get("spec")):
+        return None
     return jid if jid and re.fullmatch(r"[0-9a-f]{12}", jid) else None
 
 

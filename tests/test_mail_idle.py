@@ -217,6 +217,30 @@ class PokeTests(Base):
         self.assertIsNone(mi.poke_radar(cli=lambda j: None, job_state=live))   # busy: the debouncer retries
         self.assertEqual(seen, ["abcdef012345"])
 
+    def test_pokes_settled_radar_on_archival_hold_but_not_unverified_replacement(self):
+        old, new = "1" * 12, "2" * 12
+        self.write_registry({"id": new, "spec": "verified", "toolsets": ["terminal"]})
+        path = phconf.data_dir() / "jobs.json"
+        reg = json.loads(path.read_text())
+        swap = {"old": old, "retired": [old], "new": new}
+        reg["replacing"] = {"mail_radar": swap}
+        path.write_text(json.dumps(reg))
+        seen = []
+        def poke(state="active"):
+            return mi.poke_radar(cli=lambda j: seen.append(j) or True,
+                                 job_state=lambda j: {"id": j, "state": state})
+        self.assertTrue(poke())
+        self.assertFalse(poke("paused"))
+        for unverified in ({**swap, "arm": True}, {**swap, "retired": [new]}, {**swap, "new": old}):
+            reg["replacing"]["mail_radar"] = unverified
+            path.write_text(json.dumps(reg))
+            self.assertFalse(poke())
+        reg["replacing"]["mail_radar"] = swap
+        del reg["mail_radar"]["spec"]
+        path.write_text(json.dumps(reg))
+        self.assertFalse(poke())
+        self.assertEqual(seen, [new])
+
     def test_no_job_no_poke_and_dry_run(self):
         self.assertFalse(mi.poke_radar(cli=lambda j: self.fail("poked")))
         self.write_registry({"id": "abcdef012345"})
