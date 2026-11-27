@@ -649,6 +649,44 @@ def _job_states(run) -> dict[str, str]:
     return states
 
 
+IDLE_WAIT_S = 10 * 60
+IDLE_POLL_S = 2
+
+
+def _wait_for_idle(run, jid: str) -> bool:
+    """Pause fences future scheduling, not a previously claimed execution that can still save output.
+
+    Read the public execution list, not just `cron list`'s latest attempt: a newer refused
+    run-now can hide an older running attempt. Missing, malformed or truncated evidence is not idle.
+    """
+    deadline = time.monotonic() + IDLE_WAIT_S
+    while True:
+        try:
+            if _job_states(run).get(jid) not in {"paused", "disabled", "completed"}:
+                return False
+            output = _cron(run, "runs", jid, "--limit", "500")
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            return False
+        if output.strip() == "No cron execution attempts recorded.":
+            return True
+        pattern = rf"^([0-9a-f]{{32}}) +([a-z_]+) +job={re.escape(jid)} +source=\S+ "
+        rows = [re.match(pattern, line) for line in output.splitlines() if line and not line[0].isspace()]
+        if not rows or any(row is None for row in rows):
+            return False
+        states = {row[2] for row in rows}
+        if not states & {"claimed", "running"}:
+            return len(rows) < 500 and states <= {"completed", "failed", "unknown", "cancelled", "missed"}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(IDLE_POLL_S, remaining))
+
+
+def _defer_removal(key: str, old: str) -> None:
+    print(f"Setup: deferred removal of old {key} job {old} (paused); could not confirm it is idle. "
+          "Rerun setup to finish the swap and preserve its run history.")
+
+
 def _job_names(run) -> dict[str, str]:
     """{job id: name} from `hermes cron list --all`: the "Name:" row under each "  <id> [state]" header line. Only
     used to find a job by the unique name setup gave it while making it (`<name> (setup <random hex>)`)."""
@@ -1054,7 +1092,13 @@ def _recover_swaps(run, reg: dict) -> int:
         old, new = _swap_ids(record)
         if new and _job_id(reg.get(key)) == new:   # the registry already points at the new job: finish
             try:
-                if old and old in _job_states(run):
+                states = _job_states(run)
+                if old and old in states:
+                    if states[old] == "active":
+                        _pause(run, old)
+                    if not _wait_for_idle(run, old):
+                        _defer_removal(key, old)
+                        continue   # the swap journal keeps ownership of both jobs for the next setup
                     kept += _keep_history(key, old)
                     _remove(run, old)
             except Exception as exc:
@@ -1076,13 +1120,14 @@ def _recover_swaps(run, reg: dict) -> int:
     return kept
 
 
-def _replace(run, ensure, reg: dict, key: str, old: str, state: str, fields: dict) -> tuple[str, int]:
+def _replace(run, ensure, reg: dict, key: str, old: str, state: str, fields: dict) -> tuple[str, int | None]:
     """Swap the recorded job OLD for a new one (`hermes cron edit` cannot change toolsets); returns (new id, saved
     runs kept). First a `replacing` record (old id, was_active, and later the new job's name and id) goes into the
     registry, so a swap that dies half way is finished or undone by the next setup run with OLD's real state. The new
     job is made next; a paused or disabled OLD gives a paused new job; OLD's saved runs are copied to plugin-data
     (_keep_history); only then is OLD removed, by the caller. OLD is paused during the swap so the two never both
-    run; any failure before the removal leaves OLD as it was and removes only the half-made new job."""
+    schedule new runs together; an existing old run can finish normally. If OLD cannot be confirmed idle,
+    return None for the run count and defer removal."""
     was_active = state == "active"
     if not isinstance(reg.get(REPLACING), dict):
         reg[REPLACING] = {}
@@ -1097,7 +1142,7 @@ def _replace(run, ensure, reg: dict, key: str, old: str, state: str, fields: dic
         if was_active:
             _pause(run, old)
         new = _create(run, ensure, fields, paused=not was_active, note=note)
-        kept = _keep_history(key, old)
+        kept = _keep_history(key, old) if _wait_for_idle(run, old) else None
     except Exception:
         if _undo_swap(run, record) is not None:
             _end_swap(reg, key)
@@ -1167,7 +1212,9 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure) -> list[dict]:
         # The CLI list omits settings like prompt and catch-up. Cache the last
         # applied spec (not the private prompt text) for no-op reapplication.
         spec = sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
-        if enabled(cfg, job):
+        if key in reg.get(REPLACING, {}):
+            action = "defer"  # an idle check still owns this key; don't overwrite its recovery record
+        elif enabled(cfg, job):
             record = {"toolsets": toolsets} if toolsets is not None else {}
             same_toolsets = toolsets is None or (isinstance(entry, dict) and entry.get("toolsets") == toolsets)
             if jid not in live or key in reg.get(CREATING, {}):
@@ -1188,16 +1235,18 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure) -> list[dict]:
                 action = "replace"
                 if not dry_run:
                     new, kept = _replace(run, ensure, reg, key, jid, states[jid], fields)
-                    kept_runs += kept
                     reg[key] = {"id": new, "spec": spec, **record}
                     _save_registry(reg)   # the `replacing` record stays until the old job is gone
-                    try:
-                        _remove(run, jid)
-                    except Exception as exc:
-                        raise RuntimeError(f"Replaced {fields['name']!r} with job {new}, but the old job {jid} "
-                                           f"(paused) was not removed: run `hermes cron remove {jid}` (or run setup "
-                                           f"again, which removes it). ({exc})") from exc
-                    _end_swap(reg, key)
+                    if kept is None:
+                        _defer_removal(key, jid)
+                    else:
+                        kept_runs += kept
+                        try:
+                            _remove(run, jid)
+                        except Exception as exc:
+                            raise RuntimeError(f"Replaced {fields['name']!r} with job {new}, but the old job {jid} "
+                                               f"(paused) was not removed. Rerun setup to finish the swap. ({exc})") from exc
+                        _end_swap(reg, key)
         else:
             action = "remove" if jid in live else "skip"
             if not dry_run and key in reg:

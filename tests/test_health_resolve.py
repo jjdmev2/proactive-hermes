@@ -226,6 +226,38 @@ class ResolveHealthTests(unittest.TestCase):
         send.assert_not_called()
         self.assertIn("1 handed", stderr.getvalue())
 
+    def test_an_unresolved_relay_does_not_suppress_an_unrelated_desk_fault(self):
+        import io
+        from contextlib import redirect_stderr
+        _, say = self._say_log()
+        calendar = "Calendar source sync is broken"
+        key = health.fault_key(calendar)
+        stubs = dict.fromkeys(("check_local_delivery", "check_jobs", "check_contract", "check_say_outbox"), DEFAULT)
+        for healthy in (True, False):
+            with self.subTest(healthy=healthy):
+                health.faults.clear()
+                health.HEALTH_STATE.write_text(json.dumps({
+                    key: {"status": "open", "first_seen": (self.clock - timedelta(hours=5)).isoformat()}}))
+                health.fault("desk", calendar)
+                health.fault("relay", "desk delivery unresolved: 1 unverified")
+                say.route_problem.return_value = None if healthy else "say job not found"
+                stderr = io.StringIO()
+                def enqueue(*args, **kwargs):
+                    self.assertNotIn("last_alerted", json.loads(health.HEALTH_STATE.read_text())[key])
+                    return {"status": "queued"}
+                with patch.multiple(health, **stubs), patch.object(health, "load_jobs", return_value=[]), \
+                        patch.object(health, "check_say_receipts"), \
+                        patch.object(say, "deliver", side_effect=enqueue) as send, redirect_stderr(stderr):
+                    self.assertEqual(health.main(), 1)
+                self.assertIn("1 unverified", stderr.getvalue())
+                if healthy:
+                    self.assertIn(calendar, send.call_args.args[0])
+                    self.assertNotIn(calendar, stderr.getvalue())
+                else:
+                    send.assert_not_called()
+                    self.assertIn(calendar, stderr.getvalue())
+                self.assertEqual(json.loads(health.HEALTH_STATE.read_text())[key]["last_alerted"], self.clock.isoformat())
+
     def test_main_runs_resolve_step_without_other_health_effects(self):
         self.run_row("a", "b", "c")
         # Do not invoke other probes, delivery checks, persistence, or notification code.

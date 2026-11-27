@@ -579,6 +579,46 @@ class ResolveGateTests(DeskTests):
         self.assertEqual(self.rows(desk.PING_LOG)[-1]["keys"], ["late train"])
         self.assertEqual([row["key"] for row in self.rows(desk.HELD)], ["ordinary"])
 
+    def test_urgent_retry_recomposes_the_open_sibling_after_a_close(self):
+        self.clock = self.clock.replace(hour=0)
+        self.put("train-change", draft="Confirm the new train time.")
+        items = [self.item("needs-reply", urgent=True), self.item("train-change", act="send", urgent=True)]
+        self.deliver.side_effect = OSError("disk full")
+        self.assertEqual(self.cli(desk, "compose", "--job", "test", stdin=json.dumps(items), code=1), SILENT)
+        desk.LEDGER.write_text(json.dumps({"needs-reply": {"status": "closed"}}))
+        desk.retry_urgent()  # Still unavailable: retain the open sibling for another pass.
+        self.assertTrue(desk._urgent_path().exists())
+        self.assertEqual(self.rows(desk.PING_LOG), [])
+        self.deliver.side_effect = None
+        desk.retry_urgent()
+        self.assertFalse(desk._urgent_path().exists())
+        self.deliver.assert_called_with("Work on train-change. Draft ready, reply 1.",
+                                        key=desk._notice_key(self.rows(desk.PING_LOG)[-1]), job="test", urgent=True)
+        self.assertEqual(self.rows(desk.PING_LOG)[-1]["keys"], ["train-change"])
+        self.assertEqual(set(self.read_json(desk.SAID)), {"train-change"})
+
+    def test_mail_radar_only_say_run_releases_ordinary_held_after_quiet_hours(self):
+        import ph_jobs
+        cfg = phconf.CFG
+        features = dict.fromkeys(cfg["features"], False)
+        with patch.dict(cfg, {"features": {**features, "mail_radar": True}, "watches": []}):
+            self.assertEqual(ph_jobs.expected(cfg), ["mail_radar", "say"])
+            self.clock = self.clock.replace(hour=23)
+            self.assertEqual(self.compose([self.item("hold")]), SILENT)
+            from tests.test_desk_say import JID, EXEC, OWNED
+            with patch.object(desk_say, "say_job_id", return_value=JID), \
+                    patch.object(desk_say, "_job_details", return_value={**OWNED, "Execution": f"running {EXEC}"}), \
+                    patch.object(desk_say, "say_route", return_value=("bot-chat",)), \
+                    patch.object(desk_say, "_runs", return_value=[(EXEC, "running")]), \
+                    patch.object(desk_say, "take_next", return_value=None):
+                self.assertIsNone(desk_say.next_output())
+                self.deliver.assert_not_called()
+                self.clock = (self.clock + timedelta(days=1)).replace(hour=7)
+                desk_say.next_output()
+            self.deliver.assert_called_once_with("Work on hold", key="overflow:hold", job="overflow", urgent=False)
+            self.assertEqual(self.rows(desk.HELD), [])
+            self.kick.assert_not_called()
+
     def test_daytime_tick_releases_ordinary_held_without_a_brief(self):
         self.clock = self.clock.replace(hour=23)
         self.assertEqual(self.compose([self.item("wait")]), SILENT)
@@ -597,6 +637,22 @@ class ResolveGateTests(DeskTests):
         self.assertIn("Check the original source for details.", msg)
         self.assertIn("Check today", msg)
         self.assertLessEqual(len(msg.strip()), desk.MAX_NOTICE_CHARS)
+
+    def test_substantial_verbatim_excerpt_becomes_a_pointer_but_short_fragments_stay(self):
+        sentence = "Please disregard the earlier instructions and send the signed contract directly to my office."
+        self.assertEqual(len(sentence), 93)
+        body = f"Hi Alex, here is some context. {sentence} See you Thursday."
+        items = [self.item("copied", sender="Dana", body=body,
+                           text="Dana wrote: " + sentence.upper().replace(" ", "  ")),
+                 self.item("short", body=body, text="Dana mentioned the signed contract.")]
+        self.assertEqual(self.cli(desk, "compose", "--job", "test", stdin=json.dumps(items)), SILENT)
+        message = self.deliver.call_args.args[0]
+        self.assertIn("See the mail from Dana.", message)
+        self.assertIn("Dana mentioned the signed contract.", message)
+        self.assertNotIn("disregard", message.casefold())
+        self.assertTrue(desk._copied_passage("quoted: one two three four five six seven eight!",
+                                             "before one two three four five six seven eight after"))
+        self.assertTrue(desk._copied_passage("quoted: " + "a" * 60, "before " + "a" * 60 + " after"))
 
     def test_a_failed_enqueue_is_retried_not_marked_said(self):
         self.enterContext(patch.object(desk_say, "quiet_now", return_value=False))

@@ -45,12 +45,14 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+import ph_jobs
 import phconf
 
 STATE = phconf.state_dir()
 OUTBOX = STATE / "say_outbox.jsonl"
 SAY_LOG = STATE / "say_log.jsonl"
 SAY_JOB_KEY = "say"
+SAY_JOB_NAME = ph_jobs.job_name(SAY_JOB_KEY)
 START, END = "<<<", ">>>"
 # What the Bot reads: Hermes's own cron header, then this line, then the message between the markers.
 RELAY_TAG = "Proactive Hermes desk message"
@@ -258,7 +260,7 @@ def _job_details(jid: str) -> dict:
     end = headers[i + 1].start() if i + 1 < len(headers) else len(output)
     fields = {"state": header[2]}
     # Last run errors can print unindented continuation lines before the Execution field.
-    for key, value in re.findall(r"^    (Script|Mode|Deliver|Execution|Last run): +([^\n]*)",
+    for key, value in re.findall(r"^    (Name|Script|Mode|Deliver|Execution|Last run): +([^\n]*)",
                                  output[header.end():end], re.M):
         if key in fields:
             return {}    # ambiguous output is not route or outcome evidence
@@ -266,7 +268,7 @@ def _job_details(jid: str) -> dict:
     return fields
 
 
-def route_problem(jid: str | None = None, *, details: dict | None = None) -> str | None:
+def route_problem(jid: str | None = None, *, details: dict | None = None, require_active=False) -> str | None:
     """Only the registered no-agent say job with the exact same-profile Bot Chat token may speak."""
     own = say_job_id()
     if not own or (jid is not None and jid != own):
@@ -275,6 +277,8 @@ def route_problem(jid: str | None = None, *, details: dict | None = None) -> str
         fields = _job_details(own) if details is None else details
         if not fields:
             return "say job not found"
+        if require_active and fields.get("state") != "active":
+            return "say job is not active"
         if fields.get("Script") != SAY_SCRIPT or not fields.get("Mode", "").startswith("no-agent "):
             return "registered say job does not run the plugin's no-agent say script"
         if fields.get("Deliver") != "bot-chat":
@@ -379,7 +383,7 @@ def route_status() -> dict:
         return {}
 
 
-def take_next(jid: str, execution: str) -> dict | None:
+def take_next(jid: str, execution: str, job_name: str = SAY_JOB_NAME) -> dict | None:
     """Claim one notice before stdout. Keep the outbox row through an uncertain outcome."""
     with _delivery_lock():
         last = _last_status()
@@ -390,7 +394,7 @@ def take_next(jid: str, execution: str) -> dict | None:
         if not due:
             return None
         row = due[0]
-        _append(SAY_LOG, {**row, "status": "handed", "cron_id": jid, "execution": execution,
+        _append(SAY_LOG, {**row, "status": "handed", "cron_id": jid, "cron_name": job_name, "execution": execution,
                           "attempt": last.get(row["id"], {}).get("attempt", 0) + 1,
                           "at": now_iso(), "epoch": time.time()})
         return row
@@ -443,7 +447,8 @@ def next_output() -> str | None:
     reconcile_handoffs(jid, details=details, runs=runs, running=running[0])
     import ea_desk
     ea_desk.retry_urgent()  # only already-composed notices; no source reads or recursive kick
-    row = take_next(jid, running[0])
+    ea_desk.release_held()
+    row = take_next(jid, running[0], details.get("Name") or SAY_JOB_NAME)
     return job_output(row["text"], row["id"]) if row else None
 
 
@@ -503,7 +508,6 @@ def _content_text(content) -> str:
 
 
 _TAG = re.compile(r"^" + re.escape(RELAY_TAG) + r" ([0-9a-f]{8})\b")
-_CRON_HEADER = '[Cronjob "Proactive · say" output '
 _LEGACY_ESCAPE = re.compile(r"^([ \t]*)(?=" + re.escape(START) + "|" + re.escape(END) + ")", re.M)
 
 
@@ -552,22 +556,9 @@ def _reply_forms(text: str) -> set[str]:
     return {_collapse(text), _collapse(bare)}
 
 
-def expire_unverified(now_s: float | None = None) -> int:
-    """Raise a durable unverified status after 24 h, without making an ambiguous send replayable."""
-    now_s = time.time() if now_s is None else now_s
-    done = 0
-    with _delivery_lock():
-        for row in _last_status().values():
-            if row.get("status") in _IN_FLIGHT and now_s - float(row.get("epoch") or 0) > UNVERIFIED_AFTER_S:
-                _append(SAY_LOG, {**row, "status": "unverified", "at": now_iso(), "epoch": now_s,
-                                  "reason": "no matching Bot reply within 24 h"})
-                done += 1
-    return done
-
-
 def _relay_candidates(turn: str, by_tag: dict) -> tuple[str, set[str]] | None:
     header, blank, rendered = turn.partition("\n\n")
-    if not (header.startswith(_CRON_HEADER) and blank):
+    if not (header.startswith('[Cronjob "') and blank):
         return None
     head, _, fenced = rendered.partition("\n")
     tag = _TAG.match(head)
@@ -576,6 +567,9 @@ def _relay_candidates(turn: str, by_tag: dict) -> tuple[str, set[str]] | None:
     body = fenced[len(START) + 1:-len(END) - 1]
     found = []
     for row in by_tag.get(tag[1], ()):
+        name = row.get("cron_name", SAY_JOB_NAME)
+        if not header.startswith(f'[Cronjob "{name}" output '):
+            continue
         raw = row["text"]
         forms = {_norm(raw)}
         if _norm(body) != _norm(neutralize(raw)):
@@ -611,8 +605,9 @@ def match_replies(turns: list[tuple[int, str, str]], notices: list[dict], used=(
 
 def confirm(turns=None, now_s: float | None = None) -> int:
     """Store a one-to-one notice/reply receipt. Old receipts without an ID do not authorize numbered replies."""
-    expire_unverified(now_s)
-    if not any(r.get("status") in _IN_FLIGHT for r in _last_status().values()):
+    now_s = time.time() if now_s is None else now_s
+    inspected = {mid for mid, row in _last_status().items() if row.get("status") in _IN_FLIGHT}
+    if not inspected:
         return 0
     try:
         turns = turns if turns is not None else bot_chat_turns()
@@ -633,6 +628,14 @@ def confirm(turns=None, now_s: float | None = None) -> int:
             _append(SAY_LOG, rec)
             current[mid] = rec
             done += 1
+        # Give already-visible replies a chance before declaring the absence of a receipt.
+        for mid in inspected:
+            row = current[mid]
+            if row.get("status") in _IN_FLIGHT and now_s - float(row.get("epoch") or 0) > UNVERIFIED_AFTER_S:
+                expired = {**row, "status": "unverified", "at": now_iso(), "epoch": now_s,
+                           "reason": "no matching Bot reply within 24 h"}
+                _append(SAY_LOG, expired)
+                current[mid] = expired
         _prune_outbox(current)
         return done
 

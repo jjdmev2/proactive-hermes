@@ -44,12 +44,13 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
 import sys
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -200,6 +201,18 @@ def in_quiet(t: datetime) -> bool:
     return start <= hour < end if start <= end else hour >= start or hour < end
 
 
+def _copied_passage(synopsis: str, source: str) -> bool:
+    if not source:
+        return False
+    if source in synopsis:
+        return True   # keep the existing guard for a whole raw field, even a short subject
+    if any(synopsis[i:i + 60] in source for i in range(len(synopsis) - 59)):
+        return True
+    words = re.findall(r"\w+", synopsis)
+    source_words = " " + " ".join(re.findall(r"\w+", source)) + " "
+    return any(" " + " ".join(words[i:i + 8]) + " " in source_words for i in range(len(words) - 7))
+
+
 def normalize_item(it) -> dict | None:
     if not (isinstance(it, dict) and it.get("key") and it.get("text")):
         return None
@@ -211,9 +224,12 @@ def normalize_item(it) -> dict | None:
     raw_fields = {"subject", "body", "html", "snippet", "web_text", "source_text", "raw_text", "raw"}
     raw = [" ".join(it[field].split()).casefold() for field in raw_fields if isinstance(it.get(field), str)]
     flat = " ".join(text.split())
-    if (len(text.splitlines()) > 1 or re.search(r"<[/!][a-z]", text, re.I)
-            or any(value and value in flat.casefold() for value in raw)):
-        flat = "Check the original source for details."
+    copied = any(_copied_passage(flat[:400].casefold(), value) for value in raw)
+    if copied or len(text.splitlines()) > 1 or re.search(r"<[/!][a-z]", text, re.I):
+        sender = it.get("sender")
+        flat = (f"See the mail from {sender}." if copied and isinstance(sender, str)
+                and re.fullmatch(r"[\w][\w .@'-]{0,63}", sender) and len(sender.split()) <= 5
+                else "Check the original source for details.")
     return {**{key: value for key, value in it.items() if key not in raw_fields},
             "key": str(it["key"]).strip()[:120], "kind": str(it.get("kind") or "digest").strip().lower(),
             "text": flat[:400]}
@@ -439,8 +455,33 @@ def _urgent_path() -> Path:
     return STATE / "urgent_enqueues.json"
 
 
+def _urgent_items(ping, said) -> dict:
+    return {key: {"said": said[key], "ref": ref, "draft_version": ping.get("draft_versions", {}).get(key)}
+            for key, ref in zip(ping["keys"], ping["refs"])}
+
+
+def _recompose_urgent(ping, items):
+    # Re-number the surviving lines and never advertise a draft that has since changed or closed.
+    keys = list(items)
+    drafts = []
+    for key in keys:
+        version = items[key].get("draft_version")
+        try:
+            row = ea_resolve.get(key) if version else None
+        except (OSError, ValueError):
+            row = None
+        drafts.append(row if row and ea_resolve.draft_version(row) == version else None)
+    text, kept = render_parts(None, [items[key]["said"]["text"] for key in keys], [],
+                              suffixes=[ea_resolve.suffix(row, i) for i, row in enumerate(drafts, 1)],
+                              line_limit=LONG_LINE_JOBS.get(ping["job"]))
+    keys = keys[:kept]
+    return {**ping, "text": text, "keys": keys, "refs": [items[key]["ref"] for key in keys],
+            "drafts": {key: row["status"] for key, row in zip(keys, drafts) if row},
+            "draft_versions": {key: items[key]["draft_version"] for key, row in zip(keys, drafts) if row}}
+
+
 def retry_urgent() -> None:
-    """The */2 say job retries already-composed urgent notices without reading sources or kicking itself."""
+    """The */2 say job retries open urgent items without reading sources or kicking itself."""
     path = _urgent_path()
     if not path.exists():
         return
@@ -452,23 +493,29 @@ def retry_urgent() -> None:
         waiting = json.loads(path.read_text(encoding="utf-8"))
         closed = closed_keys()
         for key, row in list(waiting.items()):
-            if closed.intersection(row["ping"]["keys"]):
+            original = row["ping"]
+            items = row["items"] if "items" in row else _urgent_items(original, row["said"])
+            items = {k: items[k] for k in original["keys"] if k in items and k not in closed}
+            while items:
+                try:
+                    ping = original if list(items) == original["keys"] else _recompose_urgent(original, items)
+                    receipt = desk_say.enqueue(ping["text"], key=_notice_key(ping), job=ping["job"], urgent=True)
+                    _commit_notice(ping, {k: items[k]["said"] for k in ping["keys"]}, receipt)
+                except OSError:
+                    break
+                for k in ping["keys"]:
+                    items.pop(k, None)
+            if items:
+                waiting[key] = {"ping": original, "items": items}
+            else:
                 del waiting[key]
-                continue
-            try:
-                ping = row["ping"]
-                receipt = desk_say.enqueue(ping["text"], key=key, job=ping["job"], urgent=True)
-                _commit_notice(ping, row["said"], receipt)
-            except OSError:
-                continue
-            del waiting[key]
         if waiting:
             save_json(path, waiting)
         else:
             path.unlink(missing_ok=True)
 
 
-def compose(a, items: list[dict], *, flush=False) -> int:
+def compose(a, items: list[dict], *, flush=False, kick_now=True) -> int:
     print_only = getattr(a, "print_only", False)
     STATE.mkdir(parents=True, exist_ok=True)
     # The tick and producers share these queues. Serialize selection and state changes,
@@ -508,7 +555,7 @@ def compose(a, items: list[dict], *, flush=False) -> int:
             key = _notice_key(ping)
             waiting = load_json(_urgent_path(), {}) if urgent else {}
             if urgent:
-                waiting[key] = {"ping": ping, "said": {k: said[k] for k in ping["keys"]}}
+                waiting[key] = {"ping": ping, "items": _urgent_items(ping, said)}
                 save_json(_urgent_path(), waiting)
             try:
                 receipt = desk_say.enqueue(message, key=key, job=a.job, urgent=urgent)
@@ -532,7 +579,7 @@ def compose(a, items: list[dict], *, flush=False) -> int:
                     save_json(_urgent_path(), waiting)
                 else:
                     _urgent_path().unlink(missing_ok=True)
-    if not print_only and receipt.get("status") == "queued" and (urgent or not desk_say.quiet_now()):
+    if kick_now and not print_only and receipt.get("status") == "queued" and (urgent or not desk_say.quiet_now()):
         desk_say.kick()   # after the compose lock: the say job runs now; its schedule is the safety net
     print(message if print_only else "[SILENT]")
     return 0
@@ -767,6 +814,15 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
             "draft_versions": {key: ea_resolve.draft_version(rec) for key, rec in zip(keys_said, draft_rows) if rec}}
     # SAID is saved by compose() only after the message is queued, so a failed enqueue is retried, never silenced.
     return ping, any(i.get("urgent") for i in speak), said, speak
+
+
+def release_held() -> None:
+    """The always-installed say job releases daytime holds without re-running itself or printing diagnostics."""
+    if not HELD.exists() or in_quiet(now()) or not read_lines(HELD):
+        return
+    args = argparse.Namespace(job="overflow", brief=False, take_held=True)
+    with redirect_stdout(io.StringIO()):
+        compose(args, [], flush=True, kick_now=False)
 
 
 def cmd_flush(a) -> int:

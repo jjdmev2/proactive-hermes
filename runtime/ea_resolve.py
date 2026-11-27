@@ -224,14 +224,17 @@ def draft_version(row: dict) -> str:
 
 def _say_statuses() -> dict[str, dict]:
     import desk_say
-    order = {}
+    turns = None
     try:
-        turns = desk_say.bot_chat_turns() or []
-        desk_say.confirm(turns=turns)
-        order = {rid: i for i, (rid, role, _) in enumerate(turns) if role == "assistant"}
+        turns = desk_say.bot_chat_turns()
+        if turns is not None:
+            desk_say.confirm(turns=turns)
     except Exception:
-        pass
-    return {mid: {**row, "reply_order": order.get(row.get("reply_id"))}
+        turns = None
+    order = {rid: i for i, (rid, role, _) in enumerate(turns or ()) if role == "assistant"}
+    return {mid: {**row, "reply_order": order.get(row.get("reply_id")),
+                  "outside_display": turns is not None and type(row.get("reply_id")) is int
+                  and row["reply_id"] not in order}
             for mid, row in desk_say._last_status().items()}
 
 
@@ -245,10 +248,9 @@ def _message_id(row: dict) -> str | None:
     return hashlib.sha256(f"{key}\n{text.strip()}".encode()).hexdigest()[:24]
 
 
-def _numbered_draft(n, max_age_hours=36, statuses=None) -> tuple[dict | None, str]:
+def _numbered_draft(n, statuses=None) -> tuple[dict | None, str]:
     if n < 1:
         return None, "none"
-    cutoff = _timestamp(now()) - timedelta(hours=max_age_hours)
     rows = {}
     try:
         with (phconf.state_dir() / "ping_log.jsonl").open(encoding="utf-8") as log:
@@ -262,8 +264,7 @@ def _numbered_draft(n, max_age_hours=36, statuses=None) -> tuple[dict | None, st
                 keys = row.get("keys")
                 if not row.get("drafts") and not (isinstance(keys, list) and len(keys) > 1):
                     continue   # an unnumbered notice is not a reply-N target
-                at = _timestamp(row.get("at"))
-                if at is not None and at >= cutoff and (mid := _message_id(row)):
+                if mid := _message_id(row):
                     rows.setdefault(mid, row)
     except FileNotFoundError:
         return None, AMBIGUOUS
@@ -277,6 +278,8 @@ def _numbered_draft(n, max_age_hours=36, statuses=None) -> tuple[dict | None, st
             return None, AMBIGUOUS   # legacy records had no reply order
         state = receipt.get("status")
         order = receipt.get("reply_order", receipt.get("reply_id"))
+        if state == "delivered" and receipt.get("outside_display"):
+            continue
         if state == "delivered" and type(order) is int and order not in received:
             received[order] = row
         elif state not in ("queued", "retry", "failed", None):
@@ -299,14 +302,14 @@ def _numbered_draft(n, max_age_hours=36, statuses=None) -> tuple[dict | None, st
     return row, "ok"
 
 
-def number_target(n, max_age_hours=36, statuses=None) -> tuple[str | None, str]:
+def number_target(n, statuses=None) -> tuple[str | None, str]:
     """Resolve a number by confirmed Bot reply order, and only to the same draft version."""
-    row, why = _numbered_draft(n, max_age_hours, statuses)
+    row, why = _numbered_draft(n, statuses)
     return (row["key"] if row else None), why
 
 
-def key_for_number(n, max_age_hours=36, statuses=None):
-    return number_target(n, max_age_hours, statuses)[0]
+def key_for_number(n, statuses=None):
+    return number_target(n, statuses)[0]
 
 
 def _mark(key, fields, *, bind=False, expected_version=None) -> dict:

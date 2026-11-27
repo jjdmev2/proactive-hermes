@@ -316,6 +316,20 @@ class DeskSayTests(unittest.TestCase):
         self.assertEqual(say.delivered_ids(), {one, two})
         self.assertEqual(self.confirm(turns), 0)
 
+    def test_renamed_handoff_checks_its_saved_job_name_before_expiring(self):
+        self.detail.side_effect = lambda jid: {**OWNED, "Name": "Daily desk notes", "Execution": f"running {self.execution:032x}"}
+        text = "Pickup is at 7."
+        mid = say.deliver(text, key="renamed")["id"]
+        original = self.relay(mid, text)
+        renamed = (original[0], original[1].replace('"Proactive · say"', '"Daily desk notes"', 1))
+        self.assertEqual(self.confirm([original, ("assistant", text)]), 0)  # wrong header, right tag and text
+        row = say._last_status()[mid]
+        self.assertEqual((row["cron_id"], row["cron_name"]), (JID, "Daily desk notes"))
+        self.detail.side_effect = AssertionError("confirmation must use the handoff, not the new job name")
+        self.assertEqual(self.confirm([renamed, ("assistant", text)], now_s=time.time() + say.UNVERIFIED_AFTER_S + 1), 1)
+        self.assertEqual(say.status_of(mid), "delivered")
+        self.assertEqual([row["status"] for row in self.rows(say.SAY_LOG)], ["handed", "delivered"])
+
     def test_a_reworded_reply_stays_unverified_and_does_not_block_later_messages(self):
         first = say.deliver("The venue changed to Hall B.", key="a")["id"]
         second = say.deliver("Pickup is at 7.", key="b")["id"]
@@ -373,7 +387,7 @@ class DeskSayTests(unittest.TestCase):
             self.assertEqual(len(reads), 1)
             self.assertEqual(say.confirm(now_s=later), 0)
             self.assertEqual(say.confirm(now_s=later + 3600), 0)
-        self.assertEqual(len(reads), 1)   # once unverified, Bot Chat is not read for it again
+        self.assertEqual(len(reads), 2)   # inspect before expiry; once unverified, do not reread
         statuses = [r["status"] for r in self.rows(say.SAY_LOG) if r["id"] == mid]
         self.assertEqual(statuses, ["handed", "unverified"])
 

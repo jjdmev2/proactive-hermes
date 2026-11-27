@@ -32,6 +32,7 @@ class FakeCron:
         self.names = {}
         self.ensured = []
         self.states = {}
+        self.executions = {}
         self.next_id = 0
 
     def ensure(self, name, *, prompt, schedule, deliver=None, enabled_toolsets=None, home=None):
@@ -74,6 +75,11 @@ class FakeCron:
                 f"  {jid} [{self.states.get(jid, 'active')}]\n    Name:      {self.names.get(jid, '(unnamed)')}\n"
                 f"    Deliver:   local\n\n" for jid in self.live
             ) if self.live else "No scheduled jobs in profile 'custom'.\n"
+        elif action == "runs":
+            assert argv[4:] == ["--limit", "500"], argv
+            jid = argv[3]
+            stdout = "".join(f"{eid}  {state}  job={jid}  source=builtin  2026-11-26T12:00:00Z\n"
+                             for eid, state in self.executions.get(jid, [])) or "No cron execution attempts recorded.\n"
         elif action == "create":
             self.next_id += 1
             jid = f"{self.next_id:012x}"
@@ -280,6 +286,50 @@ class JobSetupTests(unittest.TestCase):
         # written into Hermes's own cron/output.
         self.assertEqual(self.kept(old, "2026-11-20_08-00-00.md").read_text(), "## Response\n[SILENT]\n")
         self.assertFalse((self.home / "cron" / "output" / new).exists())
+
+    def test_replace_waits_for_a_late_history_writer_even_when_latest_attempt_was_refused(self):
+        _, old = self._old_radar()
+        late = self.home / "cron" / "output" / old / "last-run.md"
+        self.run.executions[old] = [("b" * 32, "missed"), ("a" * 32, "running")]
+        archive = self.kept(old, late.name)
+
+        def finish():
+            late.write_text("Latest completed job output")
+            self.run.executions[old][-1] = ("a" * 32, "completed")
+
+        def real_cli(argv, **kwargs):
+            if argv[2:4] == ["remove", old]:
+                if self.run.executions[old][-1][1] == "running":
+                    # Reproduce the old race: the writer finishes after verification, just before removal.
+                    finish()
+                self.assertEqual(archive.read_text(), late.read_text())
+                jobs.shutil.rmtree(late.parent)
+            return self.run(argv, **kwargs)
+
+        with patch.object(jobs.time, "sleep", side_effect=lambda _: finish()) as wait:
+            jobs.apply(self.cfg, run=real_cli)
+        wait.assert_called_once()
+        self.assertFalse(late.exists())
+        self.assertEqual(archive.read_text(), "Latest completed job output")
+
+    def test_busy_swap_stays_paused_and_journaled_until_recovery_can_copy_the_late_run(self):
+        _, old = self._old_radar()
+        self.run.executions[old] = [("a" * 32, "claimed")]
+        late = self.home / "cron" / "output" / old / "during-recovery.md"
+        with patch.object(jobs, "IDLE_WAIT_S", 0):
+            self.assertIn("deferred removal", self.settle())
+            new = self.registry()["mail_radar"]["id"]
+            self.assertNotEqual(old, new)
+            self.assertEqual(self.registry()["replacing"]["mail_radar"]["old"], old)
+            self.assertEqual(self.run.states[old], "paused")
+            self.assertFalse(self.kept(old, "2026-11-20_08-00-00.md").exists())
+            self.assertIn("deferred removal", self.settle())
+            self.assertIn(old, self.run.live)
+        late.write_text("late saved run")
+        self.run.executions[old] = [("a" * 32, "completed")]
+        self.assertIn("finished an interrupted job swap", self.settle())
+        self.assertEqual(self.assert_swapped_cleanly(old, active=True), new)
+        self.assertEqual(self.kept(old, late.name).read_text(), "late saved run")
 
     def test_a_paused_job_stays_paused_through_the_replace(self):
         path, old = self._old_radar(state="paused")

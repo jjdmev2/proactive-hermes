@@ -156,6 +156,31 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(resolve.number_target(1, statuses=statuses), (None, resolve.AMBIGUOUS))
         self.assertEqual(resolve.number_target(1, statuses={}), (None, resolve.AMBIGUOUS))
 
+    def test_reply_number_uses_display_order_even_for_an_older_composed_notice(self):
+        old = resolve.put({**self.record, 'key': 'old', 'to': 'old@acme.example', 'draft': 'Older draft.'})
+        new = resolve.put({**self.record, 'key': 'new', 'to': 'new@acme.example', 'draft': 'Newer draft.'})
+        old_id, new_id = 'a' * 24, 'b' * 24
+        self.log_messages(*[
+            {'at': (self.clock - timedelta(hours=hours)).isoformat(), 'kind': 'desk_message',
+             'keys': [row['key']], 'drafts': {row['key']: 'ready'}, 'say_id': mid,
+             'draft_versions': {row['key']: resolve.draft_version(row)}}
+            for row, mid, hours in ((old, old_id, 37), (new, new_id, 1))
+        ])
+        with self.delivered({new_id: {'status': 'delivered', 'reply_order': 1},
+                             old_id: {'status': 'delivered', 'reply_order': 2}}):
+            self.assertIn('To: old@acme.example', self.cli('show', '--n', '1')[1])
+            for state in ('missing', 'stale', 'closed'):
+                with self.subTest(state=state):
+                    rows = {new['key']: new}
+                    if state == 'stale':
+                        rows[old['key']] = {**old, 'created_at': (self.clock - timedelta(days=3)).isoformat()}
+                    elif state == 'closed':
+                        rows[old['key']] = {**old, 'dropped_at': self.clock.isoformat()}
+                    with patch.object(resolve, '_load', return_value=rows):
+                        output = self.cli('show', '--n', '1')[1]
+                    self.assertIn('Ask the owner which item', output)
+                    self.assertNotIn('new@acme.example', output)
+
     def test_later_numbered_notice_without_a_draft_does_not_select_an_older_draft(self):
         sam = resolve.put(self.record)
         at = self.clock.isoformat()

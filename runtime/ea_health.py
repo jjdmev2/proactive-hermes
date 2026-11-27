@@ -390,14 +390,14 @@ def enqueue_for_owner(text: str, key: str) -> None:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def report() -> list[str]:
+def report(notify) -> list[str]:
     try:
         state = json.loads(HEALTH_STATE.read_text())
         state = state if isinstance(state, dict) else {}
     except Exception:
         state = {}
     t = now()
-    out: list[str] = []
+    due_desk = {}
     for key, (cls, text) in faults.items():
         prev = state.get(key) or {}
         first = parse_ts(prev.get("first_seen")) if prev.get("status") == "open" else None
@@ -411,8 +411,11 @@ def report() -> list[str]:
             enqueue_for_owner(text, key)
             state[key]["last_alerted"] = t.isoformat(timespec="seconds")
         elif cls == "desk" and due and t - first >= DESK_DOWN_AFTER:
-            out.append(text)
-            state[key]["last_alerted"] = t.isoformat(timespec="seconds")
+            due_desk[key] = text
+    out = list(due_desk.values())
+    notify(out)   # enqueue or write to the local failure lane before marking any desk alert
+    for key in due_desk:
+        state[key]["last_alerted"] = t.isoformat(timespec="seconds")
     for key, prev in state.items():
         if prev.get("status") == "open" and key not in faults:
             prev["status"] = "recovered"
@@ -451,21 +454,36 @@ def main() -> int:
             step()
         except Exception as exc:
             log({"error": f"{type(exc).__name__}: {exc}"[:200]})
-    lines = report()
-    relay = [text for cls, text in faults.values() if cls == "relay"]
-    if relay:
-        # This does not use the failing Bot Chat route. Hermes records the warning in the
-        # health job's run output (its failure-deliver is local), and doctor reads the state.
-        print("Proactive Hermes delivery health: " + "; ".join(relay), file=sys.stderr)
-        return 1
-    if lines:
-        sys.path.insert(0, str(HERE))
-        import desk_say
-        text = (f"{phconf.owner()}, the desk has a fault and may miss things until it's fixed: "
-                + "; ".join(lines[:2]))
-        # A desk fault goes to Bot Chat like any desk message (not urgent: it waits for the end of quiet hours).
-        desk_say.deliver(text, key="health:" + "|".join(sorted(lines))[:200], job="health")
-    return 0
+    local = [text for cls, text in faults.values() if cls == "relay"]
+
+    def notify(lines):
+        if lines:
+            import desk_say
+            # An old unresolved receipt is not proof the current route is broken.
+            problem = desk_say.route_problem(require_active=True) or any(
+                text.startswith("desk messages held:") for text in local)
+            for i in range(0, len(lines), 2):
+                batch = lines[i:i + 2]
+                if not problem:
+                    text = (f"{phconf.owner()}, the desk has a fault and may miss things until it's fixed: "
+                            + "; ".join(batch))
+                    try:
+                        receipt = desk_say.deliver(text, key="health:" + "|".join(sorted(batch))[:200], job="health")
+                        if receipt.get("status") in {"queued", "handed", "accepted", "delivered"}:
+                            continue
+                        if receipt.get("status") == "duplicate" and desk_say.status_of(receipt.get("id")) in {
+                            "queued", "handed", "accepted", "delivered"
+                        }:
+                            continue
+                    except OSError:
+                        pass
+                local.extend(batch)
+        if local:
+            # Hermes records stderr in this no-agent job's local failure output.
+            print("Proactive Hermes delivery health: " + "; ".join(local), file=sys.stderr)
+
+    report(notify)
+    return int(bool(local))
 
 
 if __name__ == "__main__":
