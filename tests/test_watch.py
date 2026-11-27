@@ -108,23 +108,42 @@ class WatchTests(unittest.TestCase):
         registry = json.loads(self.registry.read_text())
         registry["health"] = {"id": health, "spec": jobs._fingerprint(fields)}
         self.registry.write_text(json.dumps(registry))
+        before = self.config.read_bytes(), self.registry.read_bytes(), self.run.live.copy()
         self.run.calls.clear()
 
         rc, output = self.command(["status"])
         self.assertEqual(rc, 0)
         self.assertIn("schedule.health must be recurring, not 'in 2h'", output)
+        self.assertIn("next reconciliation will reset it to the default '7 * * * *'", output)
         self.assertIn("Proactive · watch: Card drop: installed", output)
         self.assertTrue(all(a[2] == "list" for a in self.run.calls), self.run.calls)
+        self.assertEqual((self.config.read_bytes(), self.registry.read_bytes(), self.run.live), before)
+
+        with patch.object(cli, "write_config", side_effect=OSError("fixture publish failure")):
+            rc, output = self.command(["watch", "remove", "--name", "Card drop"])
+        self.assertEqual(rc, 1, output)
+        self.assertEqual(self.config.read_bytes(), before[0])
+        self.assertEqual(self.run.states[health], "paused")
+        self.assertNotIn(["resume", health], [a[2:4] for a in self.run.calls])
+
         self.run.calls.clear()
-        self.assertEqual(self.command(["watch", "remove", "--name", "Card drop"])[0], 0)
-        self.assertEqual([a[2:4] for a in self.run.calls if a[2] not in ("list", "runs")],
-                         [["pause", watch], ["remove", watch]])
-        self.assertEqual(self.run.repeats[health], "0/1")
-        self.assertEqual(json.loads(self.registry.read_text())["health"], registry["health"])
+        rc, output = self.command(["watch", "remove", "--name", "Card drop"])
+        self.assertEqual(rc, 0, output)
+        self.assertIn("health schedule 'in 2h' was a one-time schedule; reset to the default '7 * * * *'", output)
+        self.assertIn("removed 1, deferred 0", output)
+        calls = [a[2:4] for a in self.run.calls]
+        self.assertLess(calls.index(["pause", watch]), calls.index(["remove", watch]))
+        self.assertLess(calls.index(["edit", health]), calls.index(["resume", health]))
+        self.assertNotIn(health, self.run.repeats)
+        health_spec = json.loads(self.registry.read_text())["health"]
+        self.assertEqual(health_spec["id"], health)
+        self.assertNotEqual(health_spec["spec"], registry["health"]["spec"])
+        self.assertEqual(self.run.states[health], "active")
+        self.assertEqual(self.run.schedule_of(health), "7 * * * *")
         self.assertNotIn(watch, self.run.live)
         self.assertNotIn("watch:Card drop", json.loads(self.registry.read_text()))
         self.assertEqual(cli.phconf.load()["watches"], [])
-        self.assertEqual(cli.phconf.load()["schedule"]["health"], "in 2h")
+        self.assertEqual(cli.phconf.load()["schedule"]["health"], "7 * * * *")
         remove_all = jobs.remove_all
         with patch.object(jobs, "remove_all", side_effect=lambda: remove_all(run=self.run)):
             self.assertEqual(self.command(["remove"])[0], 0)
@@ -196,7 +215,7 @@ class WatchTests(unittest.TestCase):
         self.assertNotEqual(jobs._job_states(self.run).get(new), "active")
         self.assertEqual(self.run.states[old], "paused")
 
-    def test_settled_watch_removal_does_not_touch_unrelated_radar_history(self):
+    def test_watch_removal_fences_the_watch_before_recovering_radar_history(self):
         self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
         cfg = cli.phconf.load()
         cfg["features"]["mail_radar"] = True
@@ -212,18 +231,31 @@ class WatchTests(unittest.TestCase):
         self.assertNotIn("watch:Card drop", jobs._load_registry()["replacing"])
         self.run.executions[old] = []
         radar_before = jobs._load_registry()["replacing"]["mail_radar"]
+        self.assertIn(old, radar_before["retired"])
+        self.assertEqual(self.run.states[old], "paused")
         self.run.calls.clear()
-        with patch.object(jobs, "_keep_history", wraps=jobs._keep_history) as archive:
+
+        def archive(key, jid):
+            self.assertNotEqual(self.run.states.get(watch), "active")
+            self.assertEqual(cli.phconf.load()["watches"], [])
+            self.assertEqual(self.run.states[jid], "paused")
+            return keep_history(key, jid)
+
+        keep_history = jobs._keep_history
+        with patch.object(jobs, "_keep_history", side_effect=archive) as copy:
             rc, output = self.command(["watch", "remove", "--name", "Card drop"])
         self.assertEqual(rc, 0, output)
-        self.assertNotIn(old, [args[1] for args, _ in archive.call_args_list])
-        self.assertEqual([a[2:4] for a in self.run.calls if a[2] != "list"],
-                         [["pause", watch], ["runs", watch], ["remove", watch]])
+        self.assertIn("removed 2, deferred 0", output)
+        self.assertEqual({args[1] for args, _ in copy.call_args_list}, {old, watch})
+        calls = [a[2:4] for a in self.run.calls]
+        self.assertLess(calls.index(["pause", watch]), calls.index(["runs", old]))
+        self.assertLess(calls.index(["runs", watch]), calls.index(["remove", watch]))
         self.assertEqual(cli.phconf.load()["watches"], [])
         self.assertNotIn(watch, self.run.live)
         self.assertNotIn("watch:Card drop", jobs._load_registry())
-        self.assertEqual(jobs._load_registry()["replacing"]["mail_radar"], radar_before)
-        self.assertEqual(self.run.states[old], "paused")
+        self.assertNotIn(old, self.run.live)
+        self.assertNotIn("replacing", jobs._load_registry())
+        self.assertEqual(self.run.states[self.run.job("Proactive · mail radar")], "active")
 
     def test_watch_add_reconciles_authority_on_pending_replacement(self):
         with patch.object(jobs, "IDLE_WAIT_S", 0):

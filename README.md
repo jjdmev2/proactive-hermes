@@ -127,7 +127,7 @@ Hermes starts from what it already knows (your name, timezone, connected mail, c
 
 You see every job and its times before anything is created. At the end it sends a test message.
 
-Setup resets the Proactive jobs it owns to the plugin's settings. Pause and resume are the only manual cron edits it keeps. Change behavior through `hermes proactive setup`. Desk schedules must recur: use an interval or a cron expression, not a delay or a date.
+Setup resets the Proactive jobs it owns to the plugin's settings. Pause and resume are the only manual cron edits it keeps. Change behavior through `hermes proactive setup`. Reconciliation resets any saved one-time infrastructure schedule to its default recurring schedule unless you supply a different recurring schedule. Desk schedules must recur: use an interval or a cron expression, not a delay or a date.
 
 ### Instant mail push (optional)
 

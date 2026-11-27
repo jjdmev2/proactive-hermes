@@ -695,10 +695,23 @@ def _timing_options(live: dict, fields: dict) -> list[str]:
     return argv
 
 
+def _legacy_tick_runtime(fields: dict) -> bool:
+    if fields["script"] != "proactive-hermes/desk_tick.py":
+        return False
+    try:
+        # The old tick delivered through a private relay and wrote chat state.
+        # Journal its replacement before flipping the runtime pointer.
+        return b"hide_relay_cards" in (phconf.scripts_dir() / "desk_tick.py").read_bytes()
+    except FileNotFoundError:
+        return False
+
+
 def _live_drift(live: dict, fields: dict) -> str | None:
     """Recognize visible drift for fencing and preview, never to skip the full edit."""
     if not live:
         return None
+    if _legacy_tick_runtime(fields):
+        return "replace"
     # Only the public state distinguishes a real pause from a terminal job. A paused
     # job may show a historical count at or above a newly edited repeat limit.
     if live["state"] not in {"active", "paused"}:
@@ -1120,7 +1133,7 @@ def _candidates(run, record: dict, states: dict) -> set[str]:
 
 
 def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True, paused=None, drift=None,
-                refresh=None, previously_active=(), scope=None) -> dict[str, str]:
+                refresh=None, previously_active=()) -> dict[str, str]:
     """One scheduling fence for ordinary registry entries, swaps and first installs.
 
     Checkpoint intended re-arming before the first pause. An exception during the phase is
@@ -1133,7 +1146,7 @@ def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True, paused=None, dri
     fenced = set()
     changed = False
     for key in dict.fromkeys((*reg, *swaps, *staged)):
-        if key in (REPLACING, CREATING) or (scope is not None and key not in scope):
+        if key in (REPLACING, CREATING):
             continue
         entry = reg.get(key)
         jid = _job_id(entry)
@@ -1198,16 +1211,16 @@ def _fence_jobs(run, reg: dict, wanted: dict, *, remember=True, paused=None, dri
     return states
 
 
-def _safety_fence(run, wanted: dict, *, previously_active=(), scope=None) -> None:
+def _safety_fence(run, wanted: dict, *, previously_active=()) -> None:
     # Retry from disk: the failed host call may have completed before reporting its failure.
     reg = _load_registry()
     _upgrade_schedule_fingerprints(reg, wanted)
     try:
-        _fence_jobs(run, reg, wanted, previously_active=previously_active, scope=scope)
+        _fence_jobs(run, reg, wanted, previously_active=previously_active)
     except OSError:
         reg = _load_registry()
         _upgrade_schedule_fingerprints(reg, wanted)
-        _fence_jobs(run, reg, wanted, remember=False, scope=scope)
+        _fence_jobs(run, reg, wanted, remember=False)
 
 
 def _publish_edit(run, reg: dict, key: str, jid: str, fields: dict, spec: dict, live: dict) -> None:
@@ -1344,58 +1357,64 @@ def _job_id(entry) -> str | None:
     return entry.get("id") if isinstance(entry, dict) else entry
 
 
-def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None, publish=None,
-          revoke_watch: str | None = None) -> list[dict]:
+def apply(cfg: dict, dry_run: bool = False, *, run=subprocess.run, ensure=None, publish=None) -> list[dict]:
     """Make the plugin's jobs match CFG. Only jobs recorded in the plugin's own registry (<plugin-data>/jobs.json)
     are ever edited, replaced or removed; a job is never adopted because its name or settings match. One run at a
     time per profile (registry_lock); a dry run only reads."""
     if dry_run:
+        _migrate_recurring_schedules(cfg, phconf.load())
         return _apply(cfg, True, run=run, ensure=ensure)
     preflight()   # before any change: no runtime, no job, no registry write on a Hermes without cron.plugin_api
     with registry_lock():
-        return _apply(cfg, False, run=run, ensure=ensure, publish=publish, revoke_watch=revoke_watch)
+        migrations = _migrate_recurring_schedules(cfg, phconf.load())
+        return _apply(cfg, False, run=run, ensure=ensure, publish=publish, migrations=migrations)
 
 
 class OneShotSchedule(ValueError):
     """A schedule intended to run only once cannot keep desk infrastructure running."""
 
 
-def require_recurring_schedules(cfg: dict) -> None:
-    problems = recurring_schedule_problems(cfg)
-    if problems and phconf.config_path().exists():
-        saved = phconf.load()
-        wanted = _wanted_fields(cfg)
-        scope = _revocation_scope(saved, wanted)
-        if scope is not None:
-            # A revoke need not repair an unchanged legacy value. Never accept a
-            # newly supplied one-shot or reconcile an enabled legacy job with it.
-            keep_legacy = {key for key, value in cfg["schedule"].items()
-                           if value == saved["schedule"].get(key) and (key not in wanted or key not in scope)}
-            problems = recurring_schedule_problems(cfg, ignore=keep_legacy)
-    if problems:
-        raise OneShotSchedule(" ".join(problems))
+def _one_shot(schedule: str) -> bool:
+    text = schedule.strip()
+    if text.lower().startswith(("in ", "once ")):
+        return True
+    if "T" in text or re.match(r"^\d{4}-\d{2}-\d{2}", text):
+        try:
+            datetime.fromisoformat(text)
+        except ValueError:
+            pass  # let the host report invalid syntax for other schedules
+        else:
+            return True
+    return False
 
 
-def recurring_schedule_problems(cfg: dict, *, ignore=()) -> list[str]:
-    """Diagnose legacy schedules without blocking status or policy revocation."""
-    problems = []
+def _schedule_migrations(cfg: dict):
     for job in JOBS:
         key = job["key"]
-        if key in ignore:
-            continue
-        schedule = cfg["schedule"][key].strip()
-        relative = schedule.lower().startswith(("in ", "once "))
-        timestamp = False
-        if "T" in schedule or re.match(r"^\d{4}-\d{2}-\d{2}", schedule):
-            try:
-                datetime.fromisoformat(schedule)
-                timestamp = True
-            except ValueError:
-                pass  # let the host report invalid syntax for other schedules
-        if relative or timestamp:
-            problems.append(f"schedule.{key} must be recurring, not {schedule!r}. "
-                            "Use an interval like 'every 2h' or a cron expression.")
-    return problems
+        schedule = cfg["schedule"][key]
+        if _one_shot(schedule):
+            yield key, schedule, phconf.DEFAULTS["schedule"][key]
+
+
+def recurring_schedule_problems(cfg: dict) -> list[str]:
+    return [f"schedule.{key} must be recurring, not {old!r}. "
+            f"Saved one-time schedule; the next reconciliation will reset it to the default {default!r}."
+            for key, old, default in _schedule_migrations(cfg)]
+
+
+def _migrate_recurring_schedules(cfg: dict, saved: dict) -> list[str]:
+    # Validate the entire input before changing any value. A one-shot must already
+    # be on disk under the same key; freshly supplied one-shots are invalid.
+    for key, schedule, _ in _schedule_migrations(cfg):
+        if schedule != saved["schedule"][key]:
+            raise OneShotSchedule(f"schedule.{key} must be recurring, not {schedule!r}. "
+                                  "Use an interval like 'every 2h' or a cron expression.")
+    messages = []
+    for key, old, default in _schedule_migrations(saved):
+        if cfg["schedule"][key] in (old, default):
+            cfg["schedule"][key] = default
+            messages.append(f"{key} schedule {old!r} was a one-time schedule; reset to the default {default!r}")
+    return messages
 
 
 def _fingerprint(fields: dict) -> str:
@@ -1440,15 +1459,6 @@ def _wanted_fields(cfg: dict, fields_by_key=None) -> dict:
     return {key: fields_by_key[key] for key in ph_jobs.expected(cfg)}
 
 
-def _revocation_scope(saved: dict, wanted: dict) -> set[str] | None:
-    if not (revoked := set(ph_jobs.expected(saved)) - wanted.keys()):
-        return None
-    previous = _wanted_fields(saved)
-    # Mixed setup still applies changes the owner asked for. An unchanged job
-    # is outside a revocation, even if it is missing, drifted or mid-swap.
-    return revoked | {key for key, fields in wanted.items() if fields != previous.get(key)}
-
-
 def _upgrade_schedule_fingerprints(reg: dict, wanted: dict) -> bool:
     """Recognize the old raw-schedule digest without pausing an equivalent cadence on upgrade."""
     candidates = [key for key in wanted if isinstance(reg.get(key), dict) and reg[key].get("spec")
@@ -1477,13 +1487,15 @@ def _saved_config_bytes() -> bytes | None:
         return None
 
 
-def _restore_before_publish(run, original: dict, paused: set[str], *, scope=None) -> None:
+def _restore_before_publish(run, original: dict, paused: set[str]) -> None:
     """Undo this attempt's checkpoint and re-arm only previously active, still-valid jobs."""
     if _load_registry() != original:
         _save_registry(original)
     saved = phconf.load()
-    wanted = {key: fields for key, fields in _wanted_fields(saved).items() if scope is None or key in scope}
-    _safety_fence(run, wanted, previously_active=paused, scope=scope)
+    # Never resume a legacy one-shot, even if publishing its migration failed.
+    _migrate_recurring_schedules(saved, saved)
+    wanted = _wanted_fields(saved)
+    _safety_fence(run, wanted, previously_active=paused)
     _upgrade_schedule_fingerprints(original, wanted)
     if not paused:
         return
@@ -1495,20 +1507,10 @@ def _restore_before_publish(run, original: dict, paused: set[str], *, scope=None
             _resume(run, jid)
 
 
-def _apply(cfg: dict, dry_run: bool, *, run, ensure, publish=None, revoke_watch=None) -> list[dict]:
+def _apply(cfg: dict, dry_run: bool, *, run, ensure, publish=None, migrations=()) -> list[dict]:
     reg = _load_registry()
     fields_by_key = _fields_by_key(cfg)
     wanted = _wanted_fields(cfg, fields_by_key)
-    scope = None
-    if revoke_watch is not None:
-        scope = {f"watch:{revoke_watch}"}
-        if "say" not in wanted:  # the last producer was revoked; its relay is no longer needed
-            scope.add("say")
-    elif phconf.config_path().exists():
-        scope = _revocation_scope(phconf.load(), wanted)
-    if scope is not None:
-        wanted = {key: fields for key, fields in wanted.items() if key in scope}
-        fields_by_key = {key: fields for key, fields in fields_by_key.items() if key in scope}
     pending_before = set(ph_jobs.pending_swaps(reg))
     awaiting_publish = not dry_run and publish is not None
     original = deepcopy(reg) if awaiting_publish else {}
@@ -1523,7 +1525,7 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure, publish=None, revoke_watch=
             drift = {key: _live_drift(listing.get(_job_id(reg.get(key)), {}), fields)
                      for key, (fields, _) in wanted.items()}
         else:
-            states = _fence_jobs(run, reg, wanted, paused=paused, drift=drift, refresh=refresh, scope=scope)
+            states = _fence_jobs(run, reg, wanted, paused=paused, drift=drift, refresh=refresh)
             # A visibly drifted job already meant to follow this exact policy can
             # be repaired without an intermediate pause. Do it before publishing.
             for key in tuple(refresh):
@@ -1532,34 +1534,32 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure, publish=None, revoke_watch=
                     _edit(run, jid, wanted[key][0], live)
                     refresh[key] = None  # already repaired before policy publication
         removed_watches = {key for key, entry in reg.items()
-                           if key.startswith("watch:") and key not in wanted and _job_id(entry) in states
-                           and (scope is None or key in scope)}
+                           if key.startswith("watch:") and key not in wanted and _job_id(entry) in states}
         actions = {key: _action(reg, key, wanted, states, drift.get(key)) for key in fields_by_key}
         if not dry_run:
             if publish is not None:
                 publish()  # never save a new policy while any job can still run the superseded spec
                 awaiting_publish = False
-            if scope is None or wanted:
-                install_runtime(cfg)
-                warning = toolset_warning(cfg, cron_toolsets_setting())
-                if warning:
-                    print(warning)
-            _apply_fenced(run, ensure, reg, wanted, states, drift, refresh=refresh, scope=scope)
+            for migration in migrations:
+                print(migration)
+            install_runtime(cfg)
+            warning = toolset_warning(cfg, cron_toolsets_setting())
+            if warning:
+                print(warning)
+            _apply_fenced(run, ensure, reg, wanted, states, drift, refresh=refresh)
             if upgraded:
                 _save_registry(reg)
     except BaseException:
         if awaiting_publish and _saved_config_bytes() == saved:
-            _restore_before_publish(run, original, paused, scope=scope)
+            _restore_before_publish(run, original, paused)
         elif not dry_run:
-            _safety_fence(run, wanted, scope=scope)
+            _safety_fence(run, wanted)
         raise
 
     # No history I/O (including polling a running old job) can block a policy change above.
     retirements = {}
     if not dry_run:
         for key in list(ph_jobs.pending_swaps(reg)):
-            if scope is not None and key not in scope:
-                continue
             result = retirements[key] = RemovalResult()
             _archive_swap(run, reg, key, result)
             if key in pending_before and key not in ph_jobs.pending_swaps(reg):
@@ -1603,15 +1603,12 @@ def _action(reg: dict, key: str, wanted: dict, states: dict, drift: str | None) 
     return "update" if spec.get("toolsets") == (entry.get("toolsets") if isinstance(entry, dict) else None) else "replace"
 
 
-def _apply_fenced(run, ensure, reg: dict, wanted: dict, states: dict, drift: dict, *, refresh=None, scope=None) -> None:
-    def revoked(key):
-        return key not in wanted and (scope is None or key in scope)
-
+def _apply_fenced(run, ensure, reg: dict, wanted: dict, states: dict, drift: dict, *, refresh=None) -> None:
     for key in list(reg.get(CREATING, {})):
-        if revoked(key):
+        if key not in wanted:
             _retire_stage(run, reg, key)
     for key in list(reg):
-        if key not in (CREATING, REPLACING) and revoked(key):
+        if key not in wanted and key not in (CREATING, REPLACING):
             if key not in ph_jobs.pending_swaps(reg):
                 jid = _job_id(reg[key])
                 if jid in states:
@@ -1619,7 +1616,7 @@ def _apply_fenced(run, ensure, reg: dict, wanted: dict, states: dict, drift: dic
                 reg.pop(key)
                 _save_registry(reg)
     for key in list(ph_jobs.pending_swaps(reg)):
-        if revoked(key):
+        if key not in wanted:
             _retire_swap(run, reg, key)
     # Say first: every desk message reaches Bot Chat through this worker.
     for key in sorted(wanted, key=lambda key: key != "say"):

@@ -405,15 +405,16 @@ def _change_watch(args, jobs) -> int:
         path = write_config(cfg)
 
     try:
-        revoke_watch = name if args.watch_command == "remove" else None
-        rows = jobs.apply(cfg, publish=publish, revoke_watch=revoke_watch)
+        rows = jobs.apply(cfg, publish=publish)
     except (OSError, RuntimeError) as exc:
         prefix = "Watch config saved, but cron reconciliation failed" if path else "Watch reconciliation failed"
         print(f"{prefix}: {exc}", file=sys.stderr)
         return 1
-    action = "installed" if revoke_watch is None else "revoked" if any(row["deferred"] for row in rows) else "removed"
+    removing = args.watch_command == "remove"
+    target_deferred = any(row["deferred"] for row in rows if row["job"] == jobs.ph_jobs.job_name(f"watch:{name}"))
+    action = ("revoked" if target_deferred else "removed") if removing else "installed"
     print(f"Watch {name!r}: {action}.")
-    if revoke_watch is not None:
+    if removing:
         print(f"Jobs: {_removal_summary(rows)}.")
     return 0
 
@@ -494,7 +495,6 @@ def handle(args) -> int:
         return 2
     if args.dry_run:
         try:
-            jobs.require_recurring_schedules(cfg)
             rows = jobs.apply(cfg, dry_run=True)
         except jobs.OneShotSchedule as exc:
             print(f"Setup: {exc}", file=sys.stderr)
@@ -523,7 +523,6 @@ def handle(args) -> int:
     try:
         with jobs.registry_lock():   # one setup, remove or watch change at a time: config.json and the jobs together
             cfg["watches"] = phconf.load()["watches"]   # a watch added while the questions were open is kept
-            jobs.require_recurring_schedules(cfg)
             rows = jobs.apply(cfg, publish=publish)
     except jobs.OneShotSchedule as exc:
         print(f"Setup: {exc}", file=sys.stderr)

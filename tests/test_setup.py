@@ -379,8 +379,12 @@ class JobSetupTests(unittest.TestCase):
         self.assertEqual(self.run.states[old], "paused")
         self.assertNotIn(radar, self.run.live)
         self.assertEqual(self.registry()["replacing"]["promises"]["retired"], [old])
+        survivors = {self.registry()[key]["id"] for key in ("say", "tick", "health")}
+        edits = [a for a in self.run.calls if a[2] == "edit"]
+        self.assertTrue(all("--schedule" not in a and "--timezone" not in a for a in edits))
         self.assertCountEqual([a[2:4] for a in self.run.calls if a[2] not in ("list", "runs")],
-                              [["pause", old], ["pause", radar], ["remove", radar]])
+                              [["pause", old], ["pause", radar], ["remove", radar],
+                               *(["edit", jid] for jid in survivors)])
 
     def test_recurring_repeat_and_skills_drift_preserve_only_manual_pause(self):
         jobs.apply(self.cfg, run=self.run)

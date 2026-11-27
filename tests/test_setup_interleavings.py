@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 from collections import Counter
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from io import StringIO
@@ -171,6 +173,80 @@ class FenceInterleavings(unittest.TestCase):
         for seed in SEEDS:
             with self.subTest(seed=hex(seed)), temporary_home():
                 self.run_seed(seed)
+
+    def test_seeded_legacy_schedule_and_reinstall_cycles(self):
+        # The CLI publishes its process-wide config; don't leak a trial into later tests.
+        self.enterContext(patch.object(cli.phconf, 'CFG', cli.phconf.CFG))
+        schedules = ('in 2h', '2000-01-02T12:30:00+00:00', '2099-02-01')
+        operations = ('add', 'remove', 'disable', 'reinstall')
+        for seed in SEEDS:
+            rng = random.Random(seed)
+            cases = [(op, schedule) for op in operations for schedule in schedules]
+            rng.shuffle(cases)
+            for op, schedule in cases:
+                with self.subTest(seed=seed, op=op, schedule=schedule), temporary_home():
+                    cfg = self.reset_world()
+                    cfg['features'].update(health=True, promises=True)
+                    self.apply_config(cfg)
+                    self.assert_invariant()
+                    self.assertEqual(self.watch(WATCHES[0], add=True), 0)
+                    self.assert_invariant()
+
+                    key = rng.choice(('health', 'tick', 'say', 'promises', 'mail_radar', 'lookahead'))
+                    cfg = cli.phconf.load()
+                    cfg['schedule'][key] = schedule
+                    cli.write_config(cfg)  # emulate an older install, before recurrence was required
+                    entry = jobs._load_registry().get(key)
+                    if entry:
+                        jid = entry['id']
+                        self.host(['hermes', 'cron', 'edit', jid, '--schedule', schedule, '--repeat', '1'], env=os.environ)
+                        reg = jobs._load_registry()
+                        fields, spec = jobs._fields_by_key(cfg)[key]
+                        reg[key] = {'id': jid, **spec}
+                        jobs._save_registry(reg)
+                        self.known[spec['spec']] = fields
+                        if rng.randrange(2):
+                            self.host.finish_occurrence(jid)
+
+                    def run(argv, **kwargs):
+                        if argv[2] == 'resume':
+                            self.assertNotIn(self.host.schedule_of(argv[3]), schedules)
+                        return self.host(argv, **kwargs)
+
+                    with patch.object(jobs, 'apply', side_effect=lambda candidate, **kw: self.apply_jobs(
+                            candidate, run=run, ensure=self.host.ensure, **kw)):
+                        if op in ('add', 'remove'):
+                            args = ['watch', op, '--name', WATCHES[1] if op == 'add' else WATCHES[0]]
+                            if op == 'add':
+                                args += ['--schedule', '*/30 * * * *', '--check', 'A listing', '--when', 'Available', '--then', 'tell']
+                            self.assertEqual(cli.handle(self.parser.parse_args(args)), 0)
+                        else:
+                            if op == 'reinstall':
+                                jobs.remove_all(run=run)
+                                self.assert_invariant(removed=True)
+                                self.assertEqual(jobs._load_registry(), {})
+                            answers = Path(os.environ['HERMES_HOME']) / 'answers.json'
+                            cfg['features']['promises'] = False
+                            answers.write_text(json.dumps({'features': cfg['features'], 'schedule': cfg['schedule'],
+                                                           'decisions': {'enabled': False}}))
+                            args = ['setup', '--preset', 'custom', '--answers', str(answers)]
+                            with patch('ph_doctor.report', return_value={'checks': {}, 'ready': False}):
+                                self.assertEqual(cli.handle(self.parser.parse_args(args)), 0)
+                    self.assert_invariant()
+                    saved = cli.phconf.load()
+                    self.assertEqual(saved['schedule'][key], cli.phconf.DEFAULTS['schedule'][key])
+                    wanted = self.wanted(saved)
+                    reg = jobs._load_registry()
+                    self.assertEqual(set(reg), set(wanted))
+                    self.assertEqual(set(self.host.live) - {self.unrelated}, {row['id'] for row in reg.values()})
+                    for k, (fields, spec) in wanted.items():
+                        jid = reg[k]['id']
+                        self.check_public_spec(jid, fields)
+                        self.assertEqual(reg[k], {'id': jid, **spec})
+                        self.assertEqual(self.host.states[jid], 'active')
+                    self.assertEqual([w['name'] for w in saved['watches']],
+                                     list(WATCHES[:2]) if op == 'add' else [] if op == 'remove' else [WATCHES[0]])
+                    self.assertEqual(saved['features']['promises'], op in ('add', 'remove'))
 
     def test_seeded_public_edits_are_all_reset_except_pause_and_resume(self):
         for seed in SEEDS:
