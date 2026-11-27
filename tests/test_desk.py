@@ -154,7 +154,8 @@ class DeskTests(OfflineTestCase):
         self.kick = self.enterContext(patch.object(desk_say, "kick", return_value={"kick": "ok"}))
         # "Reply N" binds to messages the owner received: here every logged message counts as delivered.
         self.enterContext(patch.object(resolve, "_say_statuses", lambda: {
-            resolve._message_id(r): "delivered" for r in self.rows(desk.PING_LOG)}))
+            resolve._message_id(r): {"status": "delivered", "reply_id": i}
+             for i, r in enumerate(self.rows(desk.PING_LOG), 1)}))
 
     @staticmethod
     def item(key, kind="action", **fields):
@@ -207,12 +208,11 @@ class DeskTests(OfflineTestCase):
                  self.item("p1-late", due=later), self.item("p1-soon", due=soon),
                  self.item("p1-waiting", waiting=True), self.item("p0", priority="P0"),
                  self.item("urgent", urgent=True)]
-        self.assertEqual(self.compose(items),
-                         "Hey Alex, 3 things:\n1. Work on urgent\n2. Work on p0\n3. Work on p1-waiting\n"
-                         "+3 more lined up, coming next (or ask me)\n")
+        self.assertEqual(self.compose(items), "Work on urgent\n+5 more lined up, coming next (or ask me)\n")
         self.clock += timedelta(minutes=30)
-        self.assertEqual(self.compose([]), "Hey Alex, 3 things:\n1. Work on p1-soon\n2. Work on p1-late\n"
-                                           "3. Work on p2-decision\n")
+        self.assertEqual(self.compose([]), "Hey Alex, 3 things:\n1. Work on p0\n2. Work on p1-waiting\n"
+                                           "3. Work on p1-soon\n+2 more lined up, coming next (or ask me)\n")
+        self.assertEqual(self.compose([]), "Hey Alex, 2 things:\n1. Work on p1-late\n2. Work on p2-decision\n")
         self.assertEqual(self.rows(desk.DIGEST), [])
 
     def test_rolled_over_items_beat_new_items_of_equal_rank(self):
@@ -554,13 +554,49 @@ class ResolveGateTests(DeskTests):
                 "3. Work on third. Draft ready, reply 3.\n+1 more lined up, coming next (or ask me)")
         self.assertEqual(self.cli(desk, "compose", "--job", "test", stdin=json.dumps(items)), SILENT)
         # Nothing but the message: no private notes ride along (the delivery input is visible in Bot Chat).
-        self.deliver.assert_called_once_with(text, key="test:first,second,third", job="test", urgent=False)
+        self.deliver.assert_called_once_with(text, key=desk._notice_key(self.rows(desk.PING_LOG)[-1]),
+                                             job="test", urgent=False)
+        self.assertIn(":drafts:", self.deliver.call_args.kwargs["key"])
         self.assertEqual(self.rows(desk.PING_LOG)[-1]["drafts"], {"second": "ready", "third": "ready"})
         self.assertEqual(self.compose([]), "Work on rolled. Draft ready, reply 1.\n")
         self.deliver.reset_mock()
         self.put("plain")
         self.assertEqual(self.cli(desk, "compose", "--job", "test", stdin=json.dumps([self.item("plain", act="send")])), SILENT)
         self.deliver.assert_called_once_with("Work on plain", key="test:plain", job="test", urgent=False)
+
+    def test_urgent_enqueue_failure_retries_during_quiet_hours(self):
+        self.clock = self.clock.replace(hour=0)
+        with patch.object(desk_say, "quiet_now", return_value=True):
+            self.deliver.side_effect = OSError("disk full")
+            items = [self.item("late train", urgent=True), self.item("ordinary")]
+            self.assertEqual(self.cli(desk, "compose", "--job", "test", stdin=json.dumps(items), code=1), SILENT)
+            self.assertEqual(len(self.rows(desk.PING_LOG)), 0)
+            self.assertTrue(desk._urgent_path().exists())
+            self.deliver.side_effect = None
+            desk.retry_urgent()
+        self.assertFalse(desk._urgent_path().exists())
+        self.assertTrue(self.deliver.call_args.kwargs["urgent"])
+        self.assertEqual(self.rows(desk.PING_LOG)[-1]["keys"], ["late train"])
+        self.assertEqual([row["key"] for row in self.rows(desk.HELD)], ["ordinary"])
+
+    def test_daytime_tick_releases_ordinary_held_without_a_brief(self):
+        self.clock = self.clock.replace(hour=23)
+        self.assertEqual(self.compose([self.item("wait")]), SILENT)
+        self.clock = (self.clock + timedelta(days=1)).replace(hour=7)
+        self.assertEqual(self.cli(desk, "flush", "--print-only"), "Work on wait\n")
+        self.assertEqual(self.rows(desk.HELD), [])
+
+    def test_composer_does_not_relay_raw_source_fields_prose_or_links(self):
+        subject = "Read entire provider alert, private source subject."
+        rows = [self.item("raw-subject", subject=subject, text=f"Full subject: {subject}"),
+                self.item("raw-body", text="Some mail body\nAnother paragraph", body="Some mail body"),
+                self.item("safe", text="Check today ftp://example.org/private https://example.org/a example.net/test")]
+        msg = self.compose(rows)
+        for excluded in (subject, "Some mail body", "Another paragraph", "example.org", "example.net"):
+            self.assertNotIn(excluded, msg)
+        self.assertIn("Check the original source for details.", msg)
+        self.assertIn("Check today", msg)
+        self.assertLessEqual(len(msg.strip()), desk.MAX_NOTICE_CHARS)
 
     def test_a_failed_enqueue_is_retried_not_marked_said(self):
         self.enterContext(patch.object(desk_say, "quiet_now", return_value=False))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -214,40 +215,41 @@ def render_show(rec) -> str:
 AMBIGUOUS = "ambiguous"
 
 
-def _say_statuses() -> dict[str, str]:
-    """{desk message id: last delivery status} from desk_say, after a confirm pass (read only on Bot Chat)."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+def draft_version(row: dict) -> str:
+    """Bind the draft and its destination/evidence to the notice the owner actually saw."""
+    fields = ("created_at", "key", "item_fp", "act", "status", "draft", "to", "channel", "thread",
+              "scope", "facts", "missing", "assumptions")
+    return hashlib.sha256(json.dumps([row.get(key) for key in fields], sort_keys=True).encode()).hexdigest()
+
+
+def _say_statuses() -> dict[str, dict]:
     import desk_say
+    order = {}
     try:
-        desk_say.confirm()
+        turns = desk_say.bot_chat_turns() or []
+        desk_say.confirm(turns=turns)
+        order = {rid: i for i, (rid, role, _) in enumerate(turns) if role == "assistant"}
     except Exception:
         pass
-    return {mid: str(row.get("status")) for mid, row in desk_say._last_status().items()}
+    return {mid: {**row, "reply_order": order.get(row.get("reply_id"))}
+            for mid, row in desk_say._last_status().items()}
 
 
 def _message_id(row: dict) -> str | None:
-    """The desk message id of a ping_log row: recorded since this release, else derived the way desk_say derives it
-    (sha256 of "<job>:<keys>" and the text)."""
     if isinstance(row.get("say_id"), str):
         return row["say_id"]
     keys, text = row.get("keys"), row.get("text")
     if not isinstance(keys, list) or not isinstance(text, str):
         return None
-    import hashlib
     key = f"{row.get('job') or ''}:{','.join(str(k) for k in keys)}"
     return hashlib.sha256(f"{key}\n{text.strip()}".encode()).hexdigest()[:24]
 
 
-def number_target(n, max_age_hours=36, statuses=None) -> tuple[str | None, str]:
-    """What "reply N" means: (key, "ok"), (None, "none") or (None, AMBIGUOUS).
-
-    N binds to the latest message with drafts that the owner has actually received: its Bot Chat delivery was
-    confirmed. A message still queued is ignored (the owner has not seen it). A newer message that was handed to
-    Bot Chat but not confirmed might be the one the owner means, so the answer is AMBIGUOUS: ask which item."""
+def _numbered_draft(n, max_age_hours=36, statuses=None) -> tuple[dict | None, str]:
     if n < 1:
         return None, "none"
     cutoff = _timestamp(now()) - timedelta(hours=max_age_hours)
-    rows = []
+    rows = {}
     try:
         with (phconf.state_dir() / "ping_log.jsonl").open(encoding="utf-8") as log:
             for line in log:
@@ -255,46 +257,65 @@ def number_target(n, max_age_hours=36, statuses=None) -> tuple[str | None, str]:
                     row = json.loads(line)
                 except ValueError:
                     continue
-                if not isinstance(row, dict) or row.get("kind") != "desk_message" or not row.get("drafts"):
+                if not isinstance(row, dict) or row.get("kind") != "desk_message":
                     continue
+                keys = row.get("keys")
+                if not row.get("drafts") and not (isinstance(keys, list) and len(keys) > 1):
+                    continue   # an unnumbered notice is not a reply-N target
                 at = _timestamp(row.get("at"))
-                if at is not None and at >= cutoff:
-                    rows.append((at, row))
+                if at is not None and at >= cutoff and (mid := _message_id(row)):
+                    rows.setdefault(mid, row)
     except FileNotFoundError:
-        return None, "none"
-    if not rows:
-        return None, "none"
-    statuses = _say_statuses() if statuses is None else statuses
-    received, unclear = None, []
-    for at, row in sorted(rows, key=lambda pair: pair[0]):
-        state = statuses.get(_message_id(row))
-        if state == "delivered":
-            received, unclear = (at, row), []
-        elif state is None or state == "queued":
-            continue   # still in the outbox (or never queued): the owner has not seen it
-        else:
-            unclear.append((at, row))   # handed to Bot Chat or unverified: the owner may have it
-    if unclear:
         return None, AMBIGUOUS
-    if received is None:
-        return None, "none"
-    keys, drafts = received[1].get("keys"), received[1]["drafts"]
-    if isinstance(keys, list) and isinstance(drafts, dict) and n <= len(keys):
-        k = keys[n - 1]
-        if isinstance(k, str) and k in drafts:
-            return k, "ok"
-    return None, "none"
+    if not rows:
+        return None, AMBIGUOUS
+    statuses = _say_statuses() if statuses is None else statuses
+    received = {}
+    for mid, row in rows.items():
+        receipt = statuses.get(mid) or {}
+        if not isinstance(receipt, dict):
+            return None, AMBIGUOUS   # legacy records had no reply order
+        state = receipt.get("status")
+        order = receipt.get("reply_order", receipt.get("reply_id"))
+        if state == "delivered" and type(order) is int and order not in received:
+            received[order] = row
+        elif state not in ("queued", "retry", "failed", None):
+            # A compose timestamp says nothing about where an unconfirmed relay appeared in the chat.
+            return None, AMBIGUOUS
+    if not received:
+        return None, AMBIGUOUS
+    latest = received[max(received)]
+    keys = latest.get("keys")
+    if not isinstance(keys, list) or n > len(keys) or not isinstance(keys[n - 1], str):
+        return None, AMBIGUOUS
+    key = keys[n - 1]
+    versions = latest.get("draft_versions")
+    try:
+        row = get(key)
+    except (OSError, ValueError):
+        row = None
+    if not row or not isinstance(versions, dict) or versions.get(key) != draft_version(row):
+        return None, AMBIGUOUS
+    return row, "ok"
+
+
+def number_target(n, max_age_hours=36, statuses=None) -> tuple[str | None, str]:
+    """Resolve a number by confirmed Bot reply order, and only to the same draft version."""
+    row, why = _numbered_draft(n, max_age_hours, statuses)
+    return (row["key"] if row else None), why
 
 
 def key_for_number(n, max_age_hours=36, statuses=None):
     return number_target(n, max_age_hours, statuses)[0]
 
 
-def _mark(key, fields, *, bind=False) -> dict:
+def _mark(key, fields, *, bind=False, expected_version=None) -> dict:
     with _write_store() as (root, rows, log):
         row = rows.get(key)
         if not isinstance(row, dict):
             return {"status": "unknown", "key": key}
+        if expected_version is not None and (not _open(row, now()) or draft_version(row) != expected_version):
+            return {"status": "changed", "key": key}
         if (bind and row.get("item_fp") is not None) or all(row.get(k) == v for k, v in fields.items()):
             return row
         row.update(fields)
@@ -635,16 +656,18 @@ def main(argv=None) -> int:
     if a.cmd == "get":
         result = get(a.key)
     elif a.cmd == "show":
-        key, why = (a.key, "ok") if a.key is not None else number_target(a.n)
-        row = get(key) if key is not None else None
+        row, why = (get(a.key), "ok") if a.key is not None else _numbered_draft(a.n)
         if why == AMBIGUOUS:
-            print("Not sure which message that number belongs to: a newer desk message may not have reached the "
-                  "owner yet. Ask which item they mean before showing or sending anything.")
+            print("Not sure which item or draft version that number refers to. Ask the owner which item they mean "
+                  "before showing or sending anything.")
         elif row is None:
             print("No stored draft for that item.")
         else:
-            mark(key, shown_at=now().isoformat())
-            print(render_show(row))
+            shown = _mark(row["key"], {"shown_at": now().isoformat()}, expected_version=draft_version(row))
+            if shown.get("status") in {"changed", "unknown"}:
+                print("The draft changed. Ask which item the owner means before showing or sending anything.")
+            else:
+                print(render_show(shown))
         return 0
     elif a.cmd == "mark":
         at = now().isoformat()

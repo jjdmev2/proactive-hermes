@@ -98,7 +98,7 @@ def check_local_delivery(jobs: list[dict]) -> None:
         for field, flag in (("deliver", "--deliver"), ("failure_deliver", "--failure-deliver")):
             value = str(job.get(field) or "").strip()
             want = "bot-chat" if say and field == "deliver" else "local"
-            if value == want or (not value and field == "failure_deliver"):
+            if value == want or (not value and field == "failure_deliver" and not say):
                 continue
             proc = subprocess.run(["hermes", "-p", phconf.profile_name(), "cron", "edit", job["id"], flag, want],
                                   capture_output=True, text=True, timeout=60)
@@ -123,42 +123,27 @@ def kick_say() -> dict:
 
 
 def check_say_outbox() -> None:
-    """Flag desk messages stuck in the outbox for over an hour."""
-    path = STATE_DIR / "say_outbox.jsonl"
-    try:
-        rows = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
-    except FileNotFoundError:
-        return
-    stale = [r for r in rows if (t := parse_ts(r.get("queued_at"))) and now() - t > timedelta(hours=1)]
+    """Flag due or unresolved items without treating normal quiet-hours backlog as a failure."""
+    import desk_say
+    last = desk_say._last_status()
+    stale = [r for r in desk_say._pending(desk_say._lines(desk_say.OUTBOX)).values()
+             if last.get(r["id"], {}).get("status") in (None, "retry")
+             and (r.get("urgent") or not desk_say.quiet_now())
+             and (t := parse_ts(r.get("queued_at"))) and now() - t > timedelta(hours=1)]
     if stale:
-        fault("desk", f"{len({r.get('id') for r in stale})} desk message(s) not posted for over an hour")
-
-
-HANDED_FAULT_AFTER = timedelta(minutes=15)
-UNVERIFIED_FAULT_FOR = timedelta(hours=24)
+        fault("relay", f"{len(stale)} desk message(s) not posted for over an hour")
 
 
 def check_say_receipts() -> None:
-    """desk_say fails closed: a message handed to the say job is never printed again. Surface the ones whose Bot
-    reply was not seen in Bot Chat, so a message for the owner cannot vanish quietly: 'handed' for over 15 min, or
-    marked 'unverified' (no matching reply within 24 h; desk_say then stops looking) in the last 24 h. Also the
-    say job's last route check, when it found the job not delivering to Bot Chat."""
-    try:
-        sys.path.insert(0, str(HERE))
-        import desk_say
-        desk_say.confirm()   # also marks handed rows older than 24 h unverified, once
-        last = desk_say._last_status()
-        route = desk_say.route_status()
-    except Exception:
-        return
-    t = now()
-    stuck = [r for r in last.values()
-             if (r.get("status") in ("posting", "handed") and (s := parse_ts(r.get("at"))) and t - s > HANDED_FAULT_AFTER)
-             or (r.get("status") == "unverified" and (s := parse_ts(r.get("at"))) and t - s <= UNVERIFIED_FAULT_FOR)]
-    if stuck:
-        fault("desk", f"{len(stuck)} desk message(s) with an unclear post, check say_log")
-    if route.get("route_problem") and (s := parse_ts(route.get("at"))) and t - s <= timedelta(hours=1):
-        fault("desk", f"desk messages held: {route['route_problem']}")
+    import desk_say
+    desk_say.reconcile_handoffs()
+    desk_say.confirm()
+    if issues := desk_say.delivery_issues():
+        fault("relay", f"desk delivery unresolved: {', '.join(issues)}; see say_log.jsonl")
+    if problem := desk_say.route_problem():
+        fault("relay", f"desk messages held: {problem}")
+    elif (route := desk_say.route_status()).get("route_problem") and (s := parse_ts(route.get("at"))) and now() - s <= timedelta(hours=1):
+        fault("relay", f"desk messages held: {route['route_problem']}")
 
 
 def _resolve_rows(path: Path) -> Iterator[dict]:
@@ -467,6 +452,12 @@ def main() -> int:
         except Exception as exc:
             log({"error": f"{type(exc).__name__}: {exc}"[:200]})
     lines = report()
+    relay = [text for cls, text in faults.values() if cls == "relay"]
+    if relay:
+        # This does not use the failing Bot Chat route. Hermes records the warning in the
+        # health job's run output (its failure-deliver is local), and doctor reads the state.
+        print("Proactive Hermes delivery health: " + "; ".join(relay), file=sys.stderr)
+        return 1
     if lines:
         sys.path.insert(0, str(HERE))
         import desk_say

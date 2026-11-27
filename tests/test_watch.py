@@ -70,8 +70,9 @@ class WatchTests(unittest.TestCase):
 
     def test_add_list_reapply_and_remove_only_the_watch(self):
         self.assertEqual(self.command(ADD + ["--then", "alarm", "--urgent"])[0], 0)
-        # The say job (plain create) and the watch (ensure_named_job with toolsets, then edit).
-        self.assertEqual([a[2] for a in self.run.calls], ["create", "edit"])
+        # Both jobs are staged first and armed only after their ID is recorded.
+        self.assertEqual([a[2] for a in self.run.calls if a[2] != "list"],
+                         ["create", "pause", "edit", "resume", "pause", "edit", "resume"])
         jid = self.run.job("Proactive · watch: Card drop")
         argv = self.run.live[jid]
         self.assertEqual(argv[argv.index("--name") + 1], "Proactive · watch: Card drop")

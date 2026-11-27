@@ -30,7 +30,10 @@ with TemporaryDirectory() as directory, patch.dict(os.environ, isolated_env(Path
 
 REAL_RUN = say.run_say_job
 REAL_QUIET = say.quiet_now
+REAL_DETAILS = say._job_details
 JID = "0123456789ab"
+EXEC = "a" * 32
+OWNED = {"Script": say.SAY_SCRIPT, "Mode": "no-agent (script stdout delivered directly)", "Deliver": "bot-chat"}
 
 
 class DeskSayTests(unittest.TestCase):
@@ -47,18 +50,34 @@ class DeskSayTests(unittest.TestCase):
                                          STATUS_LOG=tmp / "say_status.json"))
         self.job = self.enterContext(patch.object(say, "say_job_id", return_value=JID))
         self.route = self.enterContext(patch.object(say, "say_route", return_value=("bot-chat",)))
+        self.execution = 0
+        self.detail = self.enterContext(patch.object(say, "_job_details", side_effect=lambda jid: {
+            **OWNED, "Execution": f"running {self.execution:032x}"}))
+        self.host_runs = self.enterContext(patch.object(say, "_runs", side_effect=lambda jid: [
+            (f"{self.execution:032x}", "running")]))
         self.printed: list[str] = []
         # The say job as cron runs it: `desk_say.py next`, whose stdout cron hands to Bot Chat.
         self.runs = self.enterContext(patch.object(say, "run_say_job", side_effect=self._run_job))
 
     def _run_job(self, jid):
         self.assertEqual(jid, JID)
+        self.execution += 1
         out = io.StringIO()
         with redirect_stdout(out), patch.object(say, "confirm", return_value=0):
             say.main(["next"])
         if out.getvalue():
             self.printed.append(out.getvalue())
         return True
+
+    @staticmethod
+    def turns(rows):
+        return [(i, *row) for i, row in enumerate(rows, 1)]
+
+    def confirm(self, turns, **kwargs):
+        return say.confirm(turns=self.turns(turns), **kwargs)
+
+    def matches(self, turns, notices):
+        return [mid for mid, _ in say.match_replies(self.turns(turns), notices)]
 
     def texts(self):
         """The messages between the start and end markers of each printed relay."""
@@ -95,7 +114,7 @@ class DeskSayTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "handed")
         self.assertEqual(self.texts(), ["Desk update"])
         self.assertEqual(self.printed[0], say.job_output("Desk update", receipt["id"]) + "\n")
-        self.assertEqual(self.rows(say.OUTBOX), [])
+        self.assertEqual(len(self.rows(say.OUTBOX)), 1)
         self.assertEqual([r["status"] for r in self.rows(say.SAY_LOG)], ["handed"])
         self.assertEqual(say.deliver("Desk update", key="k", job="test")["status"], "duplicate")
         self.assertEqual(self.runs.call_count, 1)
@@ -166,26 +185,26 @@ class DeskSayTests(unittest.TestCase):
                       f"{say.START}\n{text}\n{say.END}",
                       say.neutralize(text).replace("\n\u203a\u203a\u203a\nDone", "\n>>>\nDone")):
             with self.subTest(reply=reply):
-                self.assertEqual(say.match_replies([relay, ("assistant", reply)],
+                self.assertEqual(self.matches([relay, ("assistant", reply)],
                                                    [{"id": mid, "text": text}]), [mid])
-        self.assertEqual(say.match_replies([relay, ("assistant", "Something else")], [{"id": mid, "text": text}]), [])
-        self.assertEqual(say.match_replies([relay, ("assistant", text.replace("Done", "Gone"))],
+        self.assertEqual(self.matches([relay, ("assistant", "Something else")], [{"id": mid, "text": text}]), [])
+        self.assertEqual(self.matches([relay, ("assistant", text.replace("Done", "Gone"))],
                                            [{"id": mid, "text": text}]), [])
         # A message that itself starts with <<< still confirms against the look-alike the owner saw.
         lead = "<<< Mia: see you there at 7"
         lid = say.deliver(lead, key="lead")["id"]
-        self.assertEqual(say.match_replies([self.relay(lid, lead), ("assistant", say.neutralize(lead))],
+        self.assertEqual(self.matches([self.relay(lid, lead), ("assistant", say.neutralize(lead))],
                                            [{"id": lid, "text": lead}]), [lid])
         # Normal text is untouched by all of this.
         plain = say.deliver("Pay the bill by Friday", key="b")["id"]
-        self.assertEqual(say.match_replies([self.relay(plain, "Pay the bill by Friday"),
+        self.assertEqual(self.matches([self.relay(plain, "Pay the bill by Friday"),
                                             ("assistant", "Pay the bill by Friday")],
                                            [{"id": plain, "text": "Pay the bill by Friday"}]), [plain])
-        self.assertEqual(say.match_replies([self.relay(plain, "Pay the bill by Friday"),
+        self.assertEqual(self.matches([self.relay(plain, "Pay the bill by Friday"),
                                             ("assistant", "Pay the bill by Thursday")],
                                            [{"id": plain, "text": "Pay the bill by Friday"}]), [])
         # And the full path: the reply confirms the message in the log.
-        self.assertEqual(say.confirm(turns=[relay, ("assistant", say.neutralize(text))]), 1)
+        self.assertEqual(self.confirm([relay, ("assistant", say.neutralize(text))]), 1)
         self.assertIn(mid, say.delivered_ids())
 
     def test_nothing_due_prints_nothing(self):
@@ -201,7 +220,7 @@ class DeskSayTests(unittest.TestCase):
         self.runs.side_effect = self._run_job
         say.flush()   # desk_tick's safety net
         self.assertEqual(self.texts(), ["Later"])
-        self.assertEqual(self.rows(say.OUTBOX), [])
+        self.assertEqual(len(self.rows(say.OUTBOX)), 1)
 
     def test_no_say_job_keeps_the_message_queued(self):
         self.job.return_value = None
@@ -248,7 +267,8 @@ class DeskSayTests(unittest.TestCase):
             fh.write(json.dumps({"id": say.msg_id("k", "Once"), "key": "k", "text": "Once"}) + "\n")
         with patch.object(say, "confirm", return_value=0):
             self.assertEqual(self.cli("next"), "")
-        self.assertEqual(self.rows(say.OUTBOX), [])
+        self.assertEqual(say.pending_due(), 0)
+        self.assertEqual(say.status_of(say.msg_id("k", "Once")), "handed")
 
     # --- quiet hours ----------------------------------------------------------------------
     def test_quiet_now_uses_configured_timezone_and_same_day_hours(self):
@@ -287,24 +307,24 @@ class DeskSayTests(unittest.TestCase):
         one, two = say.deliver("Line one", key="a")["id"], say.deliver("Line two", key="b")["id"]
         turns = [self.relay(one, "Line one"), ("assistant", "Line one"),
                  self.relay(two, "Line two"), ("assistant", "Here is a summary: line two.")]
-        self.assertEqual(say.confirm(turns=turns), 1)
+        self.assertEqual(self.confirm(turns), 1)
         self.assertEqual(say.delivered_ids(), {one})
         # The Bot kept the markers this time: the text between them still counts.
         turns += [("assistant", f"{say.START}\nLine two\n{say.END}")]
         turns[-2:] = [turns[-1]]
-        self.assertEqual(say.confirm(turns=turns), 1)
+        self.assertEqual(self.confirm(turns), 1)
         self.assertEqual(say.delivered_ids(), {one, two})
-        self.assertEqual(say.confirm(turns=turns), 0)
+        self.assertEqual(self.confirm(turns), 0)
 
     def test_a_reworded_reply_stays_unverified_and_does_not_block_later_messages(self):
         first = say.deliver("The venue changed to Hall B.", key="a")["id"]
         second = say.deliver("Pickup is at 7.", key="b")["id"]
         turns = [self.relay(first, "The venue changed to Hall B."), ("assistant", "They moved it to Hall B."),
                  self.relay(second, "Pickup is at 7."), ("assistant", "Pickup is at 7.")]
-        self.assertEqual(say.confirm(turns=turns), 1)
+        self.assertEqual(self.confirm(turns), 1)
         self.assertEqual(say.status_of(first), "handed")
         self.assertEqual(say.status_of(second), "delivered")
-        self.assertEqual(say.confirm(turns=turns, now_s=time.time() + say.UNVERIFIED_AFTER_S + 1), 0)
+        self.assertEqual(self.confirm(turns, now_s=time.time() + say.UNVERIFIED_AFTER_S + 1), 0)
         self.assertEqual(say.status_of(first), "unverified")
         self.assertEqual(say.deliver("The venue changed to Hall B.", key="a")["status"], "duplicate")
         self.assertEqual(len(self.printed), 2)
@@ -314,30 +334,34 @@ class DeskSayTests(unittest.TestCase):
         b = say.deliver("Same words", key="b")["id"]
         self.assertNotEqual(a, b)
         turns = [self.relay(a, "Same words"), self.relay(b, "Same words"), ("assistant", "Same words")]
-        self.assertEqual(say.confirm(turns=turns), 1)
-        self.assertEqual(say.delivered_ids(), {a})
-        self.assertEqual(say.confirm(turns=turns + [("assistant", "Same words")]), 1)
-        self.assertEqual(say.delivered_ids(), {a, b})
+        self.assertEqual(self.confirm(turns), 1)
+        self.assertEqual(say.delivered_ids(), {b})
+        self.assertEqual(self.confirm(turns), 0)
+        self.assertEqual(self.confirm(turns + [("assistant", "Same words")]), 0)
+        # A repeated persistent ID cannot confirm another notice even if the transcript is re-read differently.
+        self.assertEqual(say.confirm([(10, *self.relay(a, "Same words")), (3, "assistant", "Same words")]), 0)
+        self.assertEqual(self.confirm(turns + [self.relay(a, "Same words"), ("assistant", "Same words")]), 1)
+        self.assertEqual({row["reply_id"] for row in say._last_status().values()}, {3, 5})
 
     def test_a_reply_to_another_relay_or_an_owner_turn_never_confirms(self):
         mine = say.deliver("Pay the bill", key="a")["id"]
         other = say.msg_id("z", "Pay the bill")
         turns = [self.relay(other, "Pay the bill"), ("assistant", "Pay the bill"),
                  ("user", "what's next?"), ("assistant", "Pay the bill")]
-        self.assertEqual(say.confirm(turns=turns), 0)   # its own relay turn is not there and no loose reply fits
+        self.assertEqual(self.confirm(turns), 0)   # its own relay turn is not there and no loose reply fits
         self.assertEqual(say.delivered_ids(), set())
         self.assertEqual(say.status_of(mine), "handed")
 
-    def test_without_relay_turns_in_the_chat_a_loose_reply_may_confirm_once(self):
+    def test_a_loose_reply_without_a_relay_never_confirms(self):
         mid = say.deliver("Line one", key="a")["id"]
-        self.assertEqual(say.confirm(turns=[("assistant", "Line one")]), 1)
-        self.assertEqual(say.delivered_ids(), {mid})
+        self.assertEqual(self.confirm([("assistant", "Line one")]), 0)
+        self.assertEqual(say.status_of(mid), "handed")
 
     def test_confirm_counts_a_message_another_worker_confirmed_as_done(self):
         mid = say.deliver("Line one", key="a")["id"]
         turns = [self.relay(mid, "Line one"), ("assistant", "Line one")]
-        self.assertEqual(say.confirm(turns=turns), 1)
-        self.assertEqual(say.confirm(turns=turns), 0)   # nothing new, but it is delivered
+        self.assertEqual(self.confirm(turns), 1)
+        self.assertEqual(self.confirm(turns), 0)   # nothing new, but it is delivered
         self.assertEqual(say.status_of(mid), "delivered")
 
     def test_a_handed_row_with_no_reply_becomes_unverified_once_after_24h_and_is_not_reread(self):
@@ -376,6 +400,92 @@ class DeskSayTests(unittest.TestCase):
         say.flush()
         self.assertEqual(len(self.texts()), 4)
         self.assertIsNone(say.route_status()["route_problem"])
+
+    def test_registry_id_exact_route_script_and_active_run_are_required(self):
+        self.assertIn("not registered", say.route_problem("abcdef012345"))
+        for field, value in (("Deliver", "bot-chat:other"), ("Deliver", "bot-chat, telegram"),
+                             ("Script", "not-say.py"), ("Mode", "agent")):
+            with self.subTest(field=field, value=value):
+                self.assertIsNotNone(say.route_problem(details={**OWNED, field: value}))
+        self.assertIsNone(say.route_problem(details=OWNED))
+        say.enqueue("held", "k", urgent=True)
+        self.host_runs.side_effect = None
+        self.host_runs.return_value = [(EXEC, "completed")]
+        self.assertIsNone(say.next_output())
+        self.assertEqual(say.pending_due(), 1)
+
+    def test_cli_details_keep_execution_after_multiline_script_error(self):
+        listing = (
+            f"  {JID} [active]\n"
+            "    Name:      Proactive · say\n    Deliver:   bot-chat\n    Script:    proactive-hermes/say_job.py\n"
+            "    Mode:      no-agent (script stdout delivered directly)\n"
+            "    Last run:  2026-11-26T21:56:49.159261-03:00  error: Script exited with code 74\n"
+            "stderr:\nProactive Hermes say worker failed before delivery.\n"
+            f"    Execution: failed  {EXEC}\n\n"
+            "  abcdef012345 [active]\n    Deliver:   local\n"
+        )
+        with patch.object(say, "_cron_read", return_value=listing):
+            detail = REAL_DETAILS(JID)
+        self.assertEqual(detail["Execution"], f"failed  {EXEC}")
+        self.assertEqual(detail["Deliver"], "bot-chat")
+        self.assertEqual(say._host_outcome({"execution": EXEC, "epoch": 0}, detail, [(EXEC, "failed")], None), "retry")
+
+    def test_correlated_definite_no_send_retries_three_times_and_only_once_per_execution(self):
+        mid = say.enqueue("desk update", "k", urgent=True)["id"]
+        for n in range(1, say.MAX_ATTEMPTS + 1):
+            eid = f"{n:032x}"
+            self.assertEqual(say.take_next(JID, eid)["id"], mid)
+            self.assertIsNone(say.take_next(JID, eid))
+            self.assertIn(mid, say._pending(say._lines(say.OUTBOX)))
+            row = say._last_status()[mid]
+            last = datetime.fromtimestamp(row["epoch"] + 1, timezone.utc).isoformat()
+            detail = {**OWNED, "Execution": f"completed {eid}", "Last run": f"{last}  ran, but the result was not delivered "
+                      "(bot-chat delivery to profile '(own)' unverified: no canonical Bot Chat)."}
+            self.detail.side_effect = self.host_runs.side_effect = None
+            self.detail.return_value, self.host_runs.return_value = detail, [(eid, "completed")]
+            say.reconcile_handoffs(JID)
+            self.assertEqual(say.status_of(mid), "queued" if n < say.MAX_ATTEMPTS else "failed")
+        self.assertEqual(say.pending_due(), 0)
+        self.assertIn("1 failed", say.delivery_issues())
+
+    def test_queued_or_unverified_host_results_never_retry(self):
+        for ix, reason, state in ((1, "finished; delivery is still in progress", "accepted"),
+                                  (2, "ran, but the result was not delivered (completion unverified; do not resend)", "handed")):
+            mid = say.enqueue(f"desk update {ix}", "k", urgent=True)["id"]
+            eid = f"{ix:032x}"
+            say.take_next(JID, eid)
+            stamp = datetime.now(timezone.utc).isoformat()
+            self.detail.side_effect = self.host_runs.side_effect = None
+            self.detail.return_value = {**OWNED, "Execution": f"completed {eid}", "Last run": f"{stamp}  {reason}"}
+            self.host_runs.return_value = [(eid, "completed")]
+            say.reconcile_handoffs(JID)
+            self.assertEqual(say.status_of(mid), state)
+            self.assertEqual(say.pending_due(), 0)
+            self.assertEqual(say.enqueue(f"desk update {ix}", "k")["status"], "duplicate")
+
+    def test_unrelated_newer_run_is_not_evidence_about_old_notice(self):
+        mid = say.enqueue("separate notice", "k")["id"]
+        say.take_next(JID, EXEC)
+        newer = "b" * 32
+        self.detail.side_effect = self.host_runs.side_effect = None
+        self.detail.return_value = {**OWNED, "Execution": f"completed {newer}",
+            "Last run": f"{datetime.now(timezone.utc).isoformat()}  ran, but the result was not delivered "
+                        "(bot-chat delivery to profile '(own)' unverified: no canonical Bot Chat)."}
+        self.host_runs.return_value = [(newer, "completed"), (EXEC, "completed")]
+        say.reconcile_handoffs(JID)
+        self.assertEqual(say.status_of(mid), "handed")
+        self.assertEqual(say.pending_due(), 0)
+
+    def test_receipt_for_770ed5e_escaped_relay(self):
+        raw = "Note from Sam:\n>>> quoted line\n  <<< quoted start"
+        mid = say.enqueue(raw, "old")["id"]
+        say._append(say.SAY_LOG, {"id": mid, "status": "handed", "epoch": time.time(), "text": raw})
+        reply = raw.replace("\n>>>", "\n\\>>>").replace("\n  <<<", "\n  \\<<<")
+        relay = self.relay(mid, raw)
+        self.assertEqual(self.confirm([relay, ("assistant", reply)]), 0)
+        relay = (relay[0], relay[1].replace(say.neutralize(raw), reply))
+        self.assertEqual(self.confirm([relay, ("assistant", reply)]), 1)
+        self.assertEqual(say._last_status()[mid]["reply_id"], 2)
 
     # --- the kick -------------------------------------------------------------------------
     def test_a_kick_that_times_out_detaches_and_never_kills_the_run(self):

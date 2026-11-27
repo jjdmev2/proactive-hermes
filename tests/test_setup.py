@@ -144,12 +144,64 @@ class JobSetupTests(unittest.TestCase):
         self.assertFalse([argv for argv in self.run.calls if argv[2] != "list"])
         self.assertEqual(len(self.run.live), 3)
 
+    def test_failed_registry_write_recovers_fresh_say_by_staging_name(self):
+        save = jobs._save_registry
+        def fail_after_create(reg):
+            if reg.get("creating", {}).get("say", {}).get("new"):
+                raise OSError("injected write failure")
+            save(reg)
+        with patch.object(jobs, "_save_registry", side_effect=fail_after_create):
+            with self.assertRaisesRegex(OSError, "injected write failure"):
+                jobs.apply(self.cfg, run=self.run)
+        self.assertNotIn("say", self.registry())
+        staging = self.registry()["creating"]["say"]["temp"]
+        staged = self.run.job(staging)
+        self.assertEqual(self.run.option(staged, "--deliver"), "local")
+        self.assertNotEqual(self.run.schedule_of(staged), "*/2 * * * *")
+        jobs.apply(self.cfg, run=self.run)
+        self.assertEqual(self.run.job("Proactive · say"), staged)
+        self.assertEqual(self.registry()["say"]["id"], staged)
+        self.assertNotIn("creating", self.registry())
+        self.assertEqual(len([name for name in self.by_name() if real_name(name) == "Proactive · say"]), 1)
+
+    def test_remove_all_cleans_journaled_fresh_creation_before_ownership(self):
+        save = jobs._save_registry
+        def fail_after_create(reg):
+            if reg.get("creating", {}).get("say", {}).get("new"):
+                raise OSError("injected write failure")
+            save(reg)
+        with patch.object(jobs, "_save_registry", side_effect=fail_after_create):
+            with self.assertRaises(OSError):
+                jobs.apply(self.cfg, run=self.run)
+        self.assertEqual(jobs.remove_all(run=self.run), ["say"])
+        self.assertEqual(self.run.live, {})
+        self.assertEqual(self.registry(), {})
+
+    def test_partial_history_is_replaced_and_copy_mismatch_preserves_old_job(self):
+        _, old = self._old_radar()
+        filename = "2026-11-20_08-00-00.md"
+        target = self.kept(old, filename)
+        target.parent.mkdir(parents=True)
+        target.write_text("partial")
+        def corrupt_copy(_src, dst):
+            dst.write(b"wrong")
+        with patch.object(jobs.shutil, "copyfileobj", side_effect=corrupt_copy):
+            with self.assertRaisesRegex(RuntimeError, "copy mismatch"):
+                jobs.apply(self.cfg, run=self.run)
+        self.assertIn(old, self.run.live)
+        self.assertEqual(self.registry()["mail_radar"]["id"], old)
+        self.assertEqual(target.read_text(), "partial")
+        self.assertEqual(list(target.parent.iterdir()), [target])
+        jobs.apply(self.cfg, run=self.run)
+        self.assertNotIn(old, self.run.live)
+        self.assertEqual(target.read_text(), "## Response\n[SILENT]\n")
+
     def test_say_job_delivers_to_bot_chat_and_only_exists_when_something_speaks(self):
         jobs.apply(self.cfg, run=self.run)
         say = self.by_name()["Proactive · say"]
         self.assertEqual(self.run.option(say, "--deliver"), "bot-chat")
         self.assertEqual(self.run.option(say, "--failure-deliver"), "local")
-        self.assertEqual(self.run.live[say][-2], "*/2 * * * *")   # around the clock; quiet hours live in the script
+        self.assertEqual(self.run.schedule_of(say), "*/2 * * * *")   # around the clock; quiet hours live in the script
         self.cfg["features"]["health"] = False
         jobs.apply(self.cfg, run=self.run)
         self.assertEqual(self.run.live, {})
@@ -710,7 +762,7 @@ class JobSetupTests(unittest.TestCase):
                     order.append(argv[argv.index("--name") + 1])
                 return real_call(argv, **kw)
             jobs.apply(self.cfg, run=run)
-        self.assertEqual(order[0], "Proactive · say")
+        self.assertEqual(real_name(order[0]), "Proactive · say")
 
     def test_preflight_refuses_without_cron_plugin_api_and_changes_nothing(self):
         problem = "this Hermes has no cron.plugin_api (ModuleNotFoundError). Nothing was changed."
@@ -811,7 +863,7 @@ class JobSetupTests(unittest.TestCase):
         del self.run.live[first]
         self.run.calls.clear()
         jobs.apply(self.cfg, run=self.run)
-        self.assertEqual([a[2] for a in self.run.calls], ["list", "create"])
+        self.assertEqual([a[2] for a in self.run.calls if a[2] != "list"], ["create", "pause", "edit", "resume"])
         for jid in rest:
             self.assertIn(jid, self.run.live)
         self.assertNotIn(first, self.run.live)

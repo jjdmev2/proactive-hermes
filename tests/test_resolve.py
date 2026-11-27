@@ -116,21 +116,17 @@ class ResolveTests(unittest.TestCase):
         self.assertIsNone(resolve.get('sam', now=self.clock + timedelta(hours=48)))
 
     def say_fixture(self):
-        old = (self.clock - timedelta(hours=37)).isoformat()
-        recent = (self.clock - timedelta(hours=1)).isoformat()
-        rows = [
-            {'at': old, 'kind': 'desk_message', 'keys': ['expired'], 'drafts': {'expired': 'ready'}},
-            {'at': recent, 'kind': 'desk_message', 'keys': ['plain', 'sam'], 'drafts': {'sam': 'ready'}},
-            {'at': self.clock.isoformat(), 'kind': 'desk_message', 'keys': ['new'], 'drafts': {}},
-        ]
-        (resolve.phconf.state_dir() / 'ping_log.jsonl').write_text('\n'.join(map(json.dumps, rows)), encoding='utf-8')
+        row = resolve.get('sam')
+        version = resolve.draft_version(row) if row else 'unknown'
+        self.log_messages({'at': (self.clock - timedelta(hours=1)).isoformat(), 'kind': 'desk_message',
+                           'keys': ['plain', 'sam'], 'drafts': {'sam': 'ready'}, 'say_id': 'a' * 24,
+                           'draft_versions': {'sam': version}})
 
     def delivered(self, extra=None):
-        """Every ping_log row counts as received by the owner, except the ids given as id=status."""
         def statuses():
             rows = [json.loads(line) for line in
                     (resolve.phconf.state_dir() / 'ping_log.jsonl').read_text().splitlines() if line.strip()]
-            out = {resolve._message_id(r): 'delivered' for r in rows}
+            out = {resolve._message_id(r): {'status': 'delivered', 'reply_id': i} for i, r in enumerate(rows, 1)}
             out.update(extra or {})
             return out
         return patch.object(resolve, '_say_statuses', statuses)
@@ -138,24 +134,37 @@ class ResolveTests(unittest.TestCase):
     def log_messages(self, *rows):
         (resolve.phconf.state_dir() / 'ping_log.jsonl').write_text('\n'.join(map(json.dumps, rows)), encoding='utf-8')
 
-    def test_reply_number_binds_to_the_latest_message_the_owner_received(self):
-        resolve.put(self.record)
+    def test_reply_number_binds_to_bot_reply_order_and_original_draft_version(self):
+        sam = resolve.put(self.record)
+        other = resolve.put({**self.record, 'key': 'other', 'draft': 'Hello again.'})
         at = lambda h: (self.clock - timedelta(hours=h)).isoformat()  # noqa: E731
         received = {'at': at(2), 'kind': 'desk_message', 'job': 'radar', 'keys': ['sam'], 'drafts': {'sam': 'ready'},
-                    'text': 'Sam: questions in. Draft ready, reply 1.', 'say_id': 'a' * 24}
-        queued = {'at': at(1), 'kind': 'desk_message', 'job': 'radar', 'keys': ['other'],
-                  'drafts': {'other': 'ready'}, 'text': 'Other. Draft ready, reply 1.', 'say_id': 'b' * 24}
+                    'draft_versions': {'sam': resolve.draft_version(sam)}, 'say_id': 'a' * 24}
+        queued = {'at': at(1), 'kind': 'desk_message', 'job': 'radar', 'keys': ['other'], 'drafts': {'other': 'ready'},
+                  'draft_versions': {'other': resolve.draft_version(other)}, 'say_id': 'b' * 24}
         self.log_messages(received, queued)
-        statuses = {'a' * 24: 'delivered'}             # the newer one is still in the outbox
+        statuses = {'a' * 24: {'status': 'delivered', 'reply_id': 12}}
         self.assertEqual(resolve.number_target(1, statuses=statuses), ('sam', 'ok'))
-        statuses['b' * 24] = 'handed'                 # handed to Bot Chat, reply not seen: the owner may have it
-        self.assertEqual(resolve.number_target(1, statuses=statuses), (None, resolve.AMBIGUOUS))
-        statuses['b' * 24] = 'unverified'
-        self.assertEqual(resolve.number_target(1, statuses=statuses), (None, resolve.AMBIGUOUS))
-        statuses['b' * 24] = 'delivered'
+        for state in ('handed', 'accepted', 'unverified'):
+            statuses['b' * 24] = {'status': state}
+            self.assertEqual(resolve.number_target(1, statuses=statuses), (None, resolve.AMBIGUOUS))
+        statuses['b' * 24] = {'status': 'delivered', 'reply_id': 9}
+        self.assertEqual(resolve.number_target(1, statuses=statuses), ('sam', 'ok'))
+        statuses['b' * 24]['reply_id'] = 13
         self.assertEqual(resolve.number_target(1, statuses=statuses), ('other', 'ok'))
-        # Never a message that was only queued, even when it is the only one.
-        self.assertEqual(resolve.number_target(1, statuses={}), (None, 'none'))
+        resolve.put({**self.record, 'key': 'other', 'draft': 'A different draft.'})
+        self.assertEqual(resolve.number_target(1, statuses=statuses), (None, resolve.AMBIGUOUS))
+        self.assertEqual(resolve.number_target(1, statuses={}), (None, resolve.AMBIGUOUS))
+
+    def test_later_numbered_notice_without_a_draft_does_not_select_an_older_draft(self):
+        sam = resolve.put(self.record)
+        at = self.clock.isoformat()
+        self.log_messages({'at': at, 'kind': 'desk_message', 'keys': ['sam'], 'say_id': 'a' * 24,
+                           'drafts': {'sam': 'ready'}, 'draft_versions': {'sam': resolve.draft_version(sam)}},
+                          {'at': at, 'kind': 'desk_message', 'keys': ['x', 'y'], 'say_id': 'b' * 24})
+        receipts = {'a' * 24: {'status': 'delivered', 'reply_order': 1, 'reply_id': 50},
+                    'b' * 24: {'status': 'delivered', 'reply_order': 2, 'reply_id': 20}}
+        self.assertEqual(resolve.number_target(1, statuses=receipts), (None, resolve.AMBIGUOUS))
 
     def test_show_asks_when_the_number_is_ambiguous(self):
         resolve.put(self.record)
@@ -163,10 +172,10 @@ class ResolveTests(unittest.TestCase):
         self.log_messages(
             {'at': at(2), 'kind': 'desk_message', 'keys': ['plain', 'sam'], 'drafts': {'sam': 'ready'}, 'say_id': 'a' * 24},
             {'at': at(1), 'kind': 'desk_message', 'keys': ['x', 'y'], 'drafts': {'y': 'ready'}, 'say_id': 'b' * 24})
-        with self.delivered({'b' * 24: 'handed'}):
+        with self.delivered({'b' * 24: {'status': 'handed'}}):
             code, out = self.cli('show', '--n', '2')
         self.assertEqual(code, 0)
-        self.assertIn('Ask which item', out)
+        self.assertIn('Ask the owner which item', out)
         self.assertNotIn(self.record['draft'], out)
         self.assertIsNone(resolve.get('sam').get('shown_at'))
 
@@ -190,7 +199,7 @@ class ResolveTests(unittest.TestCase):
     def test_unknown_number_is_polite(self):
         self.say_fixture()
         self.enterContext(self.delivered())
-        self.assertEqual(self.cli('show', '--n', '1'), (0, 'No stored draft for that item.\n'))
+        self.assertIn('Ask the owner', self.cli('show', '--n', '1')[1])
         self.clock += timedelta(hours=36)
         self.assertIsNone(resolve.key_for_number(2))
 

@@ -45,6 +45,7 @@ FIX = {
     "authority": "authority config malformed: run `hermes proactive setup` to write the approval levels again. "
                  "Until then every reminder, alarm and calendar block is refused.",
     "runtime": "Run `hermes proactive setup`: it installs or updates the runtime scripts and the desk contract.",
+    "say_receipts": "Check `hermes cron runs` and say_log.jsonl before repeating a notice; ambiguous sends are not replayed.",
 }
 
 
@@ -123,8 +124,7 @@ def check_bot_chat(home: Path) -> tuple[bool, str]:
 
 
 def check_say_job() -> tuple[bool, str]:
-    """The say job is recorded by setup, listed by `hermes cron list --all` as active, and delivers to Bot Chat
-    and nowhere else (cron.plugin_api.delivery_platforms; the job takes nothing otherwise)."""
+    """Check that setup recorded an active worker with the exact own-profile Bot Chat route."""
     import desk_say
     jid = desk_say.say_job_id()
     if not jid:
@@ -172,7 +172,14 @@ def report(send_test: bool = False) -> dict:
         say = check_say_job()
     except Exception as exc:
         say = (False, f"{type(exc).__name__}"[:80])
-    checks = {"gateway": gw, "bot_chat": bc, "say_job": say, "mobile": mob, "decisions": dec, "mail": mail,
+    try:
+        import desk_say
+        issues = desk_say.delivery_issues()
+        receipts = (not issues, ", ".join(issues))
+    except Exception as exc:
+        receipts = (False, f"receipt state unreadable ({type(exc).__name__})")
+    checks = {"gateway": gw, "bot_chat": bc, "say_job": say, "say_receipts": receipts,
+              "mobile": mob, "decisions": dec, "mail": mail,
               "authority": check_authority(), "runtime": check_runtime()}
     for name, (ok, note) in checks.items():
         row = {"ok": ok}
@@ -207,7 +214,9 @@ def send_test_message(wait_s: float = 60) -> dict:
             f"({time.strftime('%H:%M')})")   # a new text each run, so a second test is not a duplicate
     res = desk_say.deliver(text, key="proactive-hermes-test", job="setup", urgent=True)
     row = {"status": res.get("status"), "id": res.get("id")}
-    if res.get("status") != "handed":
+    if res.get("status") == "delivered":
+        return row
+    if res.get("status") not in {"handed", "accepted"}:
         row["reason"] = res.get("kick") or res.get("reason") or ""
         return row
     deadline = time.monotonic() + wait_s

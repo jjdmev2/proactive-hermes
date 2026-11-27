@@ -45,6 +45,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import os
 import re
 import sys
 import threading
@@ -132,6 +133,8 @@ def save_json(path: Path, data) -> None:
         tmp = Path(fh.name)
         try:
             fh.write(json.dumps(data, indent=1, ensure_ascii=False, sort_keys=True))
+            fh.flush()
+            os.fsync(fh.fileno())
             fh.close()
             tmp.replace(path)
         finally:
@@ -200,9 +203,20 @@ def in_quiet(t: datetime) -> bool:
 def normalize_item(it) -> dict | None:
     if not (isinstance(it, dict) and it.get("key") and it.get("text")):
         return None
-    return {**it, "key": str(it["key"]).strip()[:120],
-            "kind": str(it.get("kind") or "digest").strip().lower(),
-            "text": " ".join(str(it["text"]).split())[:400]}
+    text = it["text"]
+    if not isinstance(text, str):
+        return None
+    # `text` is the producer's one-line synopsis, not a source field. Do not relay
+    # raw fields, pasted blocks or an identifiable verbatim copy of a source field.
+    raw_fields = {"subject", "body", "html", "snippet", "web_text", "source_text", "raw_text", "raw"}
+    raw = [" ".join(it[field].split()).casefold() for field in raw_fields if isinstance(it.get(field), str)]
+    flat = " ".join(text.split())
+    if (len(text.splitlines()) > 1 or re.search(r"<[/!][a-z]", text, re.I)
+            or any(value and value in flat.casefold() for value in raw)):
+        flat = "Check the original source for details."
+    return {**{key: value for key, value in it.items() if key not in raw_fields},
+            "key": str(it["key"]).strip()[:120], "kind": str(it.get("kind") or "digest").strip().lower(),
+            "text": flat[:400]}
 
 
 def parse_items(raw: str) -> list[dict]:
@@ -254,18 +268,22 @@ def recent_said(cutoff: datetime) -> dict:
 
 
 _MESSAGE_URL = re.compile(
-    r"\bhttps?://[^\s<>()\[\]`*]+"
+    r"\b(?:[a-z][a-z0-9+.-]*://|mailto:|javascript:|data:)[^\s<>()\[\]`*]+"
     r"|(?<![\w.@-])(?:[a-z0-9-]+\.)+[a-z]{2,63}(?![\w-])"
-    r"(?::\d+)?(?:[/?#][^\s<>()\[\]`*]*)?",
-    re.IGNORECASE,
+    r"(?::\d+)?(?:[/?#][^\s<>()\[\]`*]*)?", re.IGNORECASE,
 )
+MAX_NOTICE_CHARS = 700
+
+
+def strip_message_urls(text: str) -> str:
+    # Keep sentence punctuation (and digest label colons) beside a link.
+    return _MESSAGE_URL.sub(lambda m: m[0][len(m[0].rstrip(".,!?;:")):], text)
 
 
 def _clean_message_text(text: str) -> str:
     text = re.sub(r"!?\[([^\]]*)\]\([^\s)]+\)", r"\1", text)
     text = re.sub(r"\*+|_{2,}|`+", "", text)
-    # Keep sentence punctuation (and digest label colons) beside a link.
-    text = _MESSAGE_URL.sub(lambda m: " " + m[0][len(m[0].rstrip(".,!?;:")):], text)
+    text = strip_message_urls(text)
     text = re.sub(r"#|\(\s*\)|<\s*>", "", text)
     text = re.sub(r"(?m)^[ \t]*(?:[>+•][ \t]+)+|(?<!\S)-+(?!\S)", " ", text)
     text = re.sub(r"\s*—\s*", ", ", text)
@@ -307,7 +325,8 @@ def render_parts(header: str | None, items: list[str], worth: list[str], more: i
     if count > 1:
         heading = heading or f"Hey {phconf.owner()}, {count} things:"
     caps = phconf.CFG["caps"]
-    line_chars = line_limit or caps["line_chars"]
+    total_chars = max(1, min(MAX_NOTICE_CHARS, caps["message_chars"]))
+    line_chars = min(line_limit or caps["line_chars"], total_chars)
     lines = []
     for i, text in enumerate(items, 1):
         base = _clean_message_text(text) or "Note"
@@ -339,9 +358,15 @@ def render_parts(header: str | None, items: list[str], worth: list[str], more: i
         if pending:
             body.append(f"+{pending} more lined up, coming next (or ask me)")
         message = "\n\n".join(part for part in ("\n".join(body), digest) if part)
-        if len(message) <= caps["message_chars"] or len(lines) <= 1:
+        if len(message) <= total_chars:
             return message, len(lines)
-        lines.pop()
+        if len(lines) > 1:
+            lines.pop()
+        elif digest:
+            digest = ""
+        else:
+            # A tiny custom cap should never truncate a reply number into a different one.
+            return _clip_message_item(lines[0] if lines else message, total_chars), len(lines)
 
 
 def is_resolvable(it: dict) -> bool:
@@ -393,6 +418,56 @@ def cmd_compose(a, raw: str | None = None) -> int:
     return compose(a, items)
 
 
+def _notice_key(ping: dict) -> str:
+    key = f"{ping['job']}:{','.join(ping['keys'])}"
+    if versions := ping.get("draft_versions"):
+        key += ":drafts:" + hashlib.sha256(json.dumps(versions, sort_keys=True).encode()).hexdigest()
+    return key
+
+
+def _commit_notice(ping, said, receipt) -> None:
+    updated = recent_said(now() - timedelta(days=30))
+    updated.update({key: row for key, row in said.items() if key not in updated
+                    or row.get("said_at", "") >= updated[key].get("said_at", "")})
+    save_json(SAID, updated)
+    mid = receipt.get("id")
+    if not mid or not any(row.get("say_id") == mid and row.get("text") == ping["text"] for row in read_lines(PING_LOG)):
+        append(PING_LOG, {**ping, "delivery": receipt.get("status"), "say_id": mid})
+
+
+def _urgent_path() -> Path:
+    return STATE / "urgent_enqueues.json"
+
+
+def retry_urgent() -> None:
+    """The */2 say job retries already-composed urgent notices without reading sources or kicking itself."""
+    path = _urgent_path()
+    if not path.exists():
+        return
+    import desk_say
+    with (STATE / "compose.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not path.exists():
+            return
+        waiting = json.loads(path.read_text(encoding="utf-8"))
+        closed = closed_keys()
+        for key, row in list(waiting.items()):
+            if closed.intersection(row["ping"]["keys"]):
+                del waiting[key]
+                continue
+            try:
+                ping = row["ping"]
+                receipt = desk_say.enqueue(ping["text"], key=key, job=ping["job"], urgent=True)
+                _commit_notice(ping, row["said"], receipt)
+            except OSError:
+                continue
+            del waiting[key]
+        if waiting:
+            save_json(path, waiting)
+        else:
+            path.unlink(missing_ok=True)
+
+
 def compose(a, items: list[dict], *, flush=False) -> int:
     print_only = getattr(a, "print_only", False)
     STATE.mkdir(parents=True, exist_ok=True)
@@ -409,9 +484,10 @@ def compose(a, items: list[dict], *, flush=False) -> int:
             last = last_ping_at()
             # Process timeouts first so a full ordinary queue cannot delay them another tick.
             overflow_allowed = not expired_wait and (last is None or t - last >= FLUSH_GAP)
-            eligible = bool(expired_wait)
+            held_ready = not in_quiet(t) and bool(read_lines(HELD))
+            eligible = held_ready or bool(expired_wait)
             if overflow_allowed and not in_quiet(t):
-                eligible = (any(resolution_for(it, t) for it in wait.values())
+                eligible = (eligible or any(resolution_for(it, t) for it in wait.values())
                             or any((it := normalize_item(row)) and it["kind"] in SPEAKING for row in read_lines(DIGEST)))
             if in_quiet(t) or not eligible:
                 if print_only:
@@ -429,18 +505,33 @@ def compose(a, items: list[dict], *, flush=False) -> int:
             # only a queued message is recorded as said. A failed enqueue rolls the items over for the next tick.
             sys.path.insert(0, str(HERE))
             import desk_say
+            key = _notice_key(ping)
+            waiting = load_json(_urgent_path(), {}) if urgent else {}
+            if urgent:
+                waiting[key] = {"ping": ping, "said": {k: said[k] for k in ping["keys"]}}
+                save_json(_urgent_path(), waiting)
             try:
-                receipt = desk_say.enqueue(message, key=f"{a.job}:{','.join(ping['keys'])}", job=a.job, urgent=urgent)
+                receipt = desk_say.enqueue(message, key=key, job=a.job, urgent=urgent)
             except Exception as exc:
-                for it in speak:
-                    append(DIGEST, {"at": ping["at"], "job": a.job, **it, "overflow": True,
-                                    "first_seen": it.get("first_seen") or it.get("at") or ping["at"]})
+                if not urgent:
+                    for it in speak:
+                        append(DIGEST, {"at": ping["at"], "job": a.job, **it, "overflow": True,
+                                        "first_seen": it.get("first_seen") or it.get("at") or ping["at"]})
                 append(RUN_LOG, {"at": ping["at"], "job": a.job, "error": f"enqueue failed: {type(exc).__name__}"[:200],
                                  "rolled_over": ping["keys"]})
                 print("[SILENT]")
                 return 1
-        save_json(SAID, said)
-        append(PING_LOG, {**ping, "delivery": receipt.get("status"), "say_id": receipt.get("id")})
+        if print_only:
+            save_json(SAID, said)
+            append(PING_LOG, {**ping, "delivery": "printed", "say_id": None})
+        else:
+            _commit_notice(ping, said, receipt)
+            if urgent:
+                del waiting[key]
+                if waiting:
+                    save_json(_urgent_path(), waiting)
+                else:
+                    _urgent_path().unlink(missing_ok=True)
     if not print_only and receipt.get("status") == "queued" and (urgent or not desk_say.quiet_now()):
         desk_say.kick()   # after the compose lock: the say job runs now; its schedule is the safety net
     print(message if print_only else "[SILENT]")
@@ -497,7 +588,7 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
     said = recent_said(t - timedelta(days=30))
     take_held = getattr(a, "take_held", False)
     attach_digest = getattr(a, "attach_digest", None)
-    if take_held:
+    if take_held and not in_quiet(t):
         keys = {i["key"] for i in items}
         items += [r for row in take(HELD) if (r := normalize_item(row)) and r["key"] not in keys]
     if getattr(a, "take_pending", False):
@@ -611,11 +702,15 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
             continue
         seen.add(identity)
         unique.append(it)
-    overflow = unique[cap:]
-    speak = unique[:cap]
+    if any(it.get("urgent") for it in unique):
+        urgent_items = [it for it in unique if it.get("urgent")]
+        overflow = urgent_items[cap:] + [it for it in unique if not it.get("urgent")]
+        speak = urgent_items[:cap]
+    else:
+        overflow, speak = unique[cap:], unique[:cap]
 
     # Attach FYIs only after a message is certain; untouched rows retain their order.
-    limit = (attach_digest or 0) if speak else 0
+    limit = (attach_digest or 0) if speak and not speak[0].get("urgent") else 0
     worth, remaining = [], []
     for row, item in digest_rows:
         if (len(worth) < limit and item and item["kind"] == "digest" and item["key"] not in keys
@@ -668,15 +763,16 @@ def prepare_compose(a, items, t, wait, expired_wait, overflow_allowed):
                            "kind": it["kind"], "text": it["text"], "job": a.job}
     drafts = {key: rec["status"] for key, rec in zip(keys_said, draft_rows) if rec is not None}
     ping = {"at": at, "kind": "desk_message", "job": a.job, "keys": keys_said,
-            "refs": [i.get("ref") for i in speak], "text": message, "drafts": drafts}
+            "refs": [i.get("ref") for i in speak], "text": message, "drafts": drafts,
+            "draft_versions": {key: ea_resolve.draft_version(rec) for key, rec in zip(keys_said, draft_rows) if rec}}
     # SAID is saved by compose() only after the message is queued, so a failed enqueue is retried, never silenced.
     return ping, any(i.get("urgent") for i in speak), said, speak
 
 
 def cmd_flush(a) -> int:
-    """Desk tick: release resolution timeouts immediately; ordinary overflow waits an hour.
-    Quiet hours hold both."""
-    args = argparse.Namespace(job="overflow", print_only=getattr(a, "print_only", False), brief=False)
+    """Desk tick: release held items after quiet hours; ordinary overflow waits an hour."""
+    args = argparse.Namespace(job="overflow", print_only=getattr(a, "print_only", False), brief=False,
+                              take_held=True)
     return compose(args, [], flush=True)
 
 

@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from hashlib import sha256
+from hashlib import file_digest, sha256
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -612,8 +612,11 @@ def _save_registry(reg: dict) -> None:
         tmp = Path(f.name)
         try:
             json.dump(reg, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
             f.close()
             tmp.replace(path)
+            _sync_dir(path.parent)
         finally:
             tmp.unlink(missing_ok=True)
 
@@ -761,10 +764,8 @@ def _plugin_ensure(name: str, **kwargs) -> dict:
 
 
 def _dormant_schedule() -> str:
-    """Yesterday at 03:00, once a year: in any time zone its next run is about a year away. An agent job is created
-    under it, then `hermes cron edit` gives it the real schedule (after a pause when the job it replaces was paused),
-    so a new job never runs before it has its final settings and state."""
-    day = time.localtime(time.time() - 86400)
+    """Use a wall-clock date a week in the past, safely behind every profile timezone."""
+    day = time.gmtime(time.time() - 7 * 86400)
     return f"0 3 {day.tm_mday} {day.tm_mon} *"
 
 
@@ -846,25 +847,135 @@ def _private_dir(path: Path) -> None:
         folder.chmod(0o700)
 
 
+def _sync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _history_fingerprint(path: Path) -> tuple[int, str]:
+    with path.open("rb") as fh:
+        before = os.fstat(fh.fileno())
+        digest = file_digest(fh, "sha256").hexdigest()
+        after = os.fstat(fh.fileno())
+    if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise RuntimeError(f"Run history changed while reading {path.name!r}; rerun setup.")
+    return after.st_size, digest
+
+
 def _keep_history(key: str, old: str) -> int:
-    """Copy the saved runs of the job OLD (which `hermes cron remove` is about to delete with its output folder) from
-    Hermes's cron/output/<old>/ into <plugin-data>/job-history/<job key>/<old>/. The copy is private (0700),
-    never overwrites, and is the only thing written; Hermes's own folder is only read. Returns the files copied."""
+    """Verify run output copies before the caller may remove the old cron job."""
     src = _output_dir(old)
-    if not src.is_dir() or src.is_symlink():
+    if src.is_symlink():
+        raise RuntimeError("Refusing symlinked cron output; the old job was not removed.")
+    if not src.exists():
         return 0
+    if not src.is_dir():
+        raise RuntimeError("Cron output is not a directory; the old job was not removed.")
     dst = _history_dir(key, old)
+
+    def sources():
+        result = {}
+        for path in sorted(src.rglob("*")):
+            if not path.is_symlink() and path.is_file():
+                result[path.relative_to(src)] = _history_fingerprint(path)
+        return result
+
+    manifest = sources()
     copied = 0
-    for path in sorted(src.rglob("*")):
-        if path.is_symlink() or not path.is_file():
-            continue
-        target = dst / path.relative_to(src)
-        if target.exists():
-            continue
+    for relative, expected in manifest.items():
+        target = dst / relative
         _private_dir(target.parent)
-        shutil.copy2(path, target)
+        if target.is_symlink():
+            raise RuntimeError(f"Refusing symlinked run history {target.name!r}.")
+        if target.is_file() and _history_fingerprint(target) == expected:
+            continue
+        with NamedTemporaryFile(dir=target.parent, prefix=".run-", delete=False) as out:
+            tmp = Path(out.name)
+            try:
+                with (src / relative).open("rb") as inp:
+                    shutil.copyfileobj(inp, out)
+                out.flush()
+                os.fsync(out.fileno())
+                if _history_fingerprint(tmp) != expected:
+                    raise RuntimeError(f"Run history copy mismatch for {target.name!r}; old job kept.")
+                tmp.replace(target)
+                _sync_dir(target.parent)
+            finally:
+                tmp.unlink(missing_ok=True)
         copied += 1
+    if manifest != sources() or any(_history_fingerprint(dst / rel) != sig for rel, sig in manifest.items()):
+        raise RuntimeError("Run history changed or failed verification; old job kept. Rerun setup.")
     return copied
+
+
+CREATING = "creating"
+
+
+def _finish_create(run, ensure, reg: dict, key: str, fields: dict, entry: dict) -> str:
+    """Stage with a unique durable name, recover the ID and publish ownership before arming."""
+    pending = reg.setdefault(CREATING, {})
+    if key not in pending:
+        pending[key] = {"temp": f"{fields['name']} (setup {os.urandom(8).hex()})"}
+        _save_registry(reg)
+    record = pending[key]
+    jid = record.get("new")
+    states = _job_states(run)
+    if jid not in states:
+        matches = _temp_jobs(run, record)
+        if len(matches) > 1:
+            raise RuntimeError(f"Multiple staged jobs for {fields['name']!r}; no job activated.")
+        if matches:
+            jid = matches[0]
+        else:
+            stage = {**fields, "name": record["temp"], "deliver": "local", "prompt": "",
+                     "schedule": _dormant_schedule()}
+            toolsets = fields.get("enabled_toolsets")
+            if toolsets is None:
+                jid = _created_job_id(_cron(run, "create", *_options(stage, edit=False), "--",
+                                            stage["schedule"], stage["prompt"]))
+            else:
+                job = (ensure or _plugin_ensure)(stage["name"], prompt="Staged setup job. Return [SILENT].",
+                                                schedule=stage["schedule"],
+                                                deliver="local", enabled_toolsets=list(toolsets),
+                                                home=str(phconf.hermes_home()))
+                jid = job.get("id") if isinstance(job, dict) else None
+                if (not isinstance(jid, str) or not re.fullmatch(_JOB_ID, jid) or job.get("name") != stage["name"]
+                        or list(job.get("enabled_toolsets") or []) != list(toolsets)):
+                    raise RuntimeError(f"Cron returned a job setup did not create for {fields['name']!r}.")
+        record["new"] = jid
+        _save_registry(reg)
+    if _job_id(reg.get(key)) != jid:
+        if _job_states(run).get(jid) != "paused":
+            _pause(run, jid)
+        reg[key] = {"id": jid}
+        _save_registry(reg)   # the job can only become a real worker after this durable write
+    _edit(run, jid, fields)
+    if _job_states(run).get(jid) == "paused":
+        _resume(run, jid)
+    reg[key] = {"id": jid, **entry}
+    del pending[key]
+    if not pending:
+        del reg[CREATING]
+    _save_registry(reg)
+    return jid
+
+
+def _remove_staged(run, reg: dict, key: str) -> None:
+    pending = reg[CREATING]
+    record = pending[key]
+    states = _job_states(run)
+    targets = ({record["new"]} if record.get("new") else set()) | set(_temp_jobs(run, record))
+    for jid in targets & states.keys():
+        _remove(run, jid)
+    if _job_id(reg.get(key)) in targets:
+        reg.pop(key, None)
+    del pending[key]
+    if not pending:
+        del reg[CREATING]
+    _save_registry(reg)
 
 
 REPLACING = "replacing"   # registry record of a job swap in progress: {job key: {old, was_active, temp, new}}
@@ -948,7 +1059,7 @@ def _recover_swaps(run, reg: dict) -> int:
                     _remove(run, old)
             except Exception as exc:
                 raise RuntimeError(f"An earlier setup run replaced {key} with job {new} but the old job {old} is "
-                                   f"still there: run `hermes cron remove {old}`. ({exc})") from exc
+                                   f"still there: rerun setup after resolving the history or cron error. ({exc})") from exc
             print(f"Setup: finished an interrupted job swap for {key}: the old job {old} is removed.")
         else:
             removed = _undo_swap(run, record)
@@ -1017,6 +1128,12 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure) -> list[dict]:
         kept_runs += _recover_swaps(run, reg)   # an interrupted swap is settled first; nothing below guesses its state
     states = _job_states(run) if reg else {}
     live = set(states)
+    if not dry_run and CREATING in reg:
+        wanted = {j["key"] for j in JOBS + [watch_job(w) for w in cfg.get("watches", [])] if enabled(cfg, j)}
+        for key in set(reg[CREATING]) - wanted:
+            _remove_staged(run, reg, key)
+        states = _job_states(run)
+        live = set(states)
     out = []
     if not dry_run:
         install_runtime(cfg)
@@ -1053,11 +1170,10 @@ def _apply(cfg: dict, dry_run: bool, *, run, ensure) -> list[dict]:
         if enabled(cfg, job):
             record = {"toolsets": toolsets} if toolsets is not None else {}
             same_toolsets = toolsets is None or (isinstance(entry, dict) and entry.get("toolsets") == toolsets)
-            if jid not in live:
+            if jid not in live or key in reg.get(CREATING, {}):
                 action = "create"
                 if not dry_run:
-                    reg[key] = {"id": _create(run, ensure, fields), "spec": spec, **record}
-                    _save_registry(reg)
+                    _finish_create(run, ensure, reg, key, fields, {"spec": spec, **record})
             elif isinstance(entry, dict) and entry.get("spec") == spec and same_toolsets:
                 action = "keep"
             elif same_toolsets:
@@ -1121,8 +1237,11 @@ def remove_all(*, run=subprocess.run) -> list[str]:
 
 def _remove_all(run) -> list[str]:
     reg = _load_registry()
-    live = _list_job_ids(run) if reg else set()
     gone = []
+    for key in list(reg.get(CREATING, {})):
+        _remove_staged(run, reg, key)
+        gone.append(key)
+    live = _list_job_ids(run) if reg else set()
     # A swap an interrupted setup left: the half-made and the replaced job are the plugin's own too.
     pending = reg.get(REPLACING) if isinstance(reg.get(REPLACING), dict) else {}
     recorded = {_job_id(entry) for key, entry in reg.items() if key != REPLACING}

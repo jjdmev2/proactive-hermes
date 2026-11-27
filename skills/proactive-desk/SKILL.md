@@ -19,7 +19,7 @@ A desk message arrives as a scheduled turn from the job "Proactive · say". Repl
 
 A line ending in "Draft ready, reply N." means the desk already searched mail, Slack, past chats and its own records and stored a draft. When the owner answers with that number, "draft" or "show me":
 
-1. Run `python3 <scripts>/ea_resolve.py show --n N` (N counts in the latest desk message with a draft that reached the owner). If it says it is not sure which message the number belongs to, ask the owner which item they mean; never guess. If they answer an older message, find its key with `python3 <scripts>/ea_resolve.py list` and run `show --key K`.
+1. Run `python3 <scripts>/ea_resolve.py show --n N`. It uses the latest confirmed numbered notice in Bot Chat order and only the draft version the notice referenced. If the script asks you to clarify, ask which item the owner means; never guess. For an explicitly named older item, find its key with `python3 <scripts>/ea_resolve.py list` and use `show --key K`; say when you are showing a newer draft and ask for fresh approval.
 2. Paste the output exactly: recipient, thread, draft, open points, sources.
 3. Ask "Send as is?".
 4. Send only after a yes to that exact text, through the account and thread shown. Then write the sent message's ref to a file with the write_file tool and run `ea_resolve.py mark --key K --sent-file <file>` and, for a promise, `ea_promises.py close --key K --evidence-file <file>`.

@@ -157,7 +157,7 @@ class ResolveHealthTests(unittest.TestCase):
                 patch.object(desk_say, "_settled_ids", side_effect=[set(), {"m"}, {"m"}]), \
                 patch.object(desk_say.subprocess, "Popen") as popen, patch.dict("os.environ", DESK_SAY_DISABLE_DOOR=""):
             popen.return_value.wait.return_value = 0
-            with patch.object(desk_say, "pending_due", side_effect=[1, 1, 0]):
+            with patch.object(desk_say, "pending_due", side_effect=[1, 1, 0, 0]):
                 self.assertEqual(health.kick_say(), {"kick": "ok", "runs": 1})
         argv = popen.call_args.args[0]
         self.assertEqual(argv[1:], ["cron", "run", "0123456789ab"])
@@ -179,18 +179,20 @@ class ResolveHealthTests(unittest.TestCase):
         self.enterContext(patch.multiple(desk_say, SAY_LOG=log, OUTBOX=health.STATE_DIR / "say_outbox.jsonl",
                                          STATE=health.STATE_DIR, STATUS_LOG=health.STATE_DIR / "say_status.json"))
         self.enterContext(patch.object(desk_say, "confirm", return_value=0))
+        self.enterContext(patch.object(desk_say, "route_problem", return_value=None))
+        self.enterContext(patch.object(desk_say.time, "time", return_value=self.clock.timestamp()))
         return log, desk_say
 
     def test_handed_message_without_a_seen_reply_is_reported_after_15_minutes(self):
         log, _ = self._say_log()
-        self.append(log, {"id": "old", "status": "handed", "text": "x", "at": (self.clock - timedelta(minutes=16)).isoformat()})
-        self.append(log, {"id": "new", "status": "handed", "text": "y", "at": (self.clock - timedelta(minutes=2)).isoformat()})
+        self.append(log, {"id": "old", "status": "handed", "text": "x", "epoch": (self.clock - timedelta(minutes=16)).timestamp()})
+        self.append(log, {"id": "new", "status": "handed", "text": "y", "epoch": (self.clock - timedelta(minutes=2)).timestamp()})
         self.append(log, {"id": "ok", "status": "handed", "text": "z", "at": (self.clock - timedelta(hours=1)).isoformat()})
         self.append(log, {"id": "ok", "status": "delivered", "at": self.clock.isoformat()})
         health.check_say_receipts()
-        self.assertEqual(list(health.faults.values()), [("desk", "1 desk message(s) with an unclear post, check say_log")])
+        self.assertEqual(list(health.faults.values()), [("relay", "desk delivery unresolved: 1 handed; see say_log.jsonl")])
 
-    def test_an_unverified_message_is_reported_for_a_day_then_clears(self):
+    def test_an_unverified_message_stays_visible_until_reviewed(self):
         log, _ = self._say_log()
         self.append(log, {"id": "u", "status": "handed", "text": "x", "at": (self.clock - timedelta(hours=30)).isoformat()})
         self.append(log, {"id": "u", "status": "unverified", "at": (self.clock - timedelta(hours=6)).isoformat()})
@@ -199,7 +201,7 @@ class ResolveHealthTests(unittest.TestCase):
         health.faults.clear()
         with patch.object(health, "now", return_value=self.clock + timedelta(hours=19)):
             health.check_say_receipts()
-        self.assertEqual(health.faults, {})
+        self.assertIn("unverified", next(iter(health.faults.values()))[1])
 
     def test_a_say_job_that_held_messages_for_its_route_is_reported(self):
         _, desk_say = self._say_log()
@@ -207,7 +209,22 @@ class ResolveHealthTests(unittest.TestCase):
                                                    "route_problem": "say job delivers to local, not Bot Chat"}))
         health.check_say_receipts()
         self.assertEqual(list(health.faults.values()),
-                         [("desk", "desk messages held: say job delivers to local, not Bot Chat")])
+                         [("relay", "desk messages held: say job delivers to local, not Bot Chat")])
+
+    def test_delivery_fault_uses_local_failure_output_not_the_say_job(self):
+        import io
+        from contextlib import redirect_stderr
+        import desk_say
+        stubs = dict.fromkeys(("check_local_delivery", "check_jobs", "check_contract", "check_say_outbox"), DEFAULT)
+        def receipt_check():
+            health.fault("relay", "desk delivery unresolved: 1 handed")
+        stderr = io.StringIO()
+        with patch.multiple(health, **stubs), patch.object(health, "load_jobs", return_value=[]), \
+                patch.object(health, "check_say_receipts", side_effect=receipt_check), \
+                patch.object(desk_say, "deliver") as send, redirect_stderr(stderr):
+            self.assertEqual(health.main(), 1)
+        send.assert_not_called()
+        self.assertIn("1 handed", stderr.getvalue())
 
     def test_main_runs_resolve_step_without_other_health_effects(self):
         self.run_row("a", "b", "c")
