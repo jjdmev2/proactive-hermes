@@ -11,6 +11,7 @@ When plugin CLI registration is disabled, run the same subcommands with `python3
 """
 from __future__ import annotations
 
+from hashlib import sha256
 import json
 import sys
 from pathlib import Path
@@ -327,12 +328,17 @@ def write_config(cfg: dict) -> Path:
     return p
 
 
+_WATCH_ACTIONS = ("tell", "reminder", "alarm", "draft", "act")
+
+
 def setup_parser(parser) -> None:
     sub = parser.add_subparsers(dest="proactive_command", metavar="<command>")
     s = sub.add_parser("setup", help="Set up or update Proactive Hermes")
     s.add_argument("--preset", choices=["juan", "custom"], help="juan = Juan's setup, custom = your own")
     s.add_argument("--answers", help="JSON file of answers (keys like owner.name, timezone, slack.channels)")
-    s.add_argument("--dry-run", action="store_true", help="show the jobs, change nothing")
+    mode = s.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="show the jobs and saved watch fingerprint, change nothing")
+    mode.add_argument("--expect-watches", metavar="FINGERPRINT", help="apply only if saved watches match this preview")
     sub.add_parser("status", help="Show config and the jobs this plugin owns")
     sub.add_parser("remove", help="Remove every job this plugin created")
     sub.add_parser("questions", help="Print the setup questions as JSON (for the setup skill)")
@@ -345,11 +351,61 @@ def setup_parser(parser) -> None:
     add.add_argument("--schedule", required=True, help="Five-field cron expression")
     add.add_argument("--check", required=True)
     add.add_argument("--when", required=True)
-    add.add_argument("--then", required=True, choices=("tell", "reminder", "alarm", "draft", "act"))
+    add.add_argument("--then", required=True, choices=_WATCH_ACTIONS)
     add.add_argument("--act", help="Exact action, required with --then act")
     add.add_argument("--urgent", action="store_true")
     watch_sub.add_parser("list", help="List watches and their conditions")
     watch_sub.add_parser("remove", help="Remove a watch and its managed job").add_argument("--name", required=True)
+
+
+def _validate_watch_name(name) -> None:
+    if not isinstance(name, str) or not name.strip() or not name.isprintable():
+        raise ValueError("--name must be a nonblank, single-line name")
+
+
+def _validate_watch(watch: dict, jobs) -> str:
+    name = watch.get("name")
+    _validate_watch_name(name)
+    for field in ("check", "when"):
+        value = watch.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"--{field} must not be blank and must be a string")
+    then, act = watch.get("then"), watch.get("act")
+    if then not in _WATCH_ACTIONS:
+        raise ValueError(f"--then must be one of {', '.join(_WATCH_ACTIONS)}")
+    if then == "act" and (not isinstance(act, str) or not act.strip()):
+        raise ValueError("--then act requires an exact action in --act")
+    if then != "act" and act is not None:
+        raise ValueError("--act is only valid with --then act")
+    schedule = watch.get("schedule")
+    if not isinstance(schedule, str):
+        raise ValueError("--schedule must be a five-field cron expression")
+    jobs.validate_watch_schedule(schedule)
+    return jobs.watch_id(name)
+
+
+def _validate_watches(watches, jobs) -> None:
+    if not isinstance(watches, list):
+        raise ValueError("watches must be a list")
+    names, slugs = set(), {}
+    for index, watch in enumerate(watches, 1):
+        if not isinstance(watch, dict):
+            raise ValueError(f"watches[{index}] must be an object")
+        name = watch.get("name")
+        try:
+            slug = _validate_watch(watch, jobs)
+            if name in names:
+                raise ValueError("duplicate name")
+            if slug in slugs:
+                raise ValueError(f"same slug as {slugs[slug]!r}; choose a distinct name")
+        except ValueError as exc:
+            raise ValueError(f"watches[{index}] ({name!r}): {exc}") from exc
+        names.add(name)
+        slugs[slug] = name
+
+
+def _watches_fingerprint(watches: list) -> str:
+    return sha256(json.dumps(watches, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _watch_recorded(name, reg, jobs) -> bool:
@@ -381,8 +437,7 @@ def _change_watch(args, jobs) -> int:
     watches = cfg["watches"]
     name = args.name
     try:
-        if not name.strip() or not name.isprintable():
-            raise ValueError("--name must be a nonblank, single-line name")
+        _validate_watch_name(name)
         existing = next((watch for watch in watches if watch["name"] == name), None)
         reg = jobs._load_registry()
         if args.watch_command == "remove" and existing is None and not _watch_recorded(name, reg, jobs):
@@ -391,21 +446,15 @@ def _change_watch(args, jobs) -> int:
         # A cleanup journal is not a current managed-job registration.
         installed = any(isinstance(jid := jobs._job_id(entry), str) and jid for entry in reg.values())
         if args.watch_command == "add":
-            if not args.check.strip() or not args.when.strip():
-                raise ValueError("--check and --when must not be blank")
-            if args.then == "act" and not (args.act or "").strip():
-                raise ValueError("--then act requires an exact action in --act")
-            if args.then != "act" and args.act is not None:
-                raise ValueError("--act is only valid with --then act")
-            jobs.validate_watch_schedule(args.schedule)
             watch = {"name": name, "schedule": args.schedule, "check": args.check,
                      "when": args.when, "then": args.then, "urgent": args.urgent}
             if args.act is not None:
                 watch["act"] = args.act
+            slug = _validate_watch(watch, jobs)
             if existing is not None and existing != watch:
                 raise ValueError(f"watch {name!r} already exists; remove it before changing it")
             if existing is None:
-                if any(jobs.watch_id(w["name"]) == jobs.watch_id(name) for w in watches):
+                if any(jobs.watch_id(w["name"]) == slug for w in watches):
                     raise ValueError("another watch name has the same slug; choose a distinct name")
                 watches.append(watch)
         elif existing is not None:
@@ -514,8 +563,8 @@ def handle(args) -> int:
         try:
             answers = json.loads(Path(args.answers).read_text())
             explicit_watches = "watches" in answers
-            if explicit_watches and not isinstance(answers["watches"], list):
-                raise ValueError("watches must be a list")
+            if explicit_watches:
+                _validate_watches(answers["watches"], jobs)
             cfg = apply_answers(cfg, answers)
         except (OSError, ValueError, KeyError) as exc:
             print(f"Setup answers: {exc}", file=sys.stderr)
@@ -535,6 +584,7 @@ def handle(args) -> int:
         for row in rows:
             if row["action"] not in ("keep", "skip"):
                 print(f"  would {row['action']}: {row['job']}  {row['schedule']}  ({row['timezone']})")
+        print(f"Watches fingerprint: {_watches_fingerprint(preview_watches)}")
         return 0
     try:
         jobs.preflight()       # the public cron API, before config.json is written: a refusal changes nothing
@@ -555,6 +605,10 @@ def handle(args) -> int:
     try:
         with jobs.registry_lock():   # one setup, remove or watch change at a time: config.json and the jobs together
             current_watches = phconf.load()["watches"]
+            expected = getattr(args, "expect_watches", None)
+            if expected is not None and expected != _watches_fingerprint(current_watches):
+                print("Setup: watches changed since preview; run setup --dry-run again before applying.", file=sys.stderr)
+                return 1
             if not explicit_watches:
                 cfg["watches"] = current_watches
             elif current_watches != preview_watches and current_watches != cfg["watches"]:

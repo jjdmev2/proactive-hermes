@@ -93,7 +93,13 @@ Write the answers to a JSON file in the scratch dir, using the question keys (fo
 hermes proactive setup --preset juan|custom --answers <file> --dry-run
 ```
 
-Show the job list in plain words (what arrives when). On their OK run the same command without `--dry-run`, then `hermes proactive status`, then `hermes proactive doctor --send-test` and ask: "Did the test message show up here and on your phone?" If not, walk through the doctor's fixes.
+Show the job list in plain words (what arrives when) and keep the value from the `Watches fingerprint:` line. On their OK, apply the same answers with:
+
+```
+hermes proactive setup --preset juan|custom --answers <file> --expect-watches <fingerprint>
+```
+
+If watches changed since the preview, run `--dry-run` again and show the updated plan before asking for approval. After a successful apply, run `hermes proactive status`, then `hermes proactive doctor --send-test` and ask: "Did the test message show up here and on your phone?" If not, walk through the doctor's fixes.
 
 ## If `hermes proactive` is not found
 

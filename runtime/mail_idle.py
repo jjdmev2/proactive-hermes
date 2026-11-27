@@ -992,7 +992,7 @@ def _next(reason: str, n: int, every: str = "15 min checks") -> str:
 
 def push_report(cfg: dict | None = None, *, now: datetime | None = None, path: Path | None = None,
                 settings: dict | None = None, secret=None) -> dict[str, dict]:
-    """One row per mailbox: instant push, scheduled checks, or not scheduled, with next steps as needed.
+    """One row per mailbox with the current mode and the next step, if any.
     Rows are named "Mailbox N (domain)" for the slots, never by address; the radar's other mailboxes get one
     row each ("himalaya account <name>", "Gmail API"). Passwords are only checked for presence."""
     cfg = cfg or phconf.CFG
@@ -1002,16 +1002,25 @@ def push_report(cfg: dict | None = None, *, now: datetime | None = None, path: P
     mail = cfg.get("mail") or {}
     himalaya = [name for acc in (mail.get("himalaya_accounts") or [])
                 if (name := str((acc.get("account") if isinstance(acc, dict) else acc) or "").strip())]
-    if not radar_job_id():
+    feats = cfg.get("features") or {}
+    jid = radar_job_id()
+    state = (radar_job_state(jid) or {}).get("state") if jid else None
+    radar_status = None
+    if state == "paused":
+        radar_status = {"mode": "paused", "next": f"To resume mail checks, run `hermes cron resume {jid}`."}
+    elif feats.get("mail_radar") is False:
+        reg = ph_jobs.read_registry(phconf.data_dir() / "jobs.json")
+        if jid or any(ph_jobs.recorded_job_id(reg, key, allow_pending=True) for key in reg):
+            radar_status = {"mode": "off", "next": "Mail radar is off; enable it in `hermes proactive setup`."}
+    if radar_status is not None or not jid:
         keys = [*labels.values(), *(f"himalaya account {name}" for name in himalaya)]
         if mail.get("gmail_api"):
             keys.append("Gmail API")
-        return {key: {"mode": "not scheduled", "next": "Run `hermes proactive setup`."}
+        return {key: dict(radar_status or {"mode": "not scheduled", "next": "Run `hermes proactive setup`."})
                 for key in keys or ["all"]}
     now = now or datetime.now(timezone.utc)
     every = radar_every(cfg)
     out: dict[str, dict] = {}
-    feats = cfg.get("features") or {}
     push_on = feats.get("mail_push", True) and feats.get("mail_radar", True)
     try:
         beat = json.loads((path or heartbeat_path()).read_text())

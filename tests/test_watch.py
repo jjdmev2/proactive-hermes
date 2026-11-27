@@ -9,6 +9,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import re
 from socketserver import StreamRequestHandler, TCPServer
 from tempfile import TemporaryDirectory
 import threading
@@ -75,10 +76,73 @@ class SetupAnswersWatchTests(WatchFixture):
     watch = {"name": "Card drop", "schedule": "*/30 * * * *", "check": "shop page",
              "when": "preorders open", "then": "tell"}
 
-    def setup_answers(self, **answers):
+    def setup_answers(self, *options, **answers):
         path = self.home / "answers.json"
         path.write_text(json.dumps({"decisions.enabled": "n", **answers}))
-        return self.command(["setup", "--preset", "custom", "--answers", str(path)])
+        return self.command(["setup", "--preset", "custom", "--answers", str(path), *options])
+
+    def test_explicit_watch_validation_precedes_preview_and_mutation(self):
+        cases = (
+            (None, "must be an object"),
+            ({**self.watch, "name": "\n"}, "--name"),
+            ({**self.watch, "schedule": 15}, "--schedule"),
+            ({**self.watch, "schedule": "in 15m"}, "--schedule"),
+            ({**self.watch, "check": ""}, "--check"),
+            ({k: v for k, v in self.watch.items() if k != "when"}, "--when"),
+            ({**self.watch, "then": "email"}, "--then"),
+            ({**self.watch, "then": "act", "act": " "}, "--act"),
+            ({**self.watch, "act": "send"}, "--act"),
+        )
+        for options in ((), ("--dry-run",)):
+            for invalid, detail in cases:
+                with self.subTest(options=options, invalid=invalid):
+                    rc, output = self.setup_answers(*options, watches=[{**self.watch, "name": "First"}, invalid])
+                    self.assertEqual(rc, 2, output)
+                    self.assertIn("watches[2]", output)
+                    self.assertIn(detail, output)
+                    self.assertEqual(set(self.home.iterdir()), {self.home / "answers.json"})
+                    self.assertEqual(self.cron.calls, [])
+
+    def test_explicit_watch_rejects_duplicate_names_and_slugs(self):
+        for options in ((), ("--dry-run",)):
+            for name, detail in (("Card drop", "duplicate name"), ("Card-drop", "same slug")):
+                with self.subTest(options=options, name=name):
+                    rc, output = self.setup_answers(*options, watches=[self.watch, {**self.watch, "name": name}])
+                    self.assertEqual(rc, 2, output)
+                    self.assertIn(detail, output)
+                    self.assertIn(repr(name), output)
+                    self.assertEqual(set(self.home.iterdir()), {self.home / "answers.json"})
+                    self.assertEqual(self.cron.calls, [])
+
+    def preview_fingerprint(self, **answers):
+        rc, output = self.setup_answers("--dry-run", **answers)
+        self.assertEqual(rc, 0, output)
+        match = re.search(r"^Watches fingerprint: ([a-f0-9]{64})$", output, re.MULTILINE)
+        assert match is not None, output
+        return match.group(1)
+
+    def test_preview_fingerprints_saved_not_proposed_watches(self):
+        self.assert_setup_ok(watches=[self.watch])
+        fingerprint = self.preview_fingerprint(watches=[])
+        self.assertEqual(fingerprint, self.preview_fingerprint())
+        rc, output = self.setup_answers("--expect-watches", fingerprint, watches=[])
+        self.assertEqual(rc, 0, output)
+        self.assert_watches([])
+        self.assertNotEqual(fingerprint, self.preview_fingerprint())
+
+    def test_apply_rejects_stale_fingerprint_even_with_no_explicit_watches(self):
+        self.assert_setup_ok()
+        fingerprint = self.preview_fingerprint(watches=[])
+        self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
+        before = self.config.read_bytes(), self.registry.read_bytes(), self.cron.live.copy()
+        self.cron.calls.clear()
+        for answers in ({"watches": []}, {}, {"watches": cli.phconf.load()["watches"]}):
+            with self.subTest(answers=answers):
+                rc, output = self.setup_answers("--expect-watches", fingerprint, **answers)
+                self.assertEqual(rc, 1, output)
+                self.assertIn("watches changed since preview", output)
+                self.assertEqual((self.config.read_bytes(), self.registry.read_bytes(), self.cron.live), before)
+                self.assertEqual(self.cron.calls, [])
 
     def assert_setup_ok(self, **answers):
         rc, output = self.setup_answers(**answers)
@@ -138,13 +202,15 @@ class SetupAnswersWatchTests(WatchFixture):
 class UninstalledWatchTests(WatchFixture):
     def test_staged_watch_does_not_start_mail_push_until_setup(self):
         commands = []
-        first_idle = None
+        first_attempt = None
         idling = threading.Event()
 
         class ImapStub(StreamRequestHandler):
             def handle(self):
-                nonlocal first_idle
+                nonlocal first_attempt
                 connection_commands = []
+                if first_attempt is None:
+                    first_attempt = connection_commands
                 self.request.settimeout(6)
                 self.wfile.write(b"* OK fixture IMAP ready\r\n")
                 for line in self.rfile:
@@ -152,8 +218,6 @@ class UninstalledWatchTests(WatchFixture):
                     commands.append(command)
                     connection_commands.append(command)
                     if command == b"IDLE":
-                        if first_idle is None:
-                            first_idle = tuple(connection_commands)
                         self.wfile.write(b"+ idling\r\n")
                         idling.set()
                         return
@@ -204,8 +268,8 @@ class UninstalledWatchTests(WatchFixture):
                 self.assertEqual(mail_idle.start_in_gateway(ctx, gateway=True, secret=credentials), "started")
                 self.assertTrue(idling.wait(5), commands)
                 # Some versions of imaplib issue their own CAPABILITY right after LOGIN.
-                self.assertIn(first_idle, ((b"CAPABILITY", b"LOGIN", b"CAPABILITY", b"EXAMINE", b"IDLE"),
-                                           (b"CAPABILITY", b"LOGIN", b"CAPABILITY", b"CAPABILITY", b"EXAMINE", b"IDLE")))
+                self.assertIn(tuple(first_attempt or ()), ((b"CAPABILITY", b"LOGIN", b"CAPABILITY", b"EXAMINE", b"IDLE"),
+                                                           (b"CAPABILITY", b"LOGIN", b"CAPABILITY", b"CAPABILITY", b"EXAMINE", b"IDLE")))
                 credentials.assert_called_once_with("PROACTIVE_MAIL_1_PASSWORD")
             finally:
                 mail_idle.stop_service()

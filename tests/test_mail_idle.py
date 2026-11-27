@@ -522,6 +522,35 @@ class DoctorTests(Base):
         self.registry = phconf.data_dir() / "jobs.json"
         self.registry.parent.mkdir(parents=True)
         self.registry.write_text(json.dumps({"mail_radar": "abcdef012345"}))
+        self.cron_list = self.enterContext(patch.object(mi, "_cron_list", return_value="  abcdef012345 [active]"))
+
+    def test_registered_paused_radar_does_not_claim_push_or_scheduled_checks(self):
+        self.cron_list.return_value = "  123456abcdef [active]\n  abcdef012345 [paused]\n"
+        cfg = phconf.load()
+        cfg["mail"]["gmail_api"] = True
+        now = datetime(2026, 11, 25, 12, tzinfo=timezone.utc)
+        hb = self.tmp / "hb.json"
+        hb.write_text(json.dumps({"updated": now.isoformat(), "accounts": {"acct#1": {"state": "idle"}}}))
+        rep = mi.push_report(cfg, now=now, path=hb)
+        for key in ("Mailbox 1 (gmail.com)", "Gmail API", "himalaya account icloud"):
+            self.assertEqual(rep[key]["mode"], "paused")
+        self.cron_list.assert_called_once()
+
+    def test_radar_off_requires_an_installed_desk(self):
+        cfg = phconf.load()
+        cfg["features"]["mail_radar"] = False
+        for registry, expected in (
+            ({"say": {"id": "123456abcdef"}},
+             {"mode": "off", "next": "Mail radar is off; enable it in `hermes proactive setup`."}),
+            ({"replacing": {"say": {"old": "123456abcdef"}}},
+             {"mode": "not scheduled", "next": "Run `hermes proactive setup`."}),
+        ):
+            with self.subTest(registry=registry):
+                self.registry.write_text(json.dumps(registry))
+                report = mi.push_report(cfg)
+                self.assertEqual(report["Mailbox 1 (gmail.com)"], expected)
+                self.assertEqual(report["himalaya account icloud"], expected)
+        self.cron_list.assert_not_called()
 
     def test_no_registered_radar_reports_mail_not_scheduled(self):
         self.registry.write_text(json.dumps({"say": "123456abcdef"}))
