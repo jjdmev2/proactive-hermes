@@ -160,7 +160,7 @@ Cleanup is its own approval, `cleanup`. The desk ticks off its own phone reminde
 
 ### Add your own watches
 
-Tell Hermes in chat ("watch the Luma page for the AI meetup and tell me when registration opens") and it sets one up, or add it yourself:
+Ask Hermes in chat ("watch the Luma page for the AI meetup and tell me when registration opens"), or add the watch yourself. If the desk isn't installed, the watch is saved but won't run until you run `hermes proactive setup`. Hermes tells you if it was only saved.
 
 ```bash
 hermes proactive watch add --name "Card drop" --schedule "*/15 * * * *" \

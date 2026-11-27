@@ -370,6 +370,12 @@ class FakeCtx:
 
 
 class GatewayStartTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.registry = phconf.data_dir() / "jobs.json"
+        self.registry.parent.mkdir(parents=True)
+        self.registry.write_text(json.dumps({"mail_radar": "abcdef012345"}))
+
     def tearDown(self):
         mi.stop_service()
 
@@ -381,8 +387,10 @@ class GatewayStartTests(Base):
     def test_not_set_up_or_disabled_never_starts(self):
         ctx = FakeCtx()
         self.config.unlink()
+        self.registry.unlink()
         self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "not set up")
         self.config.write_text("{}")
+        self.registry.write_text(json.dumps({"mail_radar": "abcdef012345"}))
         with patch.object(mi, "plugin_settings", return_value={}):
             self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "no mailboxes")   # no slot filled
         cfg = phconf.load()
@@ -390,6 +398,20 @@ class GatewayStartTests(Base):
         with patch.object(phconf, "CFG", cfg):
             self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "disabled")
         self.assertIsNone(mi._SERVICE)
+
+    def test_start_requires_current_radar_not_just_any_registered_job(self):
+        ctx = FakeCtx()
+        jid = "abcdef012345"
+        reg = {"say": "0123456789ab", "replacing": {"mail_radar": {"old": "123456abcdef", "new": jid}}}
+        self.registry.write_text(json.dumps(reg))
+        with patch.object(mi.Service, "run_forever"):
+            self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "not set up")
+            phconf.secret.assert_not_called()
+            self.assertIsNone(mi._SERVICE)
+            # Published, armed replacement; only the old job's history cleanup remains.
+            reg["mail_radar"] = {"id": jid, "spec": {"name": "Proactive mail radar"}}
+            self.registry.write_text(json.dumps(reg))
+            self.assertEqual(mi.start_in_gateway(ctx, gateway=True), "started")
 
     def test_passwords_are_read_at_start_not_in_the_imap_threads(self):
         ctx = FakeCtx()

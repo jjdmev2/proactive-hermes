@@ -42,7 +42,7 @@ hermes proactive watch add --name '<short name>' --schedule '<cron>' --check '<w
 
 Write these values yourself from the owner's words, in single quotes, without any `'`, `$`, backtick or backslash in them (rephrase instead). Never paste mail, web or Slack text into a watch.
 
-Pick the schedule from how fast it moves: a conference seat or a ticket drop every 5 to 15 minutes, a price or stock check every 30 to 60, a slow form or registration daily. Use `alarm` only when minutes matter. `act` runs only if the owner allowed watch actions without asking; otherwise the watch prepares a draft and asks. Confirm in one line what you set and when it checks. `hermes proactive watch list` and `watch remove --name` manage them.
+Pick the schedule from how fast it moves: a conference seat or a ticket drop every 5 to 15 minutes, a price or stock check every 30 to 60, a slow form or registration daily. Use `alarm` only when minutes matter. `act` runs only if the owner allowed watch actions without asking; otherwise the watch prepares a draft and asks. If the CLI says the watch was only saved, tell the owner it won't run until they run `hermes proactive setup`. Otherwise, confirm in one line what you set and when it checks. `hermes proactive watch list` and `watch remove --name` manage them.
 
 ## Numbered close-out answers
 

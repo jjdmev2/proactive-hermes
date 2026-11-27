@@ -44,10 +44,16 @@ def _offer_setup(session_id: str = "", user_message: str = "", conversation_hist
     try:
         import sys
         sys.path.insert(0, str(HERE / "runtime"))
+        import ph_jobs  # pyright: ignore[reportMissingImports] (runtime/ above)
         import phconf
-        if (platform or "").lower() in SKIP_PLATFORMS or phconf.config_path().exists():
+        if (platform or "").lower() in SKIP_PLATFORMS:
             return None
-        flag = phconf.data_dir() / "setup_offered"
+        data = phconf.data_dir()
+        reg = ph_jobs.read_registry(data / "jobs.json")
+        if any(ph_jobs.recorded_job_id(reg, key, allow_pending=True) for key in reg
+               if key in ph_jobs.MANAGED_KEYS or key.startswith("watch:")):
+            return None
+        flag = data / "setup_offered"
         if flag.exists():
             return None
         flag.parent.mkdir(parents=True, exist_ok=True)

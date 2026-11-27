@@ -3,16 +3,21 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
+import imaplib
+import importlib.util
 from io import StringIO
 import json
 import os
 from pathlib import Path
+from socketserver import StreamRequestHandler, TCPServer
 from tempfile import TemporaryDirectory
+import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cli
 import jobs
+import mail_idle  # pyright: ignore[reportMissingImports] (cli adds runtime/ to sys.path)
 from tests.test_setup import FakeCron
 
 
@@ -66,6 +71,92 @@ class WatchFixture(unittest.TestCase):
 
 
 class UninstalledWatchTests(WatchFixture):
+    def test_staged_watch_does_not_start_mail_push_until_setup(self):
+        commands = []
+        idling = threading.Event()
+
+        class ImapStub(StreamRequestHandler):
+            def handle(self):
+                self.request.settimeout(6)
+                self.wfile.write(b"* OK fixture IMAP ready\r\n")
+                for line in self.rfile:
+                    tag, command, *_ = line.split()
+                    commands.append(command)
+                    if command == b"IDLE":
+                        self.wfile.write(b"+ idling\r\n")
+                        idling.set()
+                        return
+                    if command == b"CAPABILITY":
+                        self.wfile.write(b"* CAPABILITY IMAP4rev1 IDLE\r\n")
+                    elif command == b"EXAMINE":
+                        self.wfile.write(b"* 1 EXISTS\r\n")
+                    self.wfile.write(tag + b" OK fixture response\r\n")
+
+        server = self.enterContext(TCPServer(("127.0.0.1", 0), ImapStub))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        credentials = Mock(return_value="fixture-only")
+        ctx = Mock()
+        ctx.get_config.side_effect = {"mail_1_address": "fixture@example.test", "mail_1_host": "127.0.0.1",
+                                      "mail_1_port": port}.get
+        self.enterContext(patch.object(cli.phconf, "CFG", cli.phconf.load()))
+        self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
+        self.assertFalse(self.registry.exists())
+
+        def loopback(host, remote_port, **_):
+            self.assertEqual((host, remote_port), server.server_address)
+            return imaplib.IMAP4(host, remote_port, timeout=5)
+
+        # The transport is plaintext only in this loopback fixture; exercise real IMAP commands.
+        with patch.object(imaplib, "IMAP4_SSL", side_effect=loopback) as connect, \
+                patch.object(mail_idle, "_setup_file_log"):
+            try:
+                outcome = mail_idle.start_in_gateway(ctx, gateway=True, secret=credentials)
+                if outcome == "started":
+                    idling.wait(5)  # capture the wire trace even on the broken implementation
+                self.assertEqual((outcome, commands), ("not set up", []))
+                credentials.assert_not_called()
+                ctx.get_config.assert_not_called()
+                ctx.on_unload.assert_not_called()
+                connect.assert_not_called()
+                self.assertIsNone(mail_idle._SERVICE)
+
+                answers = self.home / "answers.json"
+                answers.write_text(json.dumps({"features": {"mail_radar": True, "mail_push": True},
+                                               "decisions.enabled": "n"}))
+                rc, output = self.command(["setup", "--preset", "custom", "--answers", str(answers)])
+                self.assertEqual(rc, 0, output)
+                self.assertIn("watch:Card drop", json.loads(self.registry.read_text()))
+                self.assertEqual(mail_idle.start_in_gateway(ctx, gateway=True, secret=credentials), "started")
+                self.assertTrue(idling.wait(5), commands)
+                # Some versions of imaplib issue their own CAPABILITY right after LOGIN.
+                self.assertIn(commands, ([b"CAPABILITY", b"LOGIN", b"CAPABILITY", b"EXAMINE", b"IDLE"],
+                                         [b"CAPABILITY", b"LOGIN", b"CAPABILITY", b"CAPABILITY", b"EXAMINE", b"IDLE"]))
+                credentials.assert_called_once_with("PROACTIVE_MAIL_1_PASSWORD")
+            finally:
+                mail_idle.stop_service()
+
+    def test_staged_watch_does_not_hide_first_chat_setup_offer(self):
+        spec = importlib.util.spec_from_file_location("ph_offer_test", jobs.HERE / "__init__.py")
+        assert spec is not None and spec.loader is not None
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        self.assertEqual(self.command(ADD + ["--then", "tell"])[0], 0)
+        flag = self.config.with_name("setup_offered")
+        jobs._save_registry({"replacing": {"say": {"old": "abcdef012345"}}})
+        self.assertIsNone(plugin._offer_setup(platform="cron"))
+        self.assertEqual(plugin._offer_setup(platform="cli"), {"context": plugin.OFFER})
+        self.assertIsNone(plugin._offer_setup(platform="cli"))
+
+        flag.unlink()
+        self.config.unlink()
+        jobs._save_registry({"say": "abcdef012345"})  # Installed without a mail radar.
+        self.assertIsNone(plugin._offer_setup(platform="cli"))
+        self.assertFalse(flag.exists())
+
     def test_fresh_remove_missing_watch_touches_nothing(self):
         self.assertEqual(self.command(["watch", "remove", "--name", "Card drop"]), (0, "No watch named Card drop.\n"))
         self.assertEqual(list(self.home.iterdir()), [])

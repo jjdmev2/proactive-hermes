@@ -512,7 +512,8 @@ def _install_lock(gens: Path):
 
 def install_runtime(cfg: dict) -> Path:
     """Install runtime/*.py, the rendered desk contract and a stamp listing them (phconf.runtime_status compares
-    it for `hermes proactive doctor`) as ONE generation, then activate it atomically. Only setup calls this.
+    it for `hermes proactive doctor`) as ONE generation, then activate it atomically. Setup and watch changes on
+    an installed desk call this. A watch saved on an uninstalled desk is not scheduled until setup.
 
     Each generation is a new directory HERMES_HOME/scripts/.proactive-hermes-gen/<digest>-<time>, written in full
     under a temporary name and renamed when complete; scripts_dir() (HERMES_HOME/scripts/proactive-hermes) is a

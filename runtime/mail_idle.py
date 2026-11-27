@@ -902,7 +902,7 @@ def _retire_old() -> bool:
 def start_in_gateway(ctx, *, gateway: bool | None = None, secret=None) -> str:
     """Start mail push once per process, only inside the gateway. Returns what happened (for logs/tests)."""
     global _SERVICE, _GENERATION
-    if not phconf.config_path().exists():
+    if not radar_job_id():
         return "not set up"
     if not enabled():
         return "disabled"
